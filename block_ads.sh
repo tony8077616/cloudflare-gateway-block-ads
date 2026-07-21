@@ -42,7 +42,7 @@ total_lists=$((total_lines / MAX_LIST_SIZE))
 [[ $((total_lines % MAX_LIST_SIZE)) -ne 0 ]] && total_lists=$((total_lists + 1))
 
 # Get current lists from Cloudflare
-current_lists=$(curl -sSfL --retry "$MAX_RETRIES" --retry-all-errors -X GET "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/gateway/lists" \
+current_lists=$(curl -sSfL --retry "$MAX_RETRIES" --retry-all-errors -X GET "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/gateway/lists?per_page=${MAX_LISTS}" \
     -H "Authorization: Bearer ${API_TOKEN}" \
     -H "Content-Type: application/json") || error "Failed to get current lists from Cloudflare"
     
@@ -130,7 +130,13 @@ fi
 for file in "${chunked_lists[@]}"; do
     echo "Creating list..."
 
-    # Format list counter
+    # Format list counter, skipping any number already used by an existing list
+    # (existing list numbers can have gaps, e.g. after manual deletion, so a
+    # naive position-based counter can collide with a list that still exists)
+    while echo "${current_lists}" | jq -e --arg name "${PREFIX} - $(printf '%03d' "$list_counter")" \
+        '.result | any(.name == $name)' > /dev/null; do
+        list_counter=$((list_counter + 1))
+    done
     formatted_counter=$(printf "%03d" "$list_counter")
 
     # Create payload
@@ -141,10 +147,13 @@ for file in "${chunked_lists[@]}"; do
     }')
 
     # Create list
-    list=$(curl -sSfL --retry "$MAX_RETRIES" --retry-all-errors -X POST "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/gateway/lists" \
+    list_response=$(curl -sSL --retry "$MAX_RETRIES" --retry-all-errors -w $'\nHTTP_STATUS:%{http_code}' -X POST "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/gateway/lists" \
         -H "Authorization: Bearer ${API_TOKEN}" \
         -H "Content-Type: application/json" \
-        --data "$payload") || error "Failed to create list"
+        --data "$payload")
+    http_status="${list_response##*HTTP_STATUS:}"
+    list="${list_response%$'\n'HTTP_STATUS:*}"
+    [[ "$http_status" == 2* ]] || error "Failed to create list (HTTP ${http_status}): ${list}"
 
     # Store the list ID
     used_list_ids+=("$(echo "${list}" | jq -r '.result.id')")
