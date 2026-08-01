@@ -11936,7 +11936,6 @@ collector.brandify.com
 collector.bsg.brave.com
 collector.cakeresume.com
 collector.cdp.cnn.com
-collector.clareity.net
 collector.ex.co
 collector.feedzop.com
 collector.fiverr.com
@@ -15935,7 +15934,6 @@ djqfsxlkmteke.space
 djqjbpdnislur.space
 djr4k68f8n55o.cloudfront.net
 djrkpoublcswv.store
-djs.baomihua.com
 djs.dsuaieuscx.lol
 djsoo8p407d6p.cloudfront.net
 djtciijwpgrxx.online
