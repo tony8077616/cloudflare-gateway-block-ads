@@ -1,0 +1,62 @@
+# 廣告/追蹤器清單來源設定
+# format 說明：
+#   domains       - 純網域清單，每行一個網域（可能有 *. 萬用字元前綴）
+#   adblock       - AdBlock Plus 語法（||domain^ 格式，含 CSS/例外規則等雜訊）
+#   hosts         - hosts 檔格式（0.0.0.0 domain 或 127.0.0.1 domain）
+#
+# 新增自訂訂閱來源：直接在 sources 底下加一筆，name 要唯一，
+# 抓取或解析失敗時會被略過並記錄警告，不會讓整個同步流程失敗。
+
+sources:
+  - name: oisd-big
+    url: https://big.oisd.nl/domainswild2
+    format: domains
+    enabled: true
+
+  - name: adguard-filter-21
+    url: https://adguardteam.github.io/HostlistsRegistry/assets/filter_21.txt
+    format: adblock
+    enabled: true
+
+  - name: adguard-filter-24
+    url: https://adguardteam.github.io/HostlistsRegistry/assets/filter_24.txt
+    format: adblock
+    enabled: true
+
+  - name: easylist
+    url: https://easylist.to/easylist/easylist.txt
+    format: adblock
+    enabled: true
+
+  - name: ublock-filters
+    url: https://ublockorigin.github.io/uAssetsCDN/filters/filters.min.txt
+    format: adblock
+    enabled: true
+
+  - name: ublock-badware
+    url: https://ublockorigin.pages.dev/filters/badware.min.txt
+    format: adblock
+    enabled: true
+
+  - name: ublock-privacy
+    url: https://ublockorigin.pages.dev/filters/privacy.min.txt
+    format: adblock
+    enabled: true
+
+  # ↓↓↓ 之後要加自訂訂閱來源，照這個格式在下面新增一筆即可 ↓↓↓
+  # - name: my-custom-source
+  #   url: https://example.com/my-list.txt
+  #   format: adblock
+  #   enabled: true
+
+# Cloudflare Gateway 設定
+gateway:
+  list_name_prefix: "Block ads"      # 清單名稱前綴，會自動編號（Block ads - 001, 002, ...）
+  list_chunk_size: 1000              # 每個 List 最多幾筆網域（Cloudflare 上限）
+  policy_name: "Block ads"           # 對外生效的 Policy 名稱
+
+# Cloudflare 原生分類比對設定
+native_category_check:
+  enabled: true
+  cache_ttl_days: 30                 # 分類快取有效天數，超過才重新查詢
+  bulk_batch_size: 500               # 每批次查詢筆數（已實測驗證上限約 700，用 500 留安全餘裕）
