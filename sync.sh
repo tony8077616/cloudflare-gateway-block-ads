@@ -37,6 +37,12 @@ BULK_BATCH_SIZE=500
 log() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
 warn() { echo "[$(date '+%H:%M:%S')] ⚠ $*" >&2; }
 
+is_valid_json() {
+  # 讀 stdin，回傳是否為合法 JSON（用來在丟給 jq 做實際解析前先擋掉非 JSON 回應，
+  # 避免印出一堆 jq parse error 雜訊）
+  jq -e . >/dev/null 2>&1
+}
+
 cf_curl() {
   # $1 = method, $2 = path (含 query string), $3 = body（可省略）
   local method="$1" path="$2" body="${3:-}"
@@ -133,63 +139,73 @@ fetch_and_merge_sources() {
 load_whitelist() {
   local resp
   resp=$(d1_query "SELECT domain FROM custom_whitelist")
-  if [[ "$(echo "$resp" | jq -r '.success')" != "true" ]]; then
+  if ! is_valid_json <<< "$resp" || [[ "$(jq -r '.success' <<< "$resp")" != "true" ]]; then
     warn "讀取白名單失敗，本次視為空白名單（best effort，不中斷流程）"
     return
   fi
-  echo "$resp" | jq -r '.result[0].results[]?.domain // empty'
+  jq -r '.result[0].results[]?.domain // empty' <<< "$resp"
 }
 
 load_custom_blocklist() {
   local resp
   resp=$(d1_query "SELECT domain FROM custom_blocklist")
-  if [[ "$(echo "$resp" | jq -r '.success')" != "true" ]]; then
+  if ! is_valid_json <<< "$resp" || [[ "$(jq -r '.success' <<< "$resp")" != "true" ]]; then
     warn "讀取自訂封鎖清單失敗，本次視為空清單（best effort，不中斷流程）"
     return
   fi
-  echo "$resp" | jq -r '.result[0].results[]?.domain // empty'
+  jq -r '.result[0].results[]?.domain // empty' <<< "$resp"
 }
 
 # ── 5. D1：分類快取 ───────────────────────────────────────
 
 load_category_cache() {
   # 輸出：每行「domain is_ads_category」，只取未過期的快取
-  local cutoff
+  local cutoff resp
   cutoff=$(( $(date +%s) - CACHE_TTL_DAYS * 86400 ))
-  local resp
-  resp=$(d1_query "SELECT domain, is_ads_category FROM domain_category_cache WHERE checked_at >= ?" "[\"$cutoff\"]")
-  if [[ "$(echo "$resp" | jq -r '.success')" != "true" ]]; then
+  resp=$(d1_query "SELECT domain, is_ads_category FROM domain_category_cache WHERE checked_at >= ?" \
+    "$(jq -n --arg c "$cutoff" '[$c]')")
+  if ! is_valid_json <<< "$resp" || [[ "$(jq -r '.success' <<< "$resp")" != "true" ]]; then
     warn "讀取分類快取失敗，本次視為無快取，將重新查詢全部網域"
     return
   fi
-  echo "$resp" | jq -r '.result[0].results[]? | "\(.domain) \(.is_ads_category)"'
+  jq -r '.result[0].results[]? | "\(.domain) \(.is_ads_category)"' <<< "$resp"
 }
 
 save_category_cache_batch() {
-  # $1 = 檔案，每行「domain is_ads categories_json」
+  # $1 = 檔案，每行「domain\tis_ads\tcategories_json」
+  # 分批寫入，避免單次 D1 batch request 塞入過多資料列導致失敗/逾時
   local batch_file="$1"
   [[ -s "$batch_file" ]] || return 0
 
-  local now batch_json
+  local now write_chunk_size=200
   now=$(date +%s)
-  batch_json=$(awk -v now="$now" '
-    { domain=$1; is_ads=$2; $1=""; $2=""; cats=$0; sub(/^  */, "", cats);
-      printf "%s\t%s\t%s\t%s\n", domain, is_ads, cats, now }
-  ' "$batch_file" | jq -R -s -c --arg now "$now" '
-    split("\n") | map(select(length > 0) | split("\t")) | map({
-      sql: "INSERT INTO domain_category_cache (domain, is_ads_category, categories, checked_at) VALUES (?, ?, ?, ?) ON CONFLICT(domain) DO UPDATE SET is_ads_category=excluded.is_ads_category, categories=excluded.categories, checked_at=excluded.checked_at",
-      params: [.[0], .[1], .[2], $now]
-    })
-  ')
 
-  local body resp
-  body=$(jq -n --argjson batch "$batch_json" '{batch: $batch}')
-  resp=$(curl -sS -X POST "$CF_API/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
-    -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
-    --data "$body")
-  if [[ "$(echo "$resp" | jq -r '.success')" != "true" ]]; then
-    warn "寫入分類快取批次失敗（不影響本次結果，只影響下次快取命中率）"
-  fi
+  local total_lines
+  total_lines=$(wc -l < "$batch_file" | xargs)
+  local start=1
+  while [[ $start -le $total_lines ]]; do
+    local sub_chunk_file="$TMP_DIR/cache_write_chunk.txt"
+    sed -n "${start},$((start + write_chunk_size - 1))p" "$batch_file" > "$sub_chunk_file"
+
+    local batch_json
+    batch_json=$(jq -R -s -c --arg now "$now" '
+      split("\n") | map(select(length > 0) | split("\t")) | map({
+        sql: "INSERT INTO domain_category_cache (domain, is_ads_category, categories, checked_at) VALUES (?, ?, ?, ?) ON CONFLICT(domain) DO UPDATE SET is_ads_category=excluded.is_ads_category, categories=excluded.categories, checked_at=excluded.checked_at",
+        params: [.[0], .[1], .[2], $now]
+      })
+    ' "$sub_chunk_file")
+
+    local body resp
+    body=$(jq -n --argjson batch "$batch_json" '{batch: $batch}')
+    resp=$(curl -sS --max-time 30 -X POST "$CF_API/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
+      -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
+      --data "$body")
+    if [[ "$(echo "$resp" | jq -r '.success // false')" != "true" ]]; then
+      warn "寫入分類快取第 $start~$((start + write_chunk_size)) 批失敗，略過（不影響本次結果，只影響下次快取命中率）"
+    fi
+
+    start=$((start + write_chunk_size))
+  done
 }
 
 # ── 6. Cloudflare 原生分類批次查詢 ────────────────────────
@@ -222,13 +238,18 @@ check_native_categories() {
     resp=$(curl -sS --max-time 30 "$CF_API/accounts/$CF_ACCOUNT_ID/intel/domain/bulk?$query" \
       -H "Authorization: Bearer $CF_API_TOKEN")
 
-    if [[ "$(echo "$resp" | jq -r '.success // false')" != "true" ]]; then
+    # 先確認回應本身是不是合法 JSON（可能因為逾時、速率限制等原因收到非 JSON 回應，
+    # 例如純文字錯誤頁面），避免直接把非法內容餵給 jq 印出一堆解析錯誤雜訊。
+    if ! is_valid_json <<< "$resp"; then
+      warn "第 $i~$((i+BULK_BATCH_SIZE)) 批分類查詢回應不是合法 JSON（可能是暫時性網路問題或速率限制），這批網域本次視為『未被原生分類涵蓋』（保守處理，寧可多上傳也不要漏擋）"
+      awk '{print $1, 0}' "$batch_file" >> "$out_file"
+    elif [[ "$(jq -r '.success // false' <<< "$resp")" != "true" ]]; then
       warn "第 $i~$((i+BULK_BATCH_SIZE)) 批分類查詢失敗，這批網域本次視為『未被原生分類涵蓋』（保守處理，寧可多上傳也不要漏擋）"
       awk '{print $1, 0}' "$batch_file" >> "$out_file"
     else
-      echo "$resp" | jq -r '.result[]? |
+      jq -r '.result[]? |
         [.domain, (if ([.content_categories[]?.name] | any(. == "Advertisements" or . == "Trackers/Analytics")) then 1 else 0 end),
-         ([.content_categories[]?.name] | tostring)] | @tsv' \
+         ([.content_categories[]?.name] | tostring)] | @tsv' <<< "$resp" \
         | while IFS=$'\t' read -r domain is_ads cats; do
             echo "$domain $is_ads" >> "$out_file"
             echo -e "$domain\t$is_ads\t$cats" >> "$cache_batch_file"
@@ -287,11 +308,11 @@ upload_lists() {
       resp=$(cf_curl PUT "/accounts/$CF_ACCOUNT_ID/gateway/lists/$list_id" "$body")
     else
       resp=$(cf_curl POST "/accounts/$CF_ACCOUNT_ID/gateway/lists" "$body")
-      list_id=$(echo "$resp" | jq -r '.result.id')
+      list_id=$(jq -r '.result.id' <<< "$resp")
     fi
 
-    if [[ "$(echo "$resp" | jq -r '.success')" != "true" ]]; then
-      echo "❌ 清單 $name 上傳失敗：$(echo "$resp" | jq -c '.errors')" >&2
+    if ! is_valid_json <<< "$resp" || [[ "$(jq -r '.success' <<< "$resp")" != "true" ]]; then
+      echo "❌ 清單 $name 上傳失敗：$resp" >&2
       return 1
     fi
 
@@ -344,8 +365,8 @@ ensure_policy() {
     resp=$(cf_curl POST "/accounts/$CF_ACCOUNT_ID/gateway/rules" "$body")
   fi
 
-  if [[ "$(echo "$resp" | jq -r '.success')" != "true" ]]; then
-    echo "❌ Policy 更新失敗：$(echo "$resp" | jq -c '.errors')" >&2
+  if ! is_valid_json <<< "$resp" || [[ "$(jq -r '.success' <<< "$resp")" != "true" ]]; then
+    echo "❌ Policy 更新失敗：$resp" >&2
     return 1
   fi
   local list_count
@@ -356,9 +377,19 @@ ensure_policy() {
 record_sync_history() {
   # $1 status, $2 notes, $3..$6 統計數字
   local status="$1" notes="$2" total_merged="$3" total_uploaded="$4" excluded_by_native="$5" whitelisted="$6"
+  local params
+  params=$(jq -n \
+    --arg run_at "$(date +%s)" \
+    --arg total_merged "$total_merged" \
+    --arg total_uploaded "$total_uploaded" \
+    --arg excluded_by_native "$excluded_by_native" \
+    --arg whitelisted "$whitelisted" \
+    --arg status "$status" \
+    --arg notes "$notes" \
+    '[$run_at, $total_merged, $total_uploaded, $excluded_by_native, $whitelisted, $status, $notes]')
   d1_query \
     "INSERT INTO sync_history (run_at, total_merged, total_uploaded, total_excluded_by_native_category, total_whitelisted, status, notes) VALUES (?, ?, ?, ?, ?, ?, ?)" \
-    "[\"$(date +%s)\", \"$total_merged\", \"$total_uploaded\", \"$excluded_by_native\", \"$whitelisted\", \"$status\", $(jq -Rn --arg n "$notes" '$n')]" \
+    "$params" \
     > /dev/null || warn "寫入同步歷史紀錄失敗（不影響本次同步結果本身）"
 }
 
