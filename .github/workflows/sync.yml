@@ -4,14 +4,11 @@ on:
   schedule:
     - cron: "0 18 * * *"   # 每天 UTC 18:00（台灣時間凌晨 2:00）
   workflow_dispatch: {}     # 允許手動觸發
-  push:                     # 臨時測試用，驗證完成後會移除，限定只在這個分支上才觸發
-    branches:
-      - feature/three-source-merge
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -28,4 +25,3 @@ jobs:
         run: |
           chmod +x sync.sh
           ./sync.sh
-
