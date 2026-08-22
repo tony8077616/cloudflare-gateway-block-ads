@@ -370,18 +370,33 @@ upload_lists() {
     local body
     body=$(jq -n --arg name "$name" --argjson items "$items_json" '{name: $name, type: "DOMAIN", items: $items}')
 
-    local resp list_id
-    if [[ -n "${existing_by_index[$chunk_num]:-}" ]]; then
-      list_id="${existing_by_index[$chunk_num]}"
-      resp=$(cf_curl PUT "/accounts/$CF_ACCOUNT_ID/gateway/lists/$list_id" "$body")
-    else
-      resp=$(cf_curl POST "/accounts/$CF_ACCOUNT_ID/gateway/lists" "$body")
-      list_id=$(jq -r '.result.id' <<< "$resp")
-    fi
+    # 單一清單上傳加上重試機制（最多 3 次，指數退避），
+    # 避免 150+ 次連續呼叫中偶發的暫時性網路/API 波動就讓整個上傳流程中止。
+    local resp list_id attempt upload_ok=0
+    for attempt in 1 2 3; do
+      local list_id_for_this_attempt=""
+      if [[ -n "${existing_by_index[$chunk_num]:-}" ]]; then
+        list_id_for_this_attempt="${existing_by_index[$chunk_num]}"
+        resp=$(cf_curl PUT "/accounts/$CF_ACCOUNT_ID/gateway/lists/$list_id_for_this_attempt" "$body")
+      else
+        resp=$(cf_curl POST "/accounts/$CF_ACCOUNT_ID/gateway/lists" "$body")
+      fi
 
-    if ! is_valid_json <<< "$resp" || [[ "$(jq -r '.success' <<< "$resp")" != "true" ]]; then
-      echo "❌ 清單 $name 上傳失敗：$resp" >&2
-      return 1
+      if is_valid_json <<< "$resp" && [[ "$(jq -r '.success' <<< "$resp")" == "true" ]]; then
+        list_id="${list_id_for_this_attempt:-$(jq -r '.result.id' <<< "$resp")}"
+        upload_ok=1
+        break
+      fi
+
+      warn "清單 $name 第 $attempt 次上傳失敗$([[ $attempt -lt 3 ]] && echo "，$((attempt * 2)) 秒後重試" || echo "，已達重試上限")"
+      [[ $attempt -lt 3 ]] && sleep $((attempt * 2))
+    done
+
+    if [[ $upload_ok -ne 1 ]]; then
+      warn "清單 $name 重試 3 次後仍然失敗，這批 $(wc -l < "$chunk_file" | xargs) 筆網域這次同步不會被涵蓋（不中止整個流程，繼續處理下一批；下次同步會再次嘗試）"
+      start=$((start + LIST_CHUNK_SIZE))
+      chunk_num=$((chunk_num + 1))
+      continue
     fi
 
     echo "$list_id" >> "$list_ids_file"
@@ -528,8 +543,13 @@ main() {
   fi
 
   local list_ids_file="$TMP_DIR/final_list_ids.txt"
-  if ! upload_lists "$final_file" > "$list_ids_file"; then
-    record_sync_history "failed" "upload_lists failed" "$total_merged" "$total_uploaded" "$excluded_by_native" "$whitelisted_count"
+  upload_lists "$final_file" > "$list_ids_file"
+
+  local uploaded_list_count
+  uploaded_list_count=$(wc -l < "$list_ids_file" | xargs)
+  if [[ $uploaded_list_count -eq 0 ]]; then
+    echo "❌ 所有清單上傳全部失敗，中止更新 Policy（避免把它指向空清單）" >&2
+    record_sync_history "failed" "all list uploads failed" "$total_merged" "$total_uploaded" "$excluded_by_native" "$whitelisted_count"
     exit 1
   fi
 
