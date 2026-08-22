@@ -302,6 +302,35 @@ check_native_categories() {
   local merged_cache="$TMP_DIR/cache_batch_merged.txt"
   cat "$split_dir"/chunk_*.cache 2>/dev/null > "$merged_cache"
   save_category_cache_batch "$merged_cache"
+  report_category_breakdown "$merged_cache"
+}
+
+report_category_breakdown() {
+  # $1 = 快取檔案（domain\tis_ads\tcategories_json），輸出診斷統計到 stderr
+  # 目的：讓每次執行都能看到「有沒有分類」「分類分布」，
+  # 不用像這次一樣事後手動下 SQL 才能查。
+  local cache_file="$1"
+  [[ -s "$cache_file" ]] || return 0
+
+  local total empty_count
+  total=$(wc -l < "$cache_file" | xargs)
+  empty_count=$(awk -F'\t' '$3 == "[]"' "$cache_file" | wc -l | xargs)
+
+  log "── 分類統計診斷 ──"
+  log "本次查詢網域總數：$total"
+  log "完全沒有 Cloudflare 分類：$empty_count（$(( empty_count * 100 / (total > 0 ? total : 1) ))%）"
+  log "有分類：$((total - empty_count))（$(( (total - empty_count) * 100 / (total > 0 ? total : 1) ))%）"
+
+  local top_cats
+  top_cats=$(awk -F'\t' '$3 != "[]" {print $3}' "$cache_file" \
+    | jq -rs 'flatten | reduce .[] as $c ({}; .[$c] += 1) | to_entries | sort_by(-.value) | .[0:10] | .[] | "\(.key): \(.value)"' 2>/dev/null)
+
+  if [[ -n "$top_cats" ]]; then
+    log "分類分布前 10 名："
+    while IFS= read -r line; do
+      log "  $line"
+    done <<< "$top_cats"
+  fi
 }
 
 # ── 7. Cloudflare Gateway 清單上傳 ────────────────────────
