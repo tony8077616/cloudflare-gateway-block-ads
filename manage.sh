@@ -102,6 +102,32 @@ cmd_list() {
   echo "共 $count 筆"
 }
 
+cmd_failures() {
+  # 查看清單上傳失敗的診斷紀錄（upload_failures 表），供檢討改善用
+  local limit="${1:-20}"
+  local resp
+  resp=$(d1_query "SELECT run_at, list_name, http_status, domain_count_affected, error_detail FROM upload_failures ORDER BY run_at DESC LIMIT ?" "$(jq -n --arg l "$limit" '[$l]')")
+
+  if [[ "$(echo "$resp" | jq -r '.success')" != "true" ]]; then
+    echo "❌ 查詢失敗：$(echo "$resp" | jq -c '.errors')"
+    return
+  fi
+
+  local count
+  count=$(echo "$resp" | jq '.result[0].results | length')
+  if [[ "$count" -eq 0 ]]; then
+    echo "（目前沒有失敗紀錄）"
+    return
+  fi
+
+  echo "$resp" | jq -r '.result[0].results[] | "── \(.run_at | todate) ──\n清單：\(.list_name)　HTTP 狀態：\(.http_status)　受影響網域數：\(.domain_count_affected)\n錯誤內容：\(.error_detail)\n"'
+  echo "共 $count 筆（顯示最新 $limit 筆）"
+
+  echo ""
+  echo "=== 依清單編號統計失敗次數（找出是否有特定清單反覆失敗）==="
+  echo "$resp" | jq -r '.result[0].results[] | .list_name' | sort | uniq -c | sort -rn
+}
+
 usage() {
   cat << 'EOF'
 用法：
@@ -112,10 +138,22 @@ usage() {
   ./manage.sh block add <domain> [reason]
   ./manage.sh block remove <domain>
   ./manage.sh block list
+
+  ./manage.sh failures [limit]     # 查看清單上傳失敗的診斷紀錄，預設顯示最新 20 筆
 EOF
 }
 
 main() {
+  if [[ $# -lt 1 ]]; then
+    usage
+    exit 1
+  fi
+
+  if [[ "$1" == "failures" ]]; then
+    cmd_failures "${2:-20}"
+    return
+  fi
+
   if [[ $# -lt 2 ]]; then
     usage
     exit 1
