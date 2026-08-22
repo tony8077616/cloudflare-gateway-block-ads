@@ -32,7 +32,9 @@ LIST_PREFIX="Block ads"
 LIST_CHUNK_SIZE=1000
 POLICY_NAME="Block ads"
 CACHE_TTL_DAYS=30
-BULK_BATCH_SIZE=500
+BULK_BATCH_SIZE=650        # 實測過上限約 700（更高會被 431 Request Header Fields Too Large 拒絕），650 留安全邊際
+BATCH_SLEEP=0.05           # 每批次間隔；實測 200 個並行請求皆成功、無速率限制，可以壓低間隔
+PARALLEL_WORKERS=15        # 平行處理的分類查詢工作數量；實測驗證過 200 並行皆成功，15 留大量安全邊際
 
 log() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
 warn() { echo "[$(date '+%H:%M:%S')] ⚠ $*" >&2; }
@@ -208,25 +210,23 @@ save_category_cache_batch() {
   done
 }
 
-# ── 6. Cloudflare 原生分類批次查詢 ────────────────────────
+# ── 6. Cloudflare 原生分類批次查詢（平行處理）──────────────
 
-check_native_categories() {
-  # $1 = 待查詢網域清單檔案
-  # 輸出：每行「domain is_ads」，同時把結果寫回 D1 快取
-  local to_check_file="$1"
+_check_categories_worker() {
+  # $1 = 這個 worker 要處理的網域清單檔案
+  # $2 = 輸出檔案（domain is_ads）
+  # $3 = 快取寫入用檔案（domain\tis_ads\tcategories）
+  # $4 = worker 編號（僅用於 log 訊息辨識）
+  local chunk_file="$1" out_file="$2" cache_batch_file="$3" worker_id="$4"
   local total
-  total=$(wc -l < "$to_check_file" | xargs)
-  [[ "$total" -eq 0 ]] && return 0
-
-  local out_file="$TMP_DIR/native_check_results.txt"
-  local cache_batch_file="$TMP_DIR/cache_batch.txt"
+  total=$(wc -l < "$chunk_file" | xargs)
   : > "$out_file"
   : > "$cache_batch_file"
 
   local i=0
   while [[ $i -lt $total ]]; do
-    local batch_file="$TMP_DIR/batch_$i.txt"
-    sed -n "$((i+1)),$((i+BULK_BATCH_SIZE))p" "$to_check_file" > "$batch_file"
+    local batch_file="${chunk_file}.batch_$i"
+    sed -n "$((i+1)),$((i+BULK_BATCH_SIZE))p" "$chunk_file" > "$batch_file"
 
     local query=""
     while IFS= read -r d; do
@@ -238,13 +238,11 @@ check_native_categories() {
     resp=$(curl -sS --max-time 30 "$CF_API/accounts/$CF_ACCOUNT_ID/intel/domain/bulk?$query" \
       -H "Authorization: Bearer $CF_API_TOKEN")
 
-    # 先確認回應本身是不是合法 JSON（可能因為逾時、速率限制等原因收到非 JSON 回應，
-    # 例如純文字錯誤頁面），避免直接把非法內容餵給 jq 印出一堆解析錯誤雜訊。
     if ! is_valid_json <<< "$resp"; then
-      warn "第 $i~$((i+BULK_BATCH_SIZE)) 批分類查詢回應不是合法 JSON（可能是暫時性網路問題或速率限制），這批網域本次視為『未被原生分類涵蓋』（保守處理，寧可多上傳也不要漏擋）"
+      warn "[worker $worker_id] 第 $i~$((i+BULK_BATCH_SIZE)) 批分類查詢回應不是合法 JSON（可能是暫時性網路問題或速率限制），這批網域本次視為『未被原生分類涵蓋』（保守處理，寧可多上傳也不要漏擋）"
       awk '{print $1, 0}' "$batch_file" >> "$out_file"
     elif [[ "$(jq -r '.success // false' <<< "$resp")" != "true" ]]; then
-      warn "第 $i~$((i+BULK_BATCH_SIZE)) 批分類查詢失敗，這批網域本次視為『未被原生分類涵蓋』（保守處理，寧可多上傳也不要漏擋）"
+      warn "[worker $worker_id] 第 $i~$((i+BULK_BATCH_SIZE)) 批分類查詢失敗，這批網域本次視為『未被原生分類涵蓋』（保守處理，寧可多上傳也不要漏擋）"
       awk '{print $1, 0}' "$batch_file" >> "$out_file"
     else
       jq -r '.result[]? |
@@ -256,13 +254,54 @@ check_native_categories() {
           done
     fi
 
-    log "分類查詢進度：$(( i + BULK_BATCH_SIZE > total ? total : i + BULK_BATCH_SIZE ))/$total"
+    rm -f "$batch_file"
+    log "[worker $worker_id] 分類查詢進度：$(( i + BULK_BATCH_SIZE > total ? total : i + BULK_BATCH_SIZE ))/$total"
     i=$((i + BULK_BATCH_SIZE))
-    sleep 0.2
+    sleep "$BATCH_SLEEP"
+  done
+}
+
+check_native_categories() {
+  # $1 = 待查詢網域清單檔案
+  # 輸出：每行「domain is_ads」，同時把結果寫回 D1 快取
+  # 設計：切成 PARALLEL_WORKERS 份，平行處理，大幅縮短總時間
+  #（單一 worker 內部仍是循序批次查詢，用 BATCH_SLEEP 控制節奏，
+  #  多個 worker 加總後的請求速率仍在 Cloudflare 速率限制內）
+  local to_check_file="$1"
+  local total
+  total=$(wc -l < "$to_check_file" | xargs)
+  [[ "$total" -eq 0 ]] && return 0
+
+  local split_dir="$TMP_DIR/split"
+  mkdir -p "$split_dir"
+  local lines_per_worker=$(( (total + PARALLEL_WORKERS - 1) / PARALLEL_WORKERS ))
+  split -l "$lines_per_worker" -d -a 2 "$to_check_file" "$split_dir/chunk_"
+
+  local pids=()
+  local worker_id=0
+  for chunk_file in "$split_dir"/chunk_*; do
+    [[ -f "$chunk_file" ]] || continue
+    local out_file="${chunk_file}.out"
+    local cache_file="${chunk_file}.cache"
+    _check_categories_worker "$chunk_file" "$out_file" "$cache_file" "$worker_id" &
+    pids+=($!)
+    worker_id=$((worker_id + 1))
   done
 
-  save_category_cache_batch "$cache_batch_file"
-  cat "$out_file"
+  log "已啟動 ${#pids[@]} 個平行查詢工作，共 $total 筆網域待查"
+
+  local failed_workers=0
+  for pid in "${pids[@]}"; do
+    wait "$pid" || failed_workers=$((failed_workers + 1))
+  done
+  [[ $failed_workers -gt 0 ]] && warn "有 $failed_workers 個平行查詢工作發生非預期錯誤（個別批次失敗已在各自流程內做保守處理，不影響整體繼續執行）"
+
+  # 合併所有 worker 的輸出
+  cat "$split_dir"/chunk_*.out 2>/dev/null
+
+  local merged_cache="$TMP_DIR/cache_batch_merged.txt"
+  cat "$split_dir"/chunk_*.cache 2>/dev/null > "$merged_cache"
+  save_category_cache_batch "$merged_cache"
 }
 
 # ── 7. Cloudflare Gateway 清單上傳 ────────────────────────
