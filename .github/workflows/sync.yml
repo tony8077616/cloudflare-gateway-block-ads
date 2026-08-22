@@ -1,0 +1,34 @@
+name: Sync ad-block lists to Cloudflare Gateway
+
+on:
+  schedule:
+    - cron: "0 18 * * *"   # 每天 UTC 18:00（台灣時間凌晨 2:00）
+  workflow_dispatch: {}     # 允許手動觸發
+
+# 避免排程跟手動觸發重疊執行，或連續手動觸發時互相干擾同一批 Cloudflare 資源
+# （多個 run 同時改 Gateway Lists / Policy 容易互相覆蓋）
+concurrency:
+  group: sync-ad-block-lists
+  cancel-in-progress: false
+
+# 最小權限原則：這個 workflow 只需要讀取 repo 內容，不需要寫入任何 GitHub 資源
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04    # 固定版本，避免 ubuntu-latest 未來悄悄升級造成環境突變
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7   # 原生支援 Node 24，不再出現棄用警告
+
+      # 不需要額外安裝步驟：curl、jq（1.7.1+）、coreutils 都已內建在 ubuntu-24.04 runner image 上
+
+      - name: 執行同步
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN_ADBLOCK }}
+          D1_DATABASE_ID: ${{ secrets.CF_D1_DATABASE_ID }}
+        run: |
+          chmod +x sync.sh
+          ./sync.sh
