@@ -92,6 +92,10 @@ d1_query() {
 
 # ── 1. 網域格式驗證 ──────────────────────────────────────
 DOMAIN_REGEX='^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$'
+# IPv4 位址的每個區段剛好也符合上面那組網域格式規則（純數字也算合法 label），
+# 會被誤判成合法網域混進清單，但 Cloudflare Gateway 的 DOMAIN 類型清單不接受 IP，
+# 一批裡只要有一筆是 IP 就會讓整批 1000 筆一起被拒絕。這裡額外排除掉。
+IPV4_REGEX='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
 
 # ── 2. 各格式解析函式（吃 stdin，吐出網域清單到 stdout）───
 
@@ -99,7 +103,8 @@ parse_domains() {
   grep -vE '^[[:space:]]*(#|!|$)' \
     | sed -E 's/^\*\.//' \
     | tr 'A-Z' 'a-z' \
-    | grep -E "$DOMAIN_REGEX"
+    | grep -E "$DOMAIN_REGEX" \
+    | grep -vE "$IPV4_REGEX"
 }
 
 parse_adblock() {
@@ -110,14 +115,16 @@ parse_adblock() {
     | sed -E 's/^\|\|([a-zA-Z0-9.*_-]+)\^.*/\1/' \
     | sed -E 's/^\*\.//' \
     | tr 'A-Z' 'a-z' \
-    | grep -E "$DOMAIN_REGEX"
+    | grep -E "$DOMAIN_REGEX" \
+    | grep -vE "$IPV4_REGEX"
 }
 
 parse_hosts() {
   grep -E '^(0\.0\.0\.0|127\.0\.0\.1|::1|::)[[:space:]]+' \
     | awk '{print $2}' \
     | tr 'A-Z' 'a-z' \
-    | grep -E "$DOMAIN_REGEX"
+    | grep -E "$DOMAIN_REGEX" \
+    | grep -vE "$IPV4_REGEX"
 }
 
 # ── 3. 抓取 + 合併所有來源 ────────────────────────────────
