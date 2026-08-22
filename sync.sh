@@ -36,6 +36,12 @@ BULK_BATCH_SIZE=650        # 實測過上限約 700（更高會被 431 Request H
 BATCH_SLEEP=0.05           # 每批次間隔；實測 200 個並行請求皆成功、無速率限制，可以壓低間隔
 PARALLEL_WORKERS=15        # 平行處理的分類查詢工作數量；實測驗證過 200 並行皆成功，15 留大量安全邊際
 
+# D1 免費版每日寫入額度是 100,000 筆（官方文件：https://developers.cloudflare.com/workers/platform/pricing/），
+# 額度午夜 UTC 重置。這裡保守抓 90,000 當上限，留給 custom_whitelist/custom_blocklist/sync_history
+# 這些其他表的寫入用量一些餘裕，避免精準卡在官方數字上反而不小心超額。
+D1_DAILY_WRITE_BUDGET=90000
+D1_WRITES_THIS_RUN=0   # 全域計數器，追蹤這次執行已經寫入 D1 的筆數
+
 log() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
 warn() { echo "[$(date '+%H:%M:%S')] ⚠ $*" >&2; }
 
@@ -56,6 +62,23 @@ cf_curl() {
   else
     curl -sS -X "$method" "$CF_API$path" \
       -H "Authorization: Bearer $CF_API_TOKEN"
+  fi
+}
+
+cf_curl_with_status() {
+  # 跟 cf_curl 一樣，但額外用 __HTTP_STATUS__ 分隔符號在輸出最後帶上 HTTP 狀態碼，
+  # 供需要記錄失敗診斷資訊的呼叫點使用（不影響 cf_curl 本身，避免動到其他呼叫點）。
+  local method="$1" path="$2" body="${3:-}"
+  if [[ -n "$body" ]]; then
+    curl -sS -X "$method" "$CF_API$path" \
+      -H "Authorization: Bearer $CF_API_TOKEN" \
+      -H "Content-Type: application/json" \
+      --data "$body" \
+      -w "__HTTP_STATUS__%{http_code}"
+  else
+    curl -sS -X "$method" "$CF_API$path" \
+      -H "Authorization: Bearer $CF_API_TOKEN" \
+      -w "__HTTP_STATUS__%{http_code}"
   fi
 }
 
@@ -175,7 +198,10 @@ load_category_cache() {
 
 save_category_cache_batch() {
   # $1 = 檔案，每行「domain\tis_ads\tcategories_json」
-  # 分批寫入，避免單次 D1 batch request 塞入過多資料列導致失敗/逾時
+  # 分批寫入，避免單次 D1 batch request 塞入過多資料列導致失敗/逾時。
+  # 同時檢查每日寫入額度（D1 免費版 100,000 筆/天），這次執行累計寫入量
+  # 一旦達到 D1_DAILY_WRITE_BUDGET，就停止繼續寫入快取（不影響本次同步的封鎖清單結果，
+  # 只是這批網域的分類結果沒能快取下來，下次同步會重新查詢）。
   local batch_file="$1"
   [[ -s "$batch_file" ]] || return 0
 
@@ -186,8 +212,24 @@ save_category_cache_batch() {
   total_lines=$(wc -l < "$batch_file" | xargs)
   local start=1
   while [[ $start -le $total_lines ]]; do
+    if [[ $D1_WRITES_THIS_RUN -ge $D1_DAILY_WRITE_BUDGET ]]; then
+      local remaining=$((total_lines - start + 1))
+      warn "本次執行 D1 寫入量已達每日額度上限（$D1_DAILY_WRITE_BUDGET 筆），停止繼續寫入分類快取，剩餘 $remaining 筆網域的分類結果這次不會被快取（不影響封鎖清單本身，只是下次同步這些網域要重新查詢分類）"
+      break
+    fi
+
     local sub_chunk_file="$TMP_DIR/cache_write_chunk.txt"
     sed -n "${start},$((start + write_chunk_size - 1))p" "$batch_file" > "$sub_chunk_file"
+    local this_chunk_size
+    this_chunk_size=$(wc -l < "$sub_chunk_file" | xargs)
+
+    # 如果這一批會讓累計寫入量超過額度，只取額度剩餘的部分
+    if [[ $((D1_WRITES_THIS_RUN + this_chunk_size)) -gt $D1_DAILY_WRITE_BUDGET ]]; then
+      local allowed=$((D1_DAILY_WRITE_BUDGET - D1_WRITES_THIS_RUN))
+      head -n "$allowed" "$sub_chunk_file" > "${sub_chunk_file}.trimmed"
+      mv "${sub_chunk_file}.trimmed" "$sub_chunk_file"
+      this_chunk_size=$allowed
+    fi
 
     local batch_json
     batch_json=$(jq -R -s -c --arg now "$now" '
@@ -204,6 +246,8 @@ save_category_cache_batch() {
       --data "$body")
     if [[ "$(echo "$resp" | jq -r '.success // false')" != "true" ]]; then
       warn "寫入分類快取第 $start~$((start + write_chunk_size)) 批失敗，略過（不影響本次結果，只影響下次快取命中率）"
+    else
+      D1_WRITES_THIS_RUN=$((D1_WRITES_THIS_RUN + this_chunk_size))
     fi
 
     start=$((start + write_chunk_size))
@@ -372,15 +416,17 @@ upload_lists() {
 
     # 單一清單上傳加上重試機制（最多 3 次，指數退避），
     # 避免 150+ 次連續呼叫中偶發的暫時性網路/API 波動就讓整個上傳流程中止。
-    local resp list_id attempt upload_ok=0
+    local resp resp_raw http_status list_id attempt upload_ok=0
     for attempt in 1 2 3; do
       local list_id_for_this_attempt=""
       if [[ -n "${existing_by_index[$chunk_num]:-}" ]]; then
         list_id_for_this_attempt="${existing_by_index[$chunk_num]}"
-        resp=$(cf_curl PUT "/accounts/$CF_ACCOUNT_ID/gateway/lists/$list_id_for_this_attempt" "$body")
+        resp_raw=$(cf_curl_with_status PUT "/accounts/$CF_ACCOUNT_ID/gateway/lists/$list_id_for_this_attempt" "$body")
       else
-        resp=$(cf_curl POST "/accounts/$CF_ACCOUNT_ID/gateway/lists" "$body")
+        resp_raw=$(cf_curl_with_status POST "/accounts/$CF_ACCOUNT_ID/gateway/lists" "$body")
       fi
+      resp="${resp_raw%__HTTP_STATUS__*}"
+      http_status="${resp_raw##*__HTTP_STATUS__}"
 
       if is_valid_json <<< "$resp" && [[ "$(jq -r '.success' <<< "$resp")" == "true" ]]; then
         list_id="${list_id_for_this_attempt:-$(jq -r '.result.id' <<< "$resp")}"
@@ -388,12 +434,24 @@ upload_lists() {
         break
       fi
 
-      warn "清單 $name 第 $attempt 次上傳失敗$([[ $attempt -lt 3 ]] && echo "，$((attempt * 2)) 秒後重試" || echo "，已達重試上限")"
+      warn "清單 $name 第 $attempt 次上傳失敗（HTTP $http_status）$([[ $attempt -lt 3 ]] && echo "，$((attempt * 2)) 秒後重試" || echo "，已達重試上限")"
       [[ $attempt -lt 3 ]] && sleep $((attempt * 2))
     done
 
     if [[ $upload_ok -ne 1 ]]; then
-      warn "清單 $name 重試 3 次後仍然失敗，這批 $(wc -l < "$chunk_file" | xargs) 筆網域這次同步不會被涵蓋（不中止整個流程，繼續處理下一批；下次同步會再次嘗試）"
+      local affected_count
+      affected_count=$(wc -l < "$chunk_file" | xargs)
+      warn "清單 $name 重試 3 次後仍然失敗，這批 $affected_count 筆網域這次同步不會被涵蓋（不中止整個流程，繼續處理下一批；下次同步會再次嘗試）"
+
+      # 把完整失敗診斷寫進 D1，供日後檢討改善（例如判斷是不是特定內容、特定時段容易失敗）
+      local error_detail_json
+      error_detail_json=$(jq -n --arg r "$resp" '$r[0:2000]')  # 截斷避免內容過長
+      d1_query \
+        "INSERT INTO upload_failures (run_at, list_name, http_status, error_detail, domain_count_affected, attempt_count) VALUES (?, ?, ?, ?, ?, ?)" \
+        "$(jq -n --arg t "$(date +%s)" --arg n "$name" --arg s "$http_status" --arg e "$resp" --arg c "$affected_count" \
+           '[$t, $n, $s, ($e[0:2000]), $c, "3"]')" \
+        > /dev/null || warn "寫入上傳失敗診斷紀錄本身也失敗了（不影響本次同步結果）"
+
       start=$((start + LIST_CHUNK_SIZE))
       chunk_num=$((chunk_num + 1))
       continue
