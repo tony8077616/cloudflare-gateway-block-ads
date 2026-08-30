@@ -97,11 +97,19 @@ SLOT_FETCH_PARALLEL=10   # 讀取現有清單成員時的平行度（224 份循�
 # 定位很重要：KV 只是「讀取側」快取，D1 仍然是權威來源，寫入路徑完全沒有改變。
 # KV 讀取失敗、快照不存在、解壓失敗、格式不符 —— 任何一種情況都會退回讀 D1，
 # 也就是退回這個改動之前的行為，所以最壞情況等於現狀，不會更差。
-KV_NAMESPACE_ID="${KV_NAMESPACE_ID:-8b033b48486e45909750175222437f05}"  # adblock-category-cache
+# 注意這裡是 ${VAR-default} 不是 ${VAR:-default}：少一個冒號，語意差很多。
+# 加冒號的版本連「設成空字串」都會套用預設值，於是 KV_NAMESPACE_ID="" 停用不了快取，
+# 下面的 KV_ENABLED=0 會變成永遠碰不到的死碼。不加冒號才只在「未設定」時套預設。
+#
+# 這個預設值是本 repo 自己的 namespace。**如果你是 fork 過去用的，一定要換掉**：
+# 別人的 namespace id 配上你自己的 token，每次讀都會 404、每次寫都會失敗，
+# 然後靜靜地退回讀 D1 全表掃描 —— 功能還是對的，但每次同步要多讀 46 萬列。
+# 建立自己的 namespace 之後，改這一行或設同名環境變數即可。
+KV_NAMESPACE_ID="${KV_NAMESPACE_ID-8b033b48486e45909750175222437f05}"  # adblock-category-cache
 KV_CACHE_KEY="category-cache-v1"
 KV_MAX_BYTES=$((25 * 1024 * 1024))   # KV 單一值的硬上限
 KV_WARN_BYTES=$((20 * 1024 * 1024))  # 逼近上限時先示警，別等到寫入被拒才發現
-# namespace id 沒設就整個停用，行為完全等同這個改動之前
+# namespace id 設成空字串就整個停用，行為完全等同這個改動之前
 if [[ -n "$KV_NAMESPACE_ID" ]]; then KV_ENABLED=1; else KV_ENABLED=0; fi
 # 設為 1 可略過 KV 快照、強制從 D1 重讀並重建快照（快照壞掉時的復原手段）
 REBUILD_CACHE_BLOB="${REBUILD_CACHE_BLOB:-0}"
@@ -218,7 +226,14 @@ d1_ok() {
 
 ensure_schema() {
   local batch
+  # 七張表全部在這裡建立，全新安裝不需要手動下任何 SQL。
+  # 全部是 IF NOT EXISTS，對既有資料庫是無操作，不會動到現有資料。
   batch=$(jq -n '[
+    {sql: "CREATE TABLE IF NOT EXISTS custom_whitelist (domain TEXT PRIMARY KEY, reason TEXT, added_at INTEGER NOT NULL)"},
+    {sql: "CREATE TABLE IF NOT EXISTS custom_blocklist (domain TEXT PRIMARY KEY, reason TEXT, added_at INTEGER NOT NULL)"},
+    {sql: "CREATE TABLE IF NOT EXISTS domain_category_cache (domain TEXT PRIMARY KEY, is_ads_category INTEGER NOT NULL, categories TEXT, checked_at INTEGER NOT NULL)"},
+    {sql: "CREATE TABLE IF NOT EXISTS sync_history (id INTEGER PRIMARY KEY AUTOINCREMENT, run_at INTEGER NOT NULL, total_merged INTEGER, total_uploaded INTEGER, total_excluded_by_native_category INTEGER, total_whitelisted INTEGER, status TEXT, notes TEXT)"},
+    {sql: "CREATE TABLE IF NOT EXISTS upload_failures (id INTEGER PRIMARY KEY AUTOINCREMENT, run_at INTEGER NOT NULL, list_name TEXT NOT NULL, http_status TEXT, error_detail TEXT, domain_count_affected INTEGER, attempt_count INTEGER)"},
     {sql: "CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)"},
     {sql: "CREATE TABLE IF NOT EXISTS d1_daily_writes (day TEXT PRIMARY KEY, writes INTEGER NOT NULL, updated_at INTEGER NOT NULL)"},
     {sql: "DROP TABLE IF EXISTS list_chunk_state"}
@@ -751,6 +766,7 @@ save_category_cache_blob() {
     log "KV 快照已更新：$CACHE_BLOB_ROWS 筆（新增 $fresh_rows），壓縮後 $CACHE_BLOB_BYTES bytes"
   else
     warn "KV 快照寫入失敗，下次同步會退回讀 D1 全表（不影響本次結果）"
+    warn "  若這是 fork 後的第一次執行，請確認 KV_NAMESPACE_ID 已換成你自己的 namespace"
     CACHE_BLOB_ROWS=0
     CACHE_BLOB_BYTES=0
   fi

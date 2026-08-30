@@ -135,15 +135,30 @@ _domain_and_parents() {
   done
 }
 
+_domain_proper_suffixes() {
+  # 輸出這個網域「去掉至少一個標籤」之後的所有後綴，一路到裸 TLD。
+  # 專供白名單後綴比對使用 —— 必須跟 sync.sh 的走法完全一致，細節見上方說明。
+  local rest="$1"
+  while [[ "$rest" == *.* ]]; do
+    rest="${rest#*.}"
+    echo "$rest"
+  done
+}
+
 _find_check_whitelist() {
   # $1 = 目標網域, $2 = 父網域候選檔。命中就印出命中的那筆白名單條目。
   # 語意必須跟 sync.sh 一致：預設是精確比對，只有 *.suffix 寫法才吃後綴。
-  local domain="$1" parents="$2" resp
+  local domain="$1" resp
   resp=$(d1_query "SELECT domain FROM custom_whitelist")
   [[ "$(echo "$resp" | jq -r '.success')" == "true" ]] || { echo "ERROR"; return; }
 
+  # 刻意不用呼叫端傳進來的父網域檔：那一份含網域本體、又停在兩個標籤，
+  # 兩點都跟 sync.sh 的後綴比對語意不合。這裡自己算一份忠實的。
+  local sfile="$TMP_DIR/suffixes.txt"
+  _domain_proper_suffixes "$domain" > "$sfile"
+
   echo "$resp" | jq -r '.result[0].results[]?.domain // empty' \
-    | awk -v target="$domain" -v pfile="$parents" '
+    | awk -v target="$domain" -v pfile="$sfile" '
         BEGIN { while ((getline p < pfile) > 0) parent[p] = 1 }
         {
           if ($0 == target) { print $0 " （精確比對）"; found = 1; exit }
@@ -253,6 +268,7 @@ cmd_find() {
 
   # 1. 白名單
   local wl blocked_reason="" verdict_parts=()
+  # 第二個參數保留是為了呼叫形式一致；白名單比對自己算後綴集合，見該函式說明
   wl=$(_find_check_whitelist "$domain" "$parents")
   if [[ "$wl" == "ERROR" ]]; then
     echo "1. 白名單　　　　　　⚠ 查詢失敗"
@@ -278,6 +294,7 @@ cmd_find() {
 
   # 3. Cloudflare 原生分類（讀 KV 快照，不碰 D1）
   local cat_out self_line parent_lines
+  PARENT_CAT_HIT=0
   cat_out=$(_find_check_category_cache "$domain" "$parents")
   if [[ "$cat_out" == "UNAVAILABLE" ]]; then
     echo "3. Cloudflare 原生分類　⚠ 讀不到 KV 快照，略過這一項"
@@ -297,6 +314,9 @@ cmd_find() {
     if [[ -n "$parent_lines" ]]; then
       echo "   另外，這些父網域有被原生分類涵蓋："
       echo "$parent_lines" | awk -F'\t' '{print "     - " $2}'
+      echo "   （僅供參考：是否連帶涵蓋子網域取決於 Cloudflare 對該分類的套用範圍，"
+      echo "     這裡無法斷定，需要實際發一次 DNS 查詢確認）"
+      PARENT_CAT_HIT=1
     fi
   fi
 
@@ -324,6 +344,9 @@ cmd_find() {
     echo "結論：不會被擋 —— 白名單優先於所有封鎖來源。"
   elif [[ ${#verdict_parts[@]} -gt 0 ]]; then
     echo "結論：會被擋 —— 來源：$(printf '%s、' "${verdict_parts[@]}" | sed 's/、$//')"
+  elif [[ "$PARENT_CAT_HIT" == "1" ]]; then
+    echo "結論：無法斷定 —— 四項都沒有直接命中，但上面列出的父網域有被原生分類涵蓋。"
+    echo "      實際是否被擋取決於該分類是否連帶套用到子網域，請發一次 DNS 查詢確認。"
   else
     echo "結論：不會被擋 —— 四項都沒有命中。"
     echo "      如果你預期它該被擋，先確認 sync_history 最後一次同步時間是否晚於你的異動時間。"
