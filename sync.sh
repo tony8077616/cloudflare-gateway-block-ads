@@ -1099,8 +1099,13 @@ sync_slots() {
   # 只上傳內容真的變了的槽位；輸出所有有效清單的 id 供 Policy 引用
   local idx_list="$TMP_DIR/slot_indices.txt"
   local total changed
-  total=$(grep -c . "$idx_list" 2>/dev/null || echo 0)
-  changed=$(grep -c . "$TMP_DIR/changed_slots.txt" 2>/dev/null || echo 0)
+  # grep -c 在「檔案存在但零行」時，會先印出 0、然後才回傳 exit 1。
+  # 所以不能寫成 `|| echo 0`：那個 0 已經印過了，後備的 echo 會再印一次，
+  # 變數就變成含換行的兩行內容，日誌跟 Job Summary 都會錯行。
+  # 改用 `|| true` 只吃掉那個 exit 1；檔案根本不存在時 grep 什麼都不印，
+  # 那種情況才由 ${x:-0} 補上預設值。
+  total=$(grep -c . "$idx_list" 2>/dev/null || true); total=${total:-0}
+  changed=$(grep -c . "$TMP_DIR/changed_slots.txt" 2>/dev/null || true); changed=${changed:-0}
   UPLOAD_STAT_TOTAL=$total
   log "清單總數 $total 份，其中 $changed 份需要上傳"
 
