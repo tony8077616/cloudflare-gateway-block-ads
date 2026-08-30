@@ -28,6 +28,7 @@ cleanup_on_exit() {
   local code=$?
   # 用 ${VAR:-} 取值：這個 trap 在設定變數與函式之前就已掛上，
   # 若是在初始化階段（例如缺少必要環境變數）就結束，這些名稱還不存在。
+  if [[ "${GROUP_OPEN:-0}" == "1" ]]; then group_end; fi
   if [[ "${STATE_AVAILABLE:-0}" == "1" && "${D1_WRITES_ADDED:-0}" -gt 0 ]]; then
     save_daily_budget 2>/dev/null || true
   fi
@@ -72,7 +73,9 @@ STATE_AVAILABLE=1
 # 前次狀態檔路徑（載入後由 state_get 讀取，用來取各來源的 ETag/Last-Modified）
 PREV_STATE_FILE=""
 
-# 清單上傳進度統計（由 upload_lists 填寫，供結尾摘要使用）
+SLOT_FETCH_PARALLEL=10   # 讀取現有清單成員時的平行度（224 份循序讀太慢）
+
+# 清單上傳進度統計（由 sync_slots 填寫，供結尾摘要使用）
 UPLOAD_STAT_UPLOADED=0
 UPLOAD_STAT_SKIPPED=0
 UPLOAD_STAT_FAILED=0
@@ -80,6 +83,32 @@ UPLOAD_STAT_TOTAL=0
 
 log() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
 warn() { echo "[$(date '+%H:%M:%S')] ⚠ $*" >&2; }
+
+# GitHub Actions 的可收折區塊（跟 Set up job / Run actions/checkout 一樣可以收合）。
+#
+# 標記必須跟 log/warn 走同一個輸出串流，否則會錯位：stderr 不緩衝、stdout 被導向
+# 管線時是區塊緩衝，兩者分開寫的話 ::group:: 會跟它要包住的內容分家。log 又不能改
+# 寫 stdout —— 那會污染 load_whitelist 這類用 $(...) 取回傳值的函式。
+# 所以標記一律寫 stderr，並在 workflow 用 `./sync.sh 2>&1` 合併成單一串流。
+#
+# Actions 不支援巢狀 group，因此 group_begin 會先關掉前一個，呼叫端不必自己配對。
+GROUP_OPEN=0
+group_begin() {
+  group_end
+  case "${GITHUB_ACTIONS:-}" in
+    "") echo "── $* ──" >&2 ;;
+    *)  echo "::group::$*" >&2 ;;
+  esac
+  GROUP_OPEN=1
+}
+group_end() {
+  [[ $GROUP_OPEN -eq 1 ]] || return 0
+  case "${GITHUB_ACTIONS:-}" in
+    "") : ;;
+    *)  echo "::endgroup::" >&2 ;;
+  esac
+  GROUP_OPEN=0
+}
 
 is_valid_json() {
   # 讀 stdin，回傳是否為合法 JSON（用來在丟給 jq 做實際解析前先擋掉非 JSON 回應，
@@ -147,14 +176,17 @@ d1_ok() {
 #   sync_state       key-value，存各來源解析後輸出的 checksum、白名單/自訂封鎖清單
 #                    的 checksum，以及積欠未寫入的分類快取筆數
 #   d1_daily_writes  每日（UTC）D1 寫入用量，讓額度控管跨執行累計
-#   list_chunk_state 每份 Gateway 清單的內容 checksum，用來做差異上傳與中斷續傳
+#
+# 註：曾經有一張 list_chunk_state 存每份清單的 checksum，用來判斷哪幾份要重傳。
+# 改用穩定槽位模型後，每次同步都直接向 Cloudflare 讀回實際成員，那才是權威來源，
+# 同時涵蓋差異偵測與中斷續傳，這張表就沒有存在意義了，這裡順手清掉。
 
 ensure_schema() {
   local batch
   batch=$(jq -n '[
     {sql: "CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)"},
     {sql: "CREATE TABLE IF NOT EXISTS d1_daily_writes (day TEXT PRIMARY KEY, writes INTEGER NOT NULL, updated_at INTEGER NOT NULL)"},
-    {sql: "CREATE TABLE IF NOT EXISTS list_chunk_state (chunk_num INTEGER PRIMARY KEY, list_id TEXT NOT NULL, checksum TEXT NOT NULL, item_count INTEGER NOT NULL, updated_at INTEGER NOT NULL)"}
+    {sql: "DROP TABLE IF EXISTS list_chunk_state"}
   ]')
   if d1_batch "$batch" | d1_ok; then
     return 0
@@ -348,6 +380,8 @@ fetch_and_merge_sources() {
   : > "$TMP_DIR/newmeta.txt"
   : > "$TMP_DIR/source_list.txt"
 
+  local total_sources n=0
+  total_sources=$(grep -cvE '^[[:space:]]*(#|$)' "$SOURCES_FILE" | xargs)
   local n_304=0 n_200=0
   while IFS='|' read -r name url format; do
     # 跳過空行與註解
@@ -356,35 +390,42 @@ fetch_and_merge_sources() {
     url="$(echo "$url" | xargs)"
     format="$(echo "$format" | xargs)"
     printf '%s\t%s\t%s\n' "$name" "$url" "$format" >> "$TMP_DIR/source_list.txt"
+    n=$((n + 1))
 
     local code
     code=$(curl_source "$name" "$url" 1)
 
-    if [[ "$code" == "304" ]]; then
-      # 內容未變，伺服器沒回傳 body。沿用前次 checksum，內容等到確定要完整同步才補抓。
-      local prev_sum
-      prev_sum=$(state_get "src:$name")
-      if [[ -z "$prev_sum" ]]; then
-        # 理論上不會發生（有 ETag 就該有 checksum）；保險起見改成無條件重抓
-        warn "[$name] 回應 304 但沒有前次 checksum，改用無條件請求重抓"
-        code=$(curl_source "$name" "$url" 0)
-      else
-        echo "$prev_sum" > "$TMP_DIR/sum_$name.txt"
-        printf '%s\t%s\n' "$name" "$format" >> "$TMP_DIR/notmodified.txt"
-        n_304=$((n_304 + 1))
-        log "[$name] 304 未修改，沿用前次 checksum（未下載內容）"
-        continue
-      fi
-    fi
+    case "$code" in
+      304)
+        # 內容未變，伺服器沒回傳 body。沿用前次 checksum，內容等到確定要完整同步才補抓。
+        local prev_sum
+        prev_sum=$(state_get "src:$name")
+        if [[ -z "$prev_sum" ]]; then
+          # 理論上不會發生（有 ETag 就該有 checksum）；保險起見改成無條件重抓
+          warn "[$n/$total_sources] $name 回應 304 但沒有前次 checksum，改用無條件請求重抓"
+          code=$(curl_source "$name" "$url" 0)
+        else
+          echo "$prev_sum" > "$TMP_DIR/sum_$name.txt"
+          printf '%s\t%s\n' "$name" "$format" >> "$TMP_DIR/notmodified.txt"
+          n_304=$((n_304 + 1))
+          log "[$n/$total_sources] $name 304 未修改，沿用前次 checksum（未下載內容）"
+          continue
+        fi
+        ;;
+    esac
 
-    if [[ "$code" != "200" ]]; then
-      warn "[$name] 抓取失敗（HTTP $code），略過此來源"
-      echo "$name" >> "$TMP_DIR/failed_sources.txt"
-      continue
-    fi
+    # 上面的 304 分支可能已經改寫過 code（重抓），所以這裡重新判斷一次
+    case "$code" in
+      200) : ;;
+      *)
+        warn "[$n/$total_sources] $name 抓取失敗（HTTP $code），略過此來源"
+        echo "$name" >> "$TMP_DIR/failed_sources.txt"
+        continue
+        ;;
+    esac
 
     if ! parse_source_into "$name" "$format"; then
-      warn "[$name] 未知格式 '$format'，略過"
+      warn "[$n/$total_sources] $name 未知格式 '$format'，略過"
       echo "$name" >> "$TMP_DIR/failed_sources.txt"
       continue
     fi
@@ -395,7 +436,7 @@ fetch_and_merge_sources() {
       "$(header_value "$TMP_DIR/hdr_$name.txt" 'Last-Modified')" >> "$TMP_DIR/newmeta.txt"
 
     n_200=$((n_200 + 1))
-    log "[$name] 解析出 $(wc -l < "$TMP_DIR/parsed_$name.txt" | xargs) 筆網域（checksum $(cut -c1-12 < "$TMP_DIR/sum_$name.txt")）"
+    log "[$n/$total_sources] $name 解析出 $(wc -l < "$TMP_DIR/parsed_$name.txt" | xargs) 筆網域（checksum $(cut -c1-12 < "$TMP_DIR/sum_$name.txt")）"
   done < "$SOURCES_FILE"
 
   log "來源抓取完成：$n_200 個有更新、$n_304 個回應 304 未修改、$(wc -l < "$TMP_DIR/failed_sources.txt" | xargs) 個失敗"
@@ -596,12 +637,19 @@ save_category_cache_batch() {
     resp=$(curl -sS --max-time 30 -X POST "$CF_API/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
       -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
       --data "$body")
-    if [[ "$(echo "$resp" | jq -r '.success // false')" != "true" ]]; then
-      warn "寫入分類快取第 $start~$((start + write_chunk_size)) 批失敗，略過（不影響本次結果，只影響下次快取命中率）"
-      DEFERRED_CACHE_ROWS=$((DEFERRED_CACHE_ROWS + this_chunk_size))
-    else
-      D1_WRITES_ADDED=$((D1_WRITES_ADDED + this_chunk_size))
-    fi
+    case "$(echo "$resp" | jq -r '.success // false')" in
+      true)
+        D1_WRITES_ADDED=$((D1_WRITES_ADDED + this_chunk_size))
+        ;;
+      *)
+        warn "寫入分類快取第 $start~$((start + write_chunk_size)) 批失敗，略過（不影響本次結果，只影響下次快取命中率）"
+        DEFERRED_CACHE_ROWS=$((DEFERRED_CACHE_ROWS + this_chunk_size))
+        ;;
+    esac
+
+    local written=$(( start + this_chunk_size - 1 ))
+    [[ $written -gt $total_lines ]] && written=$total_lines
+    log "  寫入分類快取進度 $written/$total_lines（今日 D1 用量 $((D1_WRITES_TODAY + D1_WRITES_ADDED))/$D1_DAILY_WRITE_BUDGET）"
 
     start=$((start + write_chunk_size))
   done
@@ -635,21 +683,36 @@ _check_categories_worker() {
     resp=$(curl -sS --max-time 30 "$CF_API/accounts/$CF_ACCOUNT_ID/intel/domain/bulk?$query" \
       -H "Authorization: Bearer $CF_API_TOKEN")
 
+    # 先把回應歸成單一分類再用 case 分派（取代原本的 if-elif-else 鏈）
+    local resp_kind
     if ! is_valid_json <<< "$resp"; then
-      warn "[worker $worker_id] 第 $i~$((i+BULK_BATCH_SIZE)) 批分類查詢回應不是合法 JSON（可能是暫時性網路問題或速率限制），這批網域本次視為『未被原生分類涵蓋』（保守處理，寧可多上傳也不要漏擋）"
-      awk '{print $1, 0}' "$batch_file" >> "$out_file"
-    elif [[ "$(jq -r '.success // false' <<< "$resp")" != "true" ]]; then
-      warn "[worker $worker_id] 第 $i~$((i+BULK_BATCH_SIZE)) 批分類查詢失敗，這批網域本次視為『未被原生分類涵蓋』（保守處理，寧可多上傳也不要漏擋）"
-      awk '{print $1, 0}' "$batch_file" >> "$out_file"
+      resp_kind="invalid_json"
     else
-      jq -r '.result[]? |
+      case "$(jq -r '.success // false' <<< "$resp")" in
+        true) resp_kind="ok" ;;
+        *)    resp_kind="failed" ;;
+      esac
+    fi
+
+    case "$resp_kind" in
+      invalid_json)
+        warn "[worker $worker_id] 第 $i~$((i+BULK_BATCH_SIZE)) 批分類查詢回應不是合法 JSON（可能是暫時性網路問題或速率限制），這批網域本次視為『未被原生分類涵蓋』（保守處理，寧可多上傳也不要漏擋）"
+        awk '{print $1, 0}' "$batch_file" >> "$out_file"
+        ;;
+      failed)
+        warn "[worker $worker_id] 第 $i~$((i+BULK_BATCH_SIZE)) 批分類查詢失敗，這批網域本次視為『未被原生分類涵蓋』（保守處理，寧可多上傳也不要漏擋）"
+        awk '{print $1, 0}' "$batch_file" >> "$out_file"
+        ;;
+      ok)
+        jq -r '.result[]? |
         [.domain, (if ([.content_categories[]?.name] | any(. == "Advertisements" or . == "Trackers/Analytics")) then 1 else 0 end),
          ([.content_categories[]?.name] | tostring)] | @tsv' <<< "$resp" \
-        | while IFS=$'\t' read -r domain is_ads cats; do
-            echo "$domain $is_ads" >> "$out_file"
-            echo -e "$domain\t$is_ads\t$cats" >> "$cache_batch_file"
-          done
-    fi
+          | while IFS=$'\t' read -r domain is_ads cats; do
+              echo "$domain $is_ads" >> "$out_file"
+              echo -e "$domain\t$is_ads\t$cats" >> "$cache_batch_file"
+            done
+        ;;
+    esac
 
     rm -f "$batch_file"
     log "[worker $worker_id] 分類查詢進度：$(( i + BULK_BATCH_SIZE > total ? total : i + BULK_BATCH_SIZE ))/$total"
@@ -737,198 +800,227 @@ get_existing_lists() {
     | jq -r --arg prefix "$LIST_PREFIX" '.result[] | select(.name | startswith($prefix)) | "\(.id) \(.name)"'
 }
 
-load_chunk_state() {
-  # 輸出每行「chunk_num<TAB>list_id<TAB>checksum」
-  [[ $STATE_AVAILABLE -eq 1 ]] || return 0
-  local resp
-  resp=$(d1_query "SELECT chunk_num, list_id, checksum FROM list_chunk_state")
-  if ! d1_ok <<< "$resp"; then
-    warn "讀取 list_chunk_state 失敗，本次所有清單都會重新上傳（結果正確，只是比較慢）"
-    return 0
-  fi
-  jq -r '.result[0].results[]? | "\(.chunk_num)\t\(.list_id)\t\(.checksum)"' <<< "$resp"
-}
+# ── 穩定槽位（stable slot）清單模型 ─────────────────────
+# 舊模型是「排序後每 1000 筆連續切片」，缺點是只要有一個網域增減，它之後的每一份
+# 清單內容都會位移一格，於是全部被判定為需要重傳。實測移除一個位於第 ~144,000 位
+# 的網域，就讓第 145~224 份全部重傳。
+#
+# 新模型把每份清單當成一個「槽位」：
+#   - 移除網域 → 只從它所在的那一份拿掉，該份留下空缺，其他份完全不動
+#   - 新增網域 → 優先填進編號最小、還有空缺的槽位，填滿了才開新的
+# 於是「移除一個網域」只會重傳一份清單。
+#
+# 成員資料直接向 Cloudflare 讀取，不另外存一份：它是權威來源、能自我修復
+# （有人手動改過清單也會被看見），而且同時涵蓋了中斷續傳 —— 上次沒傳完的狀態，
+# 這裡讀到的就是未完成的實況，這次自然會把差額補上。
+# 代價是清單內容會逐漸失去字母序，對封鎖行為沒有影響。
 
-flush_chunk_state() {
-  # $1 = 待寫入檔案，每行「chunk_num<TAB>list_id<TAB>checksum<TAB>item_count」
-  # 刻意在上傳過程中分批寫回（而不是全部跑完才寫），這樣萬一 job 被逾時或取消砍掉，
-  # 已完成的批次狀態仍然留在 D1，下次執行就能從中斷處續傳而不是整個重來。
-  [[ $STATE_AVAILABLE -eq 1 ]] || return 0
-  local state_file="$1"
-  [[ -s "$state_file" ]] || return 0
-  local batch rows
-  batch=$(jq -R -s -c --arg now "$(date +%s)" '
-    split("\n") | map(select(length > 0) | split("\t")) | map({
-      sql: "INSERT INTO list_chunk_state (chunk_num, list_id, checksum, item_count, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(chunk_num) DO UPDATE SET list_id=excluded.list_id, checksum=excluded.checksum, item_count=excluded.item_count, updated_at=excluded.updated_at",
-      params: [.[0], .[1], .[2], .[3], $now]
-    })' "$state_file")
-  rows=$(jq 'length' <<< "$batch")
-  if d1_batch "$batch" | d1_ok; then
-    D1_WRITES_ADDED=$((D1_WRITES_ADDED + rows))
-    : > "$state_file"
-  else
-    warn "寫入 list_chunk_state 失敗（下次執行會重傳這些清單，結果仍正確）"
-    : > "$state_file"
-  fi
-}
+fetch_slot_membership() {
+  # 讀回每份既有清單目前的成員 → $TMP_DIR/slot/<idx>.txt（已排序）
+  # 同時輸出 $TMP_DIR/slot_ids.txt（idx<TAB>list_id）
+  mkdir -p "$TMP_DIR/slot"
+  : > "$TMP_DIR/slot_ids.txt"
 
-upload_lists() {
-  # $1 = 最終網域清單檔案（已排序去重）
-  local final_file="$1"
-  local total total_chunks
-  total=$(wc -l < "$final_file" | xargs)
-  total_chunks=$(( (total + LIST_CHUNK_SIZE - 1) / LIST_CHUNK_SIZE ))
-  log "準備上傳：$total 筆網域，共 $total_chunks 份清單"
-
-  # 讀取現有清單，用編號對應
-  declare -A existing_by_index
+  local id name idx
   while read -r id name; do
-    local idx
     idx=$(echo "$name" | grep -oE '[0-9]+$' | sed 's/^0*//')
-    [[ -n "$idx" ]] && existing_by_index[$idx]="$id"
+    [[ -n "$idx" ]] && printf '%s\t%s\n' "$idx" "$id" >> "$TMP_DIR/slot_ids.txt"
   done < <(get_existing_lists)
 
-  # 前次每份清單的內容 checksum，用來判斷這次哪幾份真的需要重傳
-  declare -A prev_sum prev_id
-  local _cnum _cid _csum
-  while IFS=$'\t' read -r _cnum _cid _csum; do
-    [[ -n "$_cnum" ]] || continue
-    prev_sum[$_cnum]="$_csum"
-    prev_id[$_cnum]="$_cid"
-  done < <(load_chunk_state)
+  local total
+  total=$(wc -l < "$TMP_DIR/slot_ids.txt" | xargs)
+  if [[ $total -eq 0 ]]; then
+    log "Gateway 上還沒有任何清單，全部視為新建"
+    return 0
+  fi
+
+  log "讀取現有清單成員：共 $total 份"
+  local running=0 done_n=0
+  while IFS=$'\t' read -r idx id; do
+    {
+      # 每份清單上限就是 LIST_CHUNK_SIZE 筆，一頁取完，不需要分頁
+      cf_curl GET "/accounts/$CF_ACCOUNT_ID/gateway/lists/$id/items?per_page=$LIST_CHUNK_SIZE" \
+        | jq -r '.result[]?.value // empty' | sort -u > "$TMP_DIR/slot/$idx.txt"
+    } &
+    running=$((running + 1))
+    if [[ $running -ge $SLOT_FETCH_PARALLEL ]]; then
+      wait -n 2>/dev/null || wait
+      running=$((running - 1))
+      done_n=$((done_n + 1))
+      if [[ $((done_n % 40)) -eq 0 ]]; then log "  讀取進度 $done_n/$total"; fi
+    fi
+  done < "$TMP_DIR/slot_ids.txt"
+  wait
+  log "  讀取進度 $total/$total（完成）"
+}
+
+plan_slot_changes() {
+  # $1 = 目標網域清單（已排序去重）
+  # 產生 $TMP_DIR/newslot/<idx>.txt、changed_slots.txt、empty_slots.txt、slot_indices.txt
+  local desired="$1"
+  mkdir -p "$TMP_DIR/newslot"
+  : > "$TMP_DIR/changed_slots.txt"
+  : > "$TMP_DIR/empty_slots.txt"
+
+  local idx_list="$TMP_DIR/slot_indices.txt"
+  cut -f1 "$TMP_DIR/slot_ids.txt" 2>/dev/null | sort -n > "$idx_list"
+
+  local current_all="$TMP_DIR/current_all.txt"
+  cat "$TMP_DIR/slot"/*.txt 2>/dev/null | sort -u > "$current_all"
+
+  local to_remove="$TMP_DIR/to_remove.txt" to_add="$TMP_DIR/to_add.txt"
+  comm -23 "$current_all" "$desired" > "$to_remove"
+  comm -13 "$current_all" "$desired" > "$to_add"
+  log "與 Gateway 現況比對：需移除 $(wc -l < "$to_remove" | xargs) 筆、需新增 $(wc -l < "$to_add" | xargs) 筆"
+
+  # 第一步：各槽位先拿掉要移除的網域，空出來的位置留著不動其他槽位
+  local idx
+  while read -r idx; do
+    [[ -n "$idx" ]] || continue
+    comm -23 "$TMP_DIR/slot/$idx.txt" "$to_remove" > "$TMP_DIR/newslot/$idx.txt"
+  done < "$idx_list"
+
+  # 第二步：新增的網域優先遞補編號最小、還有空缺的槽位
+  local remaining="$TMP_DIR/remaining_add.txt"
+  cp "$to_add" "$remaining"
+  local filled_slots=0
+  while read -r idx; do
+    [[ -s "$remaining" ]] || break
+    [[ -n "$idx" ]] || continue
+    local cnt free
+    cnt=$(wc -l < "$TMP_DIR/newslot/$idx.txt" | xargs)
+    free=$((LIST_CHUNK_SIZE - cnt))
+    [[ $free -gt 0 ]] || continue
+    head -n "$free" "$remaining" >> "$TMP_DIR/newslot/$idx.txt"
+    sort -u -o "$TMP_DIR/newslot/$idx.txt" "$TMP_DIR/newslot/$idx.txt"
+    tail -n +"$((free + 1))" "$remaining" > "$remaining.tmp" && mv "$remaining.tmp" "$remaining"
+    filled_slots=$((filled_slots + 1))
+  done < "$idx_list"
+  if [[ $filled_slots -gt 0 ]]; then log "  有 $filled_slots 份清單的空缺被新網域遞補"; fi
+
+  # 第三步：還有剩的才開新槽位
+  local next_idx new_slots=0 last_idx
+  last_idx=$(tail -1 "$idx_list" 2>/dev/null)
+  next_idx=$(( ${last_idx:-0} + 1 ))
+  while [[ -s "$remaining" ]]; do
+    head -n "$LIST_CHUNK_SIZE" "$remaining" | sort -u > "$TMP_DIR/newslot/$next_idx.txt"
+    echo "$next_idx" >> "$idx_list"
+    tail -n +"$((LIST_CHUNK_SIZE + 1))" "$remaining" > "$remaining.tmp" && mv "$remaining.tmp" "$remaining"
+    next_idx=$((next_idx + 1))
+    new_slots=$((new_slots + 1))
+  done
+  if [[ $new_slots -gt 0 ]]; then log "  新增了 $new_slots 份清單容納放不下的網域"; fi
+
+  # 第四步：標記真正有變動的槽位，以及變成空的槽位
+  while read -r idx; do
+    [[ -n "$idx" ]] || continue
+    local newf="$TMP_DIR/newslot/$idx.txt" oldf="$TMP_DIR/slot/$idx.txt"
+    if [[ ! -s "$newf" ]]; then
+      echo "$idx" >> "$TMP_DIR/empty_slots.txt"
+      continue
+    fi
+    if [[ ! -f "$oldf" ]] || ! cmp -s "$newf" "$oldf"; then
+      echo "$idx" >> "$TMP_DIR/changed_slots.txt"
+    fi
+  done < "$idx_list"
+}
+
+sync_slots() {
+  # 只上傳內容真的變了的槽位；輸出所有有效清單的 id 供 Policy 引用
+  local idx_list="$TMP_DIR/slot_indices.txt"
+  local total changed
+  total=$(grep -c . "$idx_list" 2>/dev/null || echo 0)
+  changed=$(grep -c . "$TMP_DIR/changed_slots.txt" 2>/dev/null || echo 0)
+  UPLOAD_STAT_TOTAL=$total
+  log "清單總數 $total 份，其中 $changed 份需要上傳"
+
+  declare -A slot_id
+  local idx id
+  while IFS=$'\t' read -r idx id; do slot_id[$idx]="$id"; done < "$TMP_DIR/slot_ids.txt"
 
   local list_ids_file="$TMP_DIR/list_ids.txt"
   : > "$list_ids_file"
-  local pending_state_file="$TMP_DIR/pending_chunk_state.txt"
-  : > "$pending_state_file"
-  local n_uploaded=0 n_skipped=0 n_failed=0
+  local n=0 n_up=0 n_skip=0 n_fail=0
 
-  local chunk_num=1
-  local start=1
-  while [[ $start -le $total ]]; do
-    local chunk_file="$TMP_DIR/chunk_$chunk_num.txt"
-    sed -n "${start},$((start + LIST_CHUNK_SIZE - 1))p" "$final_file" > "$chunk_file"
+  while read -r idx; do
+    [[ -n "$idx" ]] || continue
+    n=$((n + 1))
+    local existing_id="${slot_id[$idx]:-}"
 
-    local name checksum existing_id
-    name=$(printf "%s - %03d" "$LIST_PREFIX" "$chunk_num")
-    checksum=$(sha256sum < "$chunk_file" | awk '{print $1}')
-    existing_id="${existing_by_index[$chunk_num]:-}"
-
-    # 差異上傳：內容 checksum 與前次相同、而且該清單在 Gateway 上確實還在（id 也對得上），
-    # 就沒有重傳的必要。這同時就是中斷續傳的機制 —— 上次跑到一半被砍掉的話，
-    # 已完成批次的 checksum 早已寫進 list_chunk_state，這次只會補傳剩下的部分。
-    if [[ -n "$existing_id" && "${prev_sum[$chunk_num]:-}" == "$checksum" && "${prev_id[$chunk_num]:-}" == "$existing_id" ]]; then
-      echo "$existing_id" >> "$list_ids_file"
-      n_skipped=$((n_skipped + 1))
-      log "[$chunk_num/$total_chunks] $name 內容未變，略過重傳"
-      start=$((start + LIST_CHUNK_SIZE))
-      chunk_num=$((chunk_num + 1))
+    # 這一份沒有變動就不重傳，直接沿用既有 id
+    if ! grep -qx "$idx" "$TMP_DIR/changed_slots.txt" 2>/dev/null; then
+      if [[ -n "$existing_id" ]]; then echo "$existing_id" >> "$list_ids_file"; fi
+      n_skip=$((n_skip + 1))
       continue
     fi
 
-    local items_json
+    local name items_json body chunk_file
+    chunk_file="$TMP_DIR/newslot/$idx.txt"
+    name=$(printf "%s - %03d" "$LIST_PREFIX" "$idx")
     items_json=$(jq -R -s -c 'split("\n") | map(select(length > 0)) | map({value: .})' "$chunk_file")
-    local body
     body=$(jq -n --arg name "$name" --argjson items "$items_json" '{name: $name, type: "DOMAIN", items: $items}')
 
-    # 單一清單上傳加上重試機制（最多 3 次，指數退避），
-    # 避免 150+ 次連續呼叫中偶發的暫時性網路/API 波動就讓整個上傳流程中止。
     local resp resp_raw http_status list_id attempt upload_ok=0
     for attempt in 1 2 3; do
-      local list_id_for_this_attempt=""
-      if [[ -n "${existing_by_index[$chunk_num]:-}" ]]; then
-        list_id_for_this_attempt="${existing_by_index[$chunk_num]}"
-        resp_raw=$(cf_curl_with_status PUT "/accounts/$CF_ACCOUNT_ID/gateway/lists/$list_id_for_this_attempt" "$body")
-      else
-        resp_raw=$(cf_curl_with_status POST "/accounts/$CF_ACCOUNT_ID/gateway/lists" "$body")
-      fi
+      case "$existing_id" in
+        "") resp_raw=$(cf_curl_with_status POST "/accounts/$CF_ACCOUNT_ID/gateway/lists" "$body") ;;
+        *)  resp_raw=$(cf_curl_with_status PUT "/accounts/$CF_ACCOUNT_ID/gateway/lists/$existing_id" "$body") ;;
+      esac
       resp="${resp_raw%__HTTP_STATUS__*}"
       http_status="${resp_raw##*__HTTP_STATUS__}"
 
       if is_valid_json <<< "$resp" && [[ "$(jq -r '.success' <<< "$resp")" == "true" ]]; then
-        list_id="${list_id_for_this_attempt:-$(jq -r '.result.id' <<< "$resp")}"
+        list_id="${existing_id:-$(jq -r '.result.id' <<< "$resp")}"
         upload_ok=1
         break
       fi
-
-      warn "清單 $name 第 $attempt 次上傳失敗（HTTP $http_status）$([[ $attempt -lt 3 ]] && echo "，$((attempt * 2)) 秒後重試" || echo "，已達重試上限")"
-      [[ $attempt -lt 3 ]] && sleep $((attempt * 2))
+      warn "清單 $name 第 $attempt 次上傳失敗（HTTP $http_status）"
+      if [[ $attempt -lt 3 ]]; then sleep $((attempt * 2)); fi
     done
 
-    if [[ $upload_ok -ne 1 ]]; then
-      local affected_count
-      affected_count=$(wc -l < "$chunk_file" | xargs)
-      n_failed=$((n_failed + 1))
-      # 上傳失敗但這份清單本來就存在的話，它在 Gateway 上仍保有「上一次的內容」。
-      # 讓 Policy 繼續引用它，比整份從 Policy 拿掉（等於那 1000 筆全部解除封鎖）安全得多。
-      # 這次不寫 list_chunk_state，所以下次執行會判定為需要重傳而自動重試。
-      if [[ -n "$existing_id" ]]; then
-        echo "$existing_id" >> "$list_ids_file"
-        warn "[$chunk_num/$total_chunks] $name 重試 3 次後仍失敗，保留 Gateway 上既有的舊內容並繼續引用（下次執行會自動重傳這 $affected_count 筆）"
-      else
-        warn "[$chunk_num/$total_chunks] $name 重試 3 次後仍失敗，且這是新清單、Gateway 上沒有舊版可用，這批 $affected_count 筆網域本次不會被涵蓋（下次執行會再試）"
-      fi
+    local affected
+    affected=$(wc -l < "$chunk_file" | xargs)
+    case "$upload_ok" in
+      1)
+        echo "$list_id" >> "$list_ids_file"
+        n_up=$((n_up + 1))
+        log "[$n/$total] $name 已上傳（$affected 筆）"
+        ;;
+      *)
+        n_fail=$((n_fail + 1))
+        # 上傳失敗但清單本來就存在的話，Gateway 上仍是上一次的內容。讓 Policy 繼續
+        # 引用它，比整份拿掉（等於那些網域全部解除封鎖）安全得多。下次執行會再從
+        # Cloudflare 讀到實況，自動判定需要重傳。
+        case "$existing_id" in
+          "") warn "[$n/$total] $name 上傳失敗，且是新清單沒有舊版可用，這 $affected 筆本次不會被涵蓋" ;;
+          *)  echo "$existing_id" >> "$list_ids_file"
+              warn "[$n/$total] $name 上傳失敗，保留 Gateway 上的舊內容並繼續引用（下次自動重傳這 $affected 筆）" ;;
+        esac
+        ;;
+    esac
+  done < "$idx_list"
 
-      # 把完整失敗診斷寫進 D1，供日後檢討改善（例如判斷是不是特定內容、特定時段容易失敗）
-      local error_detail_json
-      error_detail_json=$(jq -n --arg r "$resp" '$r[0:2000]')  # 截斷避免內容過長
-      d1_query \
-        "INSERT INTO upload_failures (run_at, list_name, http_status, error_detail, domain_count_affected, attempt_count) VALUES (?, ?, ?, ?, ?, ?)" \
-        "$(jq -n --arg t "$(date +%s)" --arg n "$name" --arg s "$http_status" --arg e "$resp" --arg c "$affected_count" \
-           '[$t, $n, $s, ($e[0:2000]), $c, "3"]')" \
-        > /dev/null || warn "寫入上傳失敗診斷紀錄本身也失敗了（不影響本次同步結果）"
-
-      start=$((start + LIST_CHUNK_SIZE))
-      chunk_num=$((chunk_num + 1))
-      continue
+  # 變成空的槽位就刪掉，編號留著日後重用
+  local eidx eid
+  while read -r eidx; do
+    [[ -n "$eidx" ]] || continue
+    eid="${slot_id[$eidx]:-}"
+    [[ -n "$eid" ]] || continue
+    if cf_curl DELETE "/accounts/$CF_ACCOUNT_ID/gateway/lists/$eid" > /dev/null; then
+      log "清單編號 $eidx 已無任何網域，刪除（編號保留給日後重用）"
+    else
+      warn "刪除空清單（編號 $eidx）失敗（不影響本次結果）"
     fi
+  done < "$TMP_DIR/empty_slots.txt"
 
-    echo "$list_id" >> "$list_ids_file"
-    local chunk_count
-    chunk_count=$(wc -l < "$chunk_file" | xargs)
-    n_uploaded=$((n_uploaded + 1))
-    printf '%s\t%s\t%s\t%s\n' "$chunk_num" "$list_id" "$checksum" "$chunk_count" >> "$pending_state_file"
-    log "[$chunk_num/$total_chunks] $name 已上傳（$chunk_count 筆）"
-
-    # 每 10 份就把狀態寫回 D1 一次，讓中斷續傳的粒度維持在 10 份以內
-    if [[ $(wc -l < "$pending_state_file" | xargs) -ge 10 ]]; then
-      flush_chunk_state "$pending_state_file"
-    fi
-
-    start=$((start + LIST_CHUNK_SIZE))
-    chunk_num=$((chunk_num + 1))
-  done
-
-  flush_chunk_state "$pending_state_file"
-
-  # 刪除多餘的舊清單
-  local last_chunk=$((chunk_num - 1))
-  local stale_state=""
-  for idx in "${!existing_by_index[@]}"; do
-    if [[ $idx -gt $last_chunk ]]; then
-      local old_id="${existing_by_index[$idx]}"
-      if cf_curl DELETE "/accounts/$CF_ACCOUNT_ID/gateway/lists/$old_id" > /dev/null; then
-        log "刪除多餘舊清單：編號 $idx"
-        stale_state="${stale_state}${stale_state:+,}$idx"
-      else
-        warn "刪除舊清單（編號 $idx）失敗（不影響本次上傳結果，之後手動清理即可）"
-      fi
-    fi
-  done
-  # 連同它們的 chunk 狀態一起清掉，否則清單數量之後再長回來時會誤判成「內容未變」而不重傳
-  if [[ -n "$stale_state" && $STATE_AVAILABLE -eq 1 ]]; then
-    d1_query "DELETE FROM list_chunk_state WHERE chunk_num IN ($stale_state)" \
-      | d1_ok || warn "清除多餘的 list_chunk_state 失敗（下次執行會多傳幾份，不影響正確性）"
-  fi
-
-  log "上傳統計：新上傳 $n_uploaded 份 / 內容未變略過 $n_skipped 份 / 失敗 $n_failed 份（共 $total_chunks 份）"
-  UPLOAD_STAT_UPLOADED=$n_uploaded
-  UPLOAD_STAT_SKIPPED=$n_skipped
-  UPLOAD_STAT_FAILED=$n_failed
-  UPLOAD_STAT_TOTAL=$total_chunks
+  UPLOAD_STAT_UPLOADED=$n_up
+  UPLOAD_STAT_SKIPPED=$n_skip
+  UPLOAD_STAT_FAILED=$n_fail
+  log "上傳統計：新上傳 $n_up 份／內容未變略過 $n_skip 份／失敗 $n_fail 份（共 $total 份）"
 
   cat "$list_ids_file"
 }
+
 
 ensure_policy() {
   # $1 = list_ids 檔案
@@ -1039,8 +1131,10 @@ main() {
 
   # 抓取只用到上游 HTTP，不碰 Cloudflare；真正昂貴的是後面的分類查詢與清單上傳。
   # 帶 If-None-Match/If-Modified-Since，內容沒變的來源會回 304 而不傳 body。
+  group_begin "抓取訂閱來源（條件式請求）"
   fetch_and_merge_sources
   collect_source_checksums
+  group_end
 
   local whitelist_file="$TMP_DIR/whitelist.txt"
   load_whitelist > "$whitelist_file"
@@ -1110,6 +1204,7 @@ main() {
   log "扣除白名單 $whitelisted_count 筆"
 
   # 原生分類比對
+  group_begin "Cloudflare 原生分類比對"
   local cache_file="$TMP_DIR/cache.txt"
   load_category_cache > "$cache_file"
   local cached_domains_file="$TMP_DIR/cached_domains.txt"
@@ -1139,6 +1234,7 @@ main() {
   local excluded_by_native
   excluded_by_native=$(( $(wc -l < "$after_whitelist_file" | xargs) - $(wc -l < "$after_native_file" | xargs) ))
   log "扣除已被 Cloudflare 原生 Ads 分類涵蓋的 $excluded_by_native 筆"
+  group_end
 
   # 加上自訂封鎖清單（已在閘門階段載入，這裡直接沿用）
   local final_file="$TMP_DIR/final.txt"
@@ -1153,8 +1249,14 @@ main() {
     exit 1
   fi
 
+  # 穩定槽位：先讀回 Gateway 上每份清單目前的成員，算出「哪幾份真的要改」，
+  # 只重傳那幾份。移除一個網域只會動到它所在的那一份。
+  group_begin "同步 Gateway 清單"
+  fetch_slot_membership
+  plan_slot_changes "$final_file"
   local list_ids_file="$TMP_DIR/final_list_ids.txt"
-  upload_lists "$final_file" > "$list_ids_file"
+  sync_slots > "$list_ids_file"
+  group_end
 
   local uploaded_list_count
   uploaded_list_count=$(wc -l < "$list_ids_file" | xargs)

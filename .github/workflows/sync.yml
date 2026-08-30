@@ -40,4 +40,6 @@ jobs:
           FORCE_SYNC: ${{ github.event.inputs.force == 'true' && '1' || '0' }}
         run: |
           chmod +x sync.sh
-          ./sync.sh
+          # 2>&1 是必要的：sync.sh 的 log/warn 與 ::group:: 標記都寫 stderr，
+          # 合併成單一串流才能保證收折標記跟它要包住的內容不會因為緩衝而錯位。
+          ./sync.sh 2>&1
