@@ -33,7 +33,14 @@ LIST_CHUNK_SIZE=1000
 #   20 條 → 224 份掃完約 56 秒（每請求約 5.0 秒，延遲同比例上升，總時間抵消）
 # 瓶頸在伺服器端，不在這裡，所以維持 12 就好，不要再往上調。
 FIND_PARALLEL=12
-KV_NAMESPACE_ID="${KV_NAMESPACE_ID:-8b033b48486e45909750175222437f05}"
+# 這裡是 ${VAR-default} 不是 ${VAR:-default}：少一個冒號，語意差很多。
+# 加冒號的版本連「設成空字串」都會套用預設值，那樣就沒有辦法停用 KV 了。
+# 這一行必須跟 sync.sh 的同名設定保持一致，否則兩支工具對同一個環境變數的反應會不同。
+#
+# 這個預設值是本 repo 自己的 namespace。**如果你是 fork 過去用的，要換成你自己的**：
+# 沿用別人的 namespace id 配上你自己的 token，find 的分類那一項每次都會 404，
+# 只會印「讀不到 KV 快照，略過這一項」—— 不會出錯，但那一項就永遠查不到東西。
+KV_NAMESPACE_ID="${KV_NAMESPACE_ID-8b033b48486e45909750175222437f05}"
 KV_CACHE_KEY="category-cache-v1"
 
 TMP_DIR="$(mktemp -d)"
@@ -180,6 +187,10 @@ _find_check_blocklist() {
 _kv_fetch_cache() {
   # $1 = 解壓後的輸出檔。抓取與解壓分成獨立函式，方便單獨測試解析邏輯。
   local tsv="$1" gz="$TMP_DIR/kv.gz" code
+
+  # 停用時直接短路，不要發請求。少了這道，空的 namespace 會組出
+  # .../namespaces//values/... 這種畸形 URL，照樣送出一次注定失敗的往返。
+  [[ -n "$KV_NAMESPACE_ID" ]] || return 1
 
   code=$(curl -sS -o "$gz" -w '%{http_code}' \
     -H "Authorization: Bearer $CF_API_TOKEN" \
