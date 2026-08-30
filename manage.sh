@@ -28,8 +28,11 @@ DOMAIN_REGEX='^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z
 # find 子指令用得到的設定（跟 sync.sh 保持一致）
 LIST_PREFIX="Block ads"
 LIST_CHUNK_SIZE=1000
-FIND_PARALLEL=20                 # 掃描 Gateway 清單時的平行度（實測 12 條需 55 秒；
-                                 # 本專案另處實測過 200 並行皆成功，20 仍留大量安全邊際）
+# 掃描 Gateway 清單時的平行度。實測結論：提高平行度沒有用，Gateway API 會節流。
+#   12 條 → 224 份掃完約 55 秒（每請求約 2.9 秒）
+#   20 條 → 224 份掃完約 56 秒（每請求約 5.0 秒，延遲同比例上升，總時間抵消）
+# 瓶頸在伺服器端，不在這裡，所以維持 12 就好，不要再往上調。
+FIND_PARALLEL=12
 KV_NAMESPACE_ID="${KV_NAMESPACE_ID:-8b033b48486e45909750175222437f05}"
 KV_CACHE_KEY="category-cache-v1"
 
