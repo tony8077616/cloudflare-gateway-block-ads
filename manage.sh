@@ -28,7 +28,8 @@ DOMAIN_REGEX='^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z
 # find 子指令用得到的設定（跟 sync.sh 保持一致）
 LIST_PREFIX="Block ads"
 LIST_CHUNK_SIZE=1000
-FIND_PARALLEL=12                 # 掃描 Gateway 清單時的平行度
+FIND_PARALLEL=20                 # 掃描 Gateway 清單時的平行度（實測 12 條需 55 秒；
+                                 # 本專案另處實測過 200 並行皆成功，20 仍留大量安全邊際）
 KV_NAMESPACE_ID="${KV_NAMESPACE_ID:-8b033b48486e45909750175222437f05}"
 KV_CACHE_KEY="category-cache-v1"
 
@@ -207,7 +208,7 @@ _find_scan_gateway_lists() {
     echo "NOLISTS"
     return
   fi
-  echo "SCANNING	$total" >&2
+  echo "   掃描 $total 份 Gateway 清單中…" >&2
 
   local running=0 id name
   while IFS=$'\t' read -r id name; do
@@ -241,7 +242,9 @@ cmd_find() {
   _domain_and_parents "$domain" > "$parents"
 
   echo "── 診斷 $domain ──"
-  echo "比對範圍：$(paste -sd', ' - < "$parents")"
+  # 注意：paste -sd 的參數是「輪流使用的分隔符清單」，給 ', ' 會變成逗號與空白交替出現。
+  # 要固定用同一個分隔符，就只能給一個字元，再自行補空白。
+  echo "比對範圍：$(paste -sd, - < "$parents" | sed 's/,/, /g')"
   echo "（Gateway 的 DOMAIN 清單命中父網域時會連子網域一起擋，所以父網域也要一起查）"
   echo
 
@@ -315,11 +318,11 @@ cmd_find() {
 
   echo
   if [[ -n "$wl" && "$wl" != "ERROR" ]]; then
-    echo "結論：**不會被擋** —— 白名單優先於所有封鎖來源。"
+    echo "結論：不會被擋 —— 白名單優先於所有封鎖來源。"
   elif [[ ${#verdict_parts[@]} -gt 0 ]]; then
-    echo "結論：**會被擋** —— 來源：$(printf '%s、' "${verdict_parts[@]}" | sed 's/、$//')"
+    echo "結論：會被擋 —— 來源：$(printf '%s、' "${verdict_parts[@]}" | sed 's/、$//')"
   else
-    echo "結論：**不會被擋** —— 四項都沒有命中。"
+    echo "結論：不會被擋 —— 四項都沒有命中。"
     echo "      如果你預期它該被擋，先確認 sync_history 最後一次同步時間是否晚於你的異動時間。"
   fi
 }
