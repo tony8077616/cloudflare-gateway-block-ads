@@ -21,7 +21,20 @@ set -uo pipefail
 WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCES_FILE="$WORKDIR/sources.conf"
 TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
+# 結束前先把本次的 D1 寫入用量記回去，再清掉暫存目錄。
+# 中途 exit 1 的失敗路徑也會經過這裡，避免已經花掉的額度沒被記錄，
+# 導致下次執行以為額度還很充裕而超額。save_daily_budget 本身是冪等的。
+cleanup_on_exit() {
+  local code=$?
+  # 用 ${VAR:-} 取值：這個 trap 在設定變數與函式之前就已掛上，
+  # 若是在初始化階段（例如缺少必要環境變數）就結束，這些名稱還不存在。
+  if [[ "${STATE_AVAILABLE:-0}" == "1" && "${D1_WRITES_ADDED:-0}" -gt 0 ]]; then
+    save_daily_budget 2>/dev/null || true
+  fi
+  rm -rf "$TMP_DIR"
+  return $code
+}
+trap cleanup_on_exit EXIT
 
 : "${CF_ACCOUNT_ID:?請設定 CF_ACCOUNT_ID}"
 : "${CF_API_TOKEN:?請設定 CF_API_TOKEN}"
@@ -39,8 +52,31 @@ PARALLEL_WORKERS=15        # 平行處理的分類查詢工作數量；實測驗
 # D1 免費版每日寫入額度是 100,000 筆（官方文件：https://developers.cloudflare.com/workers/platform/pricing/），
 # 額度午夜 UTC 重置。這裡保守抓 90,000 當上限，留給 custom_whitelist/custom_blocklist/sync_history
 # 這些其他表的寫入用量一些餘裕，避免精準卡在官方數字上反而不小心超額。
+#
+# 重要：這個計數器必須「跨執行累計」。舊版叫 D1_WRITES_THIS_RUN，每次執行歸零，
+# 在一天只跑一次的排程下剛好等價於每日用量；但改成每小時跑之後，24 次執行會各自
+# 以為自己有完整的 90,000 額度可用，最壞情況寫到 24 倍，遠超真實的每日上限。
+# 現在改成啟動時從 d1_daily_writes 讀「今天（UTC）已用量」，結束時把本次增量寫回。
 D1_DAILY_WRITE_BUDGET=90000
-D1_WRITES_THIS_RUN=0   # 全域計數器，追蹤這次執行已經寫入 D1 的筆數
+D1_DAY="$(date -u +%F)"      # UTC 日期字串，額度以此為界（跟 Cloudflare 的重置時點一致）
+D1_WRITES_TODAY=0            # 今日已用量，啟動時從 D1 載入
+D1_WRITES_ADDED=0            # 本次執行新增的寫入量，結束時累加回 D1
+DEFERRED_CACHE_ROWS=0        # 本次因額度不足而沒能寫入的分類快取筆數
+DEFERRED_BACKLOG=0           # 上次執行遺留、還沒補寫的分類快取筆數
+
+# 設為 1 可略過 checksum 閘門強制完整同步（workflow_dispatch 手動觸發時可指定）
+FORCE_SYNC="${FORCE_SYNC:-0}"
+# 狀態表不可用時退回的模式：一定完整同步、不做差異上傳（永遠正確，只是比較慢）
+STATE_AVAILABLE=1
+
+# 前次狀態檔路徑（載入後由 state_get 讀取，用來取各來源的 ETag/Last-Modified）
+PREV_STATE_FILE=""
+
+# 清單上傳進度統計（由 upload_lists 填寫，供結尾摘要使用）
+UPLOAD_STAT_UPLOADED=0
+UPLOAD_STAT_SKIPPED=0
+UPLOAD_STAT_FAILED=0
+UPLOAD_STAT_TOTAL=0
 
 log() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
 warn() { echo "[$(date '+%H:%M:%S')] ⚠ $*" >&2; }
@@ -88,6 +124,110 @@ d1_query() {
   local body
   body=$(jq -n --arg sql "$sql" --argjson params "$params" '{sql: $sql, params: $params}')
   cf_curl POST "/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" "$body"
+}
+
+d1_batch() {
+  # $1 = statements 的 JSON array（[{sql, params?}, ...]），走 batch API 一次送多筆，
+  # 比逐筆送快很多，也少掉大量往返延遲。
+  local batch_json="$1" body
+  body=$(jq -n --argjson batch "$batch_json" '{batch: $batch}')
+  cf_curl POST "/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" "$body"
+}
+
+d1_ok() {
+  # 讀 stdin，判斷 D1 回應是否成功
+  local resp; resp="$(cat)"
+  is_valid_json <<< "$resp" && [[ "$(jq -r '.success' <<< "$resp")" == "true" ]]
+}
+
+# ── 0. 狀態表（本次新增）─────────────────────────────────
+# 用 IF NOT EXISTS 自建，讓腳本自帶 migration：不需要額外的手動建表步驟，
+# 資料庫被重建時也能自動恢復。DDL 對已存在的表是 no-op，成本可忽略。
+#
+#   sync_state       key-value，存各來源解析後輸出的 checksum、白名單/自訂封鎖清單
+#                    的 checksum，以及積欠未寫入的分類快取筆數
+#   d1_daily_writes  每日（UTC）D1 寫入用量，讓額度控管跨執行累計
+#   list_chunk_state 每份 Gateway 清單的內容 checksum，用來做差異上傳與中斷續傳
+
+ensure_schema() {
+  local batch
+  batch=$(jq -n '[
+    {sql: "CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)"},
+    {sql: "CREATE TABLE IF NOT EXISTS d1_daily_writes (day TEXT PRIMARY KEY, writes INTEGER NOT NULL, updated_at INTEGER NOT NULL)"},
+    {sql: "CREATE TABLE IF NOT EXISTS list_chunk_state (chunk_num INTEGER PRIMARY KEY, list_id TEXT NOT NULL, checksum TEXT NOT NULL, item_count INTEGER NOT NULL, updated_at INTEGER NOT NULL)"}
+  ]')
+  if d1_batch "$batch" | d1_ok; then
+    return 0
+  fi
+  warn "建立/確認狀態表失敗，本次退回無狀態模式：會完整同步且不做差異上傳（結果仍然正確，只是比較慢）"
+  STATE_AVAILABLE=0
+  return 1
+}
+
+load_sync_state() {
+  # 輸出每行「key<TAB>value」
+  [[ $STATE_AVAILABLE -eq 1 ]] || return 0
+  local resp
+  resp=$(d1_query "SELECT key, value FROM sync_state")
+  if ! d1_ok <<< "$resp"; then
+    warn "讀取 sync_state 失敗，本次視為無先前狀態（會完整同步）"
+    return 0
+  fi
+  jq -r '.result[0].results[]? | "\(.key)\t\(.value)"' <<< "$resp"
+}
+
+save_sync_state() {
+  # $1 = 檔案，每行「key<TAB>value」
+  [[ $STATE_AVAILABLE -eq 1 ]] || return 0
+  local state_file="$1"
+  [[ -s "$state_file" ]] || return 0
+  local batch rows
+  batch=$(jq -R -s -c --arg now "$(date +%s)" '
+    split("\n") | map(select(length > 0) | split("\t")) | map({
+      sql: "INSERT INTO sync_state (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+      params: [.[0], .[1], $now]
+    })' "$state_file")
+  rows=$(jq 'length' <<< "$batch")
+  if d1_batch "$batch" | d1_ok; then
+    D1_WRITES_ADDED=$((D1_WRITES_ADDED + rows))
+  else
+    warn "寫入 sync_state 失敗（下次執行會因為讀不到 checksum 而完整同步，結果仍正確）"
+  fi
+}
+
+load_daily_budget() {
+  [[ $STATE_AVAILABLE -eq 1 ]] || return 0
+  local resp
+  resp=$(d1_query "SELECT writes FROM d1_daily_writes WHERE day = ?" "$(jq -n --arg d "$D1_DAY" '[$d]')")
+  if ! d1_ok <<< "$resp"; then
+    # 讀不到就保守假設已用掉一半額度，寧可少寫一點快取，也不要不小心超額
+    warn "讀取今日 D1 額度用量失敗，保守視為已用掉半數額度"
+    D1_WRITES_TODAY=$((D1_DAILY_WRITE_BUDGET / 2))
+    return
+  fi
+  D1_WRITES_TODAY=$(jq -r '.result[0].results[0].writes // 0' <<< "$resp")
+  log "今日（$D1_DAY UTC）D1 已用寫入量：$D1_WRITES_TODAY / $D1_DAILY_WRITE_BUDGET"
+}
+
+save_daily_budget() {
+  # 冪等：寫回成功就把增量歸零，重複呼叫不會重複累加。
+  # 這讓它可以同時掛在正常結束路徑和 EXIT trap 上，中途 exit 1 也不會漏記用量。
+  [[ $STATE_AVAILABLE -eq 1 ]] || return 0
+  [[ $D1_WRITES_ADDED -gt 0 ]] || return 0
+  # 用 writes = writes + ? 而不是直接覆寫，避免同時間有另一個 run 也在累加時互相蓋掉
+  if d1_query \
+      "INSERT INTO d1_daily_writes (day, writes, updated_at) VALUES (?, ?, ?) ON CONFLICT(day) DO UPDATE SET writes = writes + excluded.writes, updated_at = excluded.updated_at" \
+      "$(jq -n --arg d "$D1_DAY" --arg w "$D1_WRITES_ADDED" --arg t "$(date +%s)" '[$d, $w, $t]')" \
+      | d1_ok; then
+    D1_WRITES_TODAY=$((D1_WRITES_TODAY + D1_WRITES_ADDED))
+    D1_WRITES_ADDED=0
+  else
+    warn "回寫今日 D1 額度用量失敗（下次執行會低估已用量）"
+  fi
+}
+
+d1_budget_left() {
+  echo $(( D1_DAILY_WRITE_BUDGET - D1_WRITES_TODAY - D1_WRITES_ADDED ))
 }
 
 # ── 1. 網域格式驗證 ──────────────────────────────────────
@@ -146,41 +286,226 @@ parse_hosts() {
 
 # ── 3. 抓取 + 合併所有來源 ────────────────────────────────
 
-fetch_and_merge_sources() {
-  local merged_file="$TMP_DIR/merged.txt"
-  : > "$merged_file"
+state_get() {
+  # $1 = key，從已載入的前次狀態檔取值（檔案不存在時回傳空字串）
+  [[ -n "${PREV_STATE_FILE:-}" && -s "${PREV_STATE_FILE:-}" ]] || return 0
+  awk -F'\t' -v k="$1" '$1==k{print $2; exit}' "$PREV_STATE_FILE"
+}
 
+header_value() {
+  # $1 = 標頭檔, $2 = 標頭名稱。跟隨轉址時會有多組標頭，取最後一組（即最終回應）的值。
+  grep -i "^$2:" "$1" 2>/dev/null | tail -1 | sed -E "s/^[^:]+:[[:space:]]*//" | tr -d '\r'
+}
+
+curl_source() {
+  # $1 name, $2 url, $3 是否帶條件式標頭（1/0）
+  # 內容寫入 raw_<name>.txt、標頭寫入 hdr_<name>.txt，HTTP 狀態碼輸出到 stdout
+  local name="$1" url="$2" conditional="$3"
+  local -a hdrs=()
+  if [[ "$conditional" == "1" ]]; then
+    local et lm
+    et=$(state_get "etag:$name")
+    lm=$(state_get "lastmod:$name")
+    [[ -n "$et" ]] && hdrs+=(-H "If-None-Match: $et")
+    [[ -n "$lm" ]] && hdrs+=(-H "If-Modified-Since: $lm")
+  fi
+  curl -sSL --retry 3 --retry-all-errors --max-time 60 \
+    -A "cloudflare-gateway-block-ads-sync/1.0" \
+    "${hdrs[@]}" \
+    -D "$TMP_DIR/hdr_$name.txt" -o "$TMP_DIR/raw_$name.txt" \
+    -w '%{http_code}' "$url" 2>/dev/null
+}
+
+parse_source_into() {
+  # $1 name, $2 format；解析 raw_<name>.txt → parsed_<name>.txt，並寫出 sum_<name>.txt
+  local name="$1" format="$2"
+  local raw_file="$TMP_DIR/raw_$name.txt" parsed_file="$TMP_DIR/parsed_$name.txt"
+  case "$format" in
+    domains) parse_domains < "$raw_file" > "$parsed_file" ;;
+    adblock) parse_adblock < "$raw_file" > "$parsed_file" ;;
+    hosts)   parse_hosts   < "$raw_file" > "$parsed_file" ;;
+    *) return 1 ;;
+  esac
+  sha256sum < "$parsed_file" | awk '{print $1}' > "$TMP_DIR/sum_$name.txt"
+}
+
+fetch_and_merge_sources() {
+  # 副作用（供 checksum 閘門使用）：
+  #   $TMP_DIR/sum_<name>.txt        該來源解析後輸出的 sha256
+  #   $TMP_DIR/failed_sources.txt    每行一個抓取/解析失敗的來源名
+  #   $TMP_DIR/notmodified.txt       回應 304 的來源（name<TAB>format），內容尚未下載
+  #   $TMP_DIR/newmeta.txt           name<TAB>etag<TAB>lastmod，供下次條件式請求使用
+  #
+  # checksum 刻意算在「解析後的網域輸出」而不是下載到的原始檔上。原因是幾乎每個
+  # 上游清單都帶會變動的檔頭，例如：
+  #   easylist        ! Version: 202608300930   ← 內含時間戳，每次重建就變
+  #   ublock-privacy  ! Last modified: ... / ! Diff-Path: ../patches/2026.8.30.393.patch
+  #   AdGuard-DNS     ! Version: 1.0.77.58
+  # 規則一條都沒改、檔頭照樣變，對原始位元組算 checksum 會導致每小時都判定為
+  # 「有變動」，閘門形同虛設。解析後的輸出已經濾掉所有 ! 註解，才真正反映規則異動。
+  : > "$TMP_DIR/failed_sources.txt"
+  : > "$TMP_DIR/notmodified.txt"
+  : > "$TMP_DIR/newmeta.txt"
+  : > "$TMP_DIR/source_list.txt"
+
+  local n_304=0 n_200=0
   while IFS='|' read -r name url format; do
     # 跳過空行與註解
     [[ -z "$name" || "$name" =~ ^[[:space:]]*# ]] && continue
     name="$(echo "$name" | xargs)"
     url="$(echo "$url" | xargs)"
     format="$(echo "$format" | xargs)"
+    printf '%s\t%s\t%s\n' "$name" "$url" "$format" >> "$TMP_DIR/source_list.txt"
 
-    log "抓取來源：$name ($format) ← $url"
-    local raw_file="$TMP_DIR/raw_$name.txt"
-    if ! curl -sSfL --retry 3 --retry-all-errors --max-time 60 \
-        -A "cloudflare-gateway-block-ads-sync/1.0" \
-        "$url" -o "$raw_file"; then
-      warn "[$name] 抓取失敗，略過此來源"
+    local code
+    code=$(curl_source "$name" "$url" 1)
+
+    if [[ "$code" == "304" ]]; then
+      # 內容未變，伺服器沒回傳 body。沿用前次 checksum，內容等到確定要完整同步才補抓。
+      local prev_sum
+      prev_sum=$(state_get "src:$name")
+      if [[ -z "$prev_sum" ]]; then
+        # 理論上不會發生（有 ETag 就該有 checksum）；保險起見改成無條件重抓
+        warn "[$name] 回應 304 但沒有前次 checksum，改用無條件請求重抓"
+        code=$(curl_source "$name" "$url" 0)
+      else
+        echo "$prev_sum" > "$TMP_DIR/sum_$name.txt"
+        printf '%s\t%s\n' "$name" "$format" >> "$TMP_DIR/notmodified.txt"
+        n_304=$((n_304 + 1))
+        log "[$name] 304 未修改，沿用前次 checksum（未下載內容）"
+        continue
+      fi
+    fi
+
+    if [[ "$code" != "200" ]]; then
+      warn "[$name] 抓取失敗（HTTP $code），略過此來源"
+      echo "$name" >> "$TMP_DIR/failed_sources.txt"
       continue
     fi
 
-    local parsed_file="$TMP_DIR/parsed_$name.txt"
-    case "$format" in
-      domains) parse_domains < "$raw_file" > "$parsed_file" ;;
-      adblock) parse_adblock < "$raw_file" > "$parsed_file" ;;
-      hosts)   parse_hosts   < "$raw_file" > "$parsed_file" ;;
-      *) warn "[$name] 未知格式 '$format'，略過"; continue ;;
-    esac
+    if ! parse_source_into "$name" "$format"; then
+      warn "[$name] 未知格式 '$format'，略過"
+      echo "$name" >> "$TMP_DIR/failed_sources.txt"
+      continue
+    fi
 
-    local count
-    count=$(wc -l < "$parsed_file" | xargs)
-    log "[$name] 解析出 $count 筆網域"
-    cat "$parsed_file" >> "$merged_file"
+    # 記下這次的驗證標頭，下次就能用條件式請求省下整包下載
+    printf '%s\t%s\t%s\n' "$name" \
+      "$(header_value "$TMP_DIR/hdr_$name.txt" 'ETag')" \
+      "$(header_value "$TMP_DIR/hdr_$name.txt" 'Last-Modified')" >> "$TMP_DIR/newmeta.txt"
+
+    n_200=$((n_200 + 1))
+    log "[$name] 解析出 $(wc -l < "$TMP_DIR/parsed_$name.txt" | xargs) 筆網域（checksum $(cut -c1-12 < "$TMP_DIR/sum_$name.txt")）"
   done < "$SOURCES_FILE"
 
-  sort -u "$merged_file"
+  log "來源抓取完成：$n_200 個有更新、$n_304 個回應 304 未修改、$(wc -l < "$TMP_DIR/failed_sources.txt" | xargs) 個失敗"
+}
+
+materialize_sources() {
+  # 確定要完整同步時才呼叫：把先前回應 304、因此沒有下載內容的來源改用無條件請求補抓。
+  # 閘門階段之所以不抓，是因為大多數執行最後都會略過，那些下載就是純浪費。
+  [[ -s "$TMP_DIR/notmodified.txt" ]] || return 0
+  local name format url code
+  while IFS=$'\t' read -r name format; do
+    [[ -n "$name" ]] || continue
+    url=$(awk -F'\t' -v n="$name" '$1==n{print $2; exit}' "$TMP_DIR/source_list.txt")
+    log "補抓 304 來源的內容：$name"
+    code=$(curl_source "$name" "$url" 0)
+    if [[ "$code" != "200" ]] || ! parse_source_into "$name" "$format"; then
+      warn "[$name] 補抓失敗（HTTP $code），本次合併會缺少這個來源的網域"
+      echo "$name" >> "$TMP_DIR/failed_sources.txt"
+      rm -f "$TMP_DIR/sum_$name.txt"
+      continue
+    fi
+    printf '%s\t%s\t%s\n' "$name" \
+      "$(header_value "$TMP_DIR/hdr_$name.txt" 'ETag')" \
+      "$(header_value "$TMP_DIR/hdr_$name.txt" 'Last-Modified')" >> "$TMP_DIR/newmeta.txt"
+  done < "$TMP_DIR/notmodified.txt"
+}
+
+collect_source_checksums() {
+  # 把各來源的 sum_<name>.txt 收攏成一份「name<TAB>checksum」供閘門比對
+  : > "$TMP_DIR/source_checksums.txt"
+  local name
+  while IFS=$'\t' read -r name _ _; do
+    [[ -n "$name" && -s "$TMP_DIR/sum_$name.txt" ]] || continue
+    printf '%s\t%s\n' "$name" "$(cat "$TMP_DIR/sum_$name.txt")" >> "$TMP_DIR/source_checksums.txt"
+  done < "$TMP_DIR/source_list.txt"
+}
+
+build_merged() {
+  # 把所有已解析的來源合併去重
+  cat "$TMP_DIR"/parsed_*.txt 2>/dev/null | sort -u
+}
+
+emit_meta_state() {
+  # 由 newmeta.txt 產出 sync_state 需要的 etag:/lastmod: 項目。
+  # 回應 304 的來源不會出現在 newmeta.txt —— 它們在 D1 裡的既有值會原封不動保留，
+  # 因為 save_sync_state 是 upsert，只會動到有給的 key。
+  [[ -s "$TMP_DIR/newmeta.txt" ]] || return 0
+  awk -F'\t' '{
+    if (length($2)) print "etag:" $1 "\t" $2
+    if (length($3)) print "lastmod:" $1 "\t" $3
+  }' "$TMP_DIR/newmeta.txt"
+}
+
+checksum_of_lines() {
+  # 讀 stdin，排序去重後算 sha256。用在白名單/自訂封鎖清單上，
+  # 讓「同樣的內容但查詢回傳順序不同」不會被誤判成有變動。
+  sort -u | sha256sum | awk '{print $1}'
+}
+
+decide_should_sync() {
+  # 比對本次算出的 checksum 與 sync_state 中的前次值，決定要不要繼續完整同步。
+  # 回傳 0 = 要同步；1 = 可以略過。
+  # $1 = 前次狀態檔（key<TAB>value）, $2 = 白名單 checksum, $3 = 自訂封鎖清單 checksum
+  # 輸出（stdout）：一行變動原因摘要，供記錄用
+  local prev_file="$1" wl_sum="$2" bl_sum="$3"
+
+  if [[ "$FORCE_SYNC" == "1" ]]; then
+    echo "FORCE_SYNC=1，略過閘門強制同步"
+    return 0
+  fi
+  if [[ $STATE_AVAILABLE -ne 1 ]]; then
+    echo "狀態表不可用，退回完整同步"
+    return 0
+  fi
+  if [[ ! -s "$prev_file" ]]; then
+    echo "沒有先前的 checksum 紀錄（首次啟用閘門）"
+    return 0
+  fi
+
+  # 抓取失敗的來源不列入比對：它這次沒有新的 checksum，若當成「有變動」會導致
+  # 上游暫時掛掉時反而觸發同步，把缺了該來源的清單推上去。維持略過才是安全的
+  # 那一邊 —— Gateway 上會保留前一次完整的清單。
+  local changed
+  # 三個輸入檔依序是：前次狀態（key 已含 src: 前綴）、本次抓取失敗的來源、本次 checksum
+  changed=$(awk -F'\t' '
+    NR==FNR            { prev[$1] = $2; next }
+    FILENAME == ARGV[2] { failed[$1] = 1; next }
+    {
+      if ($1 in failed) next
+      key = "src:" $1
+      if (!(key in prev))  { print "新增來源 " $1; next }
+      if (prev[key] != $2) { print "來源內容變動 " $1 }
+    }
+  ' "$prev_file" "$TMP_DIR/failed_sources.txt" "$TMP_DIR/source_checksums.txt")
+
+  local prev_wl prev_bl
+  prev_wl=$(awk -F'\t' '$1=="whitelist"{print $2}' "$prev_file")
+  prev_bl=$(awk -F'\t' '$1=="blocklist"{print $2}' "$prev_file")
+  [[ "$prev_wl" != "$wl_sum" ]] && changed="${changed}${changed:+$'\n'}白名單有變動"
+  [[ "$prev_bl" != "$bl_sum" ]] && changed="${changed}${changed:+$'\n'}自訂封鎖清單有變動"
+
+  if [[ $DEFERRED_BACKLOG -gt 0 && $(d1_budget_left) -gt 0 ]]; then
+    changed="${changed}${changed:+$'\n'}有 $DEFERRED_BACKLOG 筆積欠的分類快取待補寫"
+  fi
+
+  if [[ -n "$changed" ]]; then
+    echo "$changed" | paste -sd'；' -
+    return 0
+  fi
+  return 1
 }
 
 # ── 4. D1：白名單 / 自訂封鎖清單 ──────────────────────────
@@ -236,9 +561,12 @@ save_category_cache_batch() {
   total_lines=$(wc -l < "$batch_file" | xargs)
   local start=1
   while [[ $start -le $total_lines ]]; do
-    if [[ $D1_WRITES_THIS_RUN -ge $D1_DAILY_WRITE_BUDGET ]]; then
+    local budget_left
+    budget_left=$(d1_budget_left)
+    if [[ $budget_left -le 0 ]]; then
       local remaining=$((total_lines - start + 1))
-      warn "本次執行 D1 寫入量已達每日額度上限（$D1_DAILY_WRITE_BUDGET 筆），停止繼續寫入分類快取，剩餘 $remaining 筆網域的分類結果這次不會被快取（不影響封鎖清單本身，只是下次同步這些網域要重新查詢分類）"
+      DEFERRED_CACHE_ROWS=$((DEFERRED_CACHE_ROWS + remaining))
+      warn "今日（$D1_DAY UTC）D1 寫入量已達上限（$D1_DAILY_WRITE_BUDGET 筆），停止寫入分類快取。剩餘 $remaining 筆延後到明天：額度在 UTC 午夜重置，之後第一次執行會自動重查並補寫。封鎖清單本身不受影響，本次仍照常上傳。"
       break
     fi
 
@@ -247,12 +575,12 @@ save_category_cache_batch() {
     local this_chunk_size
     this_chunk_size=$(wc -l < "$sub_chunk_file" | xargs)
 
-    # 如果這一批會讓累計寫入量超過額度，只取額度剩餘的部分
-    if [[ $((D1_WRITES_THIS_RUN + this_chunk_size)) -gt $D1_DAILY_WRITE_BUDGET ]]; then
-      local allowed=$((D1_DAILY_WRITE_BUDGET - D1_WRITES_THIS_RUN))
-      head -n "$allowed" "$sub_chunk_file" > "${sub_chunk_file}.trimmed"
+    # 如果這一批會超出剩餘額度，只取額度容得下的部分，其餘計入延後
+    if [[ $this_chunk_size -gt $budget_left ]]; then
+      head -n "$budget_left" "$sub_chunk_file" > "${sub_chunk_file}.trimmed"
       mv "${sub_chunk_file}.trimmed" "$sub_chunk_file"
-      this_chunk_size=$allowed
+      DEFERRED_CACHE_ROWS=$((DEFERRED_CACHE_ROWS + this_chunk_size - budget_left))
+      this_chunk_size=$budget_left
     fi
 
     local batch_json
@@ -270,8 +598,9 @@ save_category_cache_batch() {
       --data "$body")
     if [[ "$(echo "$resp" | jq -r '.success // false')" != "true" ]]; then
       warn "寫入分類快取第 $start~$((start + write_chunk_size)) 批失敗，略過（不影響本次結果，只影響下次快取命中率）"
+      DEFERRED_CACHE_ROWS=$((DEFERRED_CACHE_ROWS + this_chunk_size))
     else
-      D1_WRITES_THIS_RUN=$((D1_WRITES_THIS_RUN + this_chunk_size))
+      D1_WRITES_ADDED=$((D1_WRITES_ADDED + this_chunk_size))
     fi
 
     start=$((start + write_chunk_size))
@@ -408,11 +737,48 @@ get_existing_lists() {
     | jq -r --arg prefix "$LIST_PREFIX" '.result[] | select(.name | startswith($prefix)) | "\(.id) \(.name)"'
 }
 
+load_chunk_state() {
+  # 輸出每行「chunk_num<TAB>list_id<TAB>checksum」
+  [[ $STATE_AVAILABLE -eq 1 ]] || return 0
+  local resp
+  resp=$(d1_query "SELECT chunk_num, list_id, checksum FROM list_chunk_state")
+  if ! d1_ok <<< "$resp"; then
+    warn "讀取 list_chunk_state 失敗，本次所有清單都會重新上傳（結果正確，只是比較慢）"
+    return 0
+  fi
+  jq -r '.result[0].results[]? | "\(.chunk_num)\t\(.list_id)\t\(.checksum)"' <<< "$resp"
+}
+
+flush_chunk_state() {
+  # $1 = 待寫入檔案，每行「chunk_num<TAB>list_id<TAB>checksum<TAB>item_count」
+  # 刻意在上傳過程中分批寫回（而不是全部跑完才寫），這樣萬一 job 被逾時或取消砍掉，
+  # 已完成的批次狀態仍然留在 D1，下次執行就能從中斷處續傳而不是整個重來。
+  [[ $STATE_AVAILABLE -eq 1 ]] || return 0
+  local state_file="$1"
+  [[ -s "$state_file" ]] || return 0
+  local batch rows
+  batch=$(jq -R -s -c --arg now "$(date +%s)" '
+    split("\n") | map(select(length > 0) | split("\t")) | map({
+      sql: "INSERT INTO list_chunk_state (chunk_num, list_id, checksum, item_count, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(chunk_num) DO UPDATE SET list_id=excluded.list_id, checksum=excluded.checksum, item_count=excluded.item_count, updated_at=excluded.updated_at",
+      params: [.[0], .[1], .[2], .[3], $now]
+    })' "$state_file")
+  rows=$(jq 'length' <<< "$batch")
+  if d1_batch "$batch" | d1_ok; then
+    D1_WRITES_ADDED=$((D1_WRITES_ADDED + rows))
+    : > "$state_file"
+  else
+    warn "寫入 list_chunk_state 失敗（下次執行會重傳這些清單，結果仍正確）"
+    : > "$state_file"
+  fi
+}
+
 upload_lists() {
   # $1 = 最終網域清單檔案（已排序去重）
   local final_file="$1"
-  local total
+  local total total_chunks
   total=$(wc -l < "$final_file" | xargs)
+  total_chunks=$(( (total + LIST_CHUNK_SIZE - 1) / LIST_CHUNK_SIZE ))
+  log "準備上傳：$total 筆網域，共 $total_chunks 份清單"
 
   # 讀取現有清單，用編號對應
   declare -A existing_by_index
@@ -422,8 +788,20 @@ upload_lists() {
     [[ -n "$idx" ]] && existing_by_index[$idx]="$id"
   done < <(get_existing_lists)
 
+  # 前次每份清單的內容 checksum，用來判斷這次哪幾份真的需要重傳
+  declare -A prev_sum prev_id
+  local _cnum _cid _csum
+  while IFS=$'\t' read -r _cnum _cid _csum; do
+    [[ -n "$_cnum" ]] || continue
+    prev_sum[$_cnum]="$_csum"
+    prev_id[$_cnum]="$_cid"
+  done < <(load_chunk_state)
+
   local list_ids_file="$TMP_DIR/list_ids.txt"
   : > "$list_ids_file"
+  local pending_state_file="$TMP_DIR/pending_chunk_state.txt"
+  : > "$pending_state_file"
+  local n_uploaded=0 n_skipped=0 n_failed=0
 
   local chunk_num=1
   local start=1
@@ -431,8 +809,23 @@ upload_lists() {
     local chunk_file="$TMP_DIR/chunk_$chunk_num.txt"
     sed -n "${start},$((start + LIST_CHUNK_SIZE - 1))p" "$final_file" > "$chunk_file"
 
-    local name
+    local name checksum existing_id
     name=$(printf "%s - %03d" "$LIST_PREFIX" "$chunk_num")
+    checksum=$(sha256sum < "$chunk_file" | awk '{print $1}')
+    existing_id="${existing_by_index[$chunk_num]:-}"
+
+    # 差異上傳：內容 checksum 與前次相同、而且該清單在 Gateway 上確實還在（id 也對得上），
+    # 就沒有重傳的必要。這同時就是中斷續傳的機制 —— 上次跑到一半被砍掉的話，
+    # 已完成批次的 checksum 早已寫進 list_chunk_state，這次只會補傳剩下的部分。
+    if [[ -n "$existing_id" && "${prev_sum[$chunk_num]:-}" == "$checksum" && "${prev_id[$chunk_num]:-}" == "$existing_id" ]]; then
+      echo "$existing_id" >> "$list_ids_file"
+      n_skipped=$((n_skipped + 1))
+      log "[$chunk_num/$total_chunks] $name 內容未變，略過重傳"
+      start=$((start + LIST_CHUNK_SIZE))
+      chunk_num=$((chunk_num + 1))
+      continue
+    fi
+
     local items_json
     items_json=$(jq -R -s -c 'split("\n") | map(select(length > 0)) | map({value: .})' "$chunk_file")
     local body
@@ -465,7 +858,16 @@ upload_lists() {
     if [[ $upload_ok -ne 1 ]]; then
       local affected_count
       affected_count=$(wc -l < "$chunk_file" | xargs)
-      warn "清單 $name 重試 3 次後仍然失敗，這批 $affected_count 筆網域這次同步不會被涵蓋（不中止整個流程，繼續處理下一批；下次同步會再次嘗試）"
+      n_failed=$((n_failed + 1))
+      # 上傳失敗但這份清單本來就存在的話，它在 Gateway 上仍保有「上一次的內容」。
+      # 讓 Policy 繼續引用它，比整份從 Policy 拿掉（等於那 1000 筆全部解除封鎖）安全得多。
+      # 這次不寫 list_chunk_state，所以下次執行會判定為需要重傳而自動重試。
+      if [[ -n "$existing_id" ]]; then
+        echo "$existing_id" >> "$list_ids_file"
+        warn "[$chunk_num/$total_chunks] $name 重試 3 次後仍失敗，保留 Gateway 上既有的舊內容並繼續引用（下次執行會自動重傳這 $affected_count 筆）"
+      else
+        warn "[$chunk_num/$total_chunks] $name 重試 3 次後仍失敗，且這是新清單、Gateway 上沒有舊版可用，這批 $affected_count 筆網域本次不會被涵蓋（下次執行會再試）"
+      fi
 
       # 把完整失敗診斷寫進 D1，供日後檢討改善（例如判斷是不是特定內容、特定時段容易失敗）
       local error_detail_json
@@ -484,24 +886,46 @@ upload_lists() {
     echo "$list_id" >> "$list_ids_file"
     local chunk_count
     chunk_count=$(wc -l < "$chunk_file" | xargs)
-    log "清單 $name 已上傳（$chunk_count 筆）"
+    n_uploaded=$((n_uploaded + 1))
+    printf '%s\t%s\t%s\t%s\n' "$chunk_num" "$list_id" "$checksum" "$chunk_count" >> "$pending_state_file"
+    log "[$chunk_num/$total_chunks] $name 已上傳（$chunk_count 筆）"
+
+    # 每 10 份就把狀態寫回 D1 一次，讓中斷續傳的粒度維持在 10 份以內
+    if [[ $(wc -l < "$pending_state_file" | xargs) -ge 10 ]]; then
+      flush_chunk_state "$pending_state_file"
+    fi
 
     start=$((start + LIST_CHUNK_SIZE))
     chunk_num=$((chunk_num + 1))
   done
 
+  flush_chunk_state "$pending_state_file"
+
   # 刪除多餘的舊清單
   local last_chunk=$((chunk_num - 1))
+  local stale_state=""
   for idx in "${!existing_by_index[@]}"; do
     if [[ $idx -gt $last_chunk ]]; then
       local old_id="${existing_by_index[$idx]}"
       if cf_curl DELETE "/accounts/$CF_ACCOUNT_ID/gateway/lists/$old_id" > /dev/null; then
         log "刪除多餘舊清單：編號 $idx"
+        stale_state="${stale_state}${stale_state:+,}$idx"
       else
         warn "刪除舊清單（編號 $idx）失敗（不影響本次上傳結果，之後手動清理即可）"
       fi
     fi
   done
+  # 連同它們的 chunk 狀態一起清掉，否則清單數量之後再長回來時會誤判成「內容未變」而不重傳
+  if [[ -n "$stale_state" && $STATE_AVAILABLE -eq 1 ]]; then
+    d1_query "DELETE FROM list_chunk_state WHERE chunk_num IN ($stale_state)" \
+      | d1_ok || warn "清除多餘的 list_chunk_state 失敗（下次執行會多傳幾份，不影響正確性）"
+  fi
+
+  log "上傳統計：新上傳 $n_uploaded 份 / 內容未變略過 $n_skipped 份 / 失敗 $n_failed 份（共 $total_chunks 份）"
+  UPLOAD_STAT_UPLOADED=$n_uploaded
+  UPLOAD_STAT_SKIPPED=$n_skipped
+  UPLOAD_STAT_FAILED=$n_failed
+  UPLOAD_STAT_TOTAL=$total_chunks
 
   cat "$list_ids_file"
 }
@@ -552,26 +976,116 @@ record_sync_history() {
     --arg status "$status" \
     --arg notes "$notes" \
     '[$run_at, $total_merged, $total_uploaded, $excluded_by_native, $whitelisted, $status, $notes]')
-  d1_query \
-    "INSERT INTO sync_history (run_at, total_merged, total_uploaded, total_excluded_by_native_category, total_whitelisted, status, notes) VALUES (?, ?, ?, ?, ?, ?, ?)" \
-    "$params" \
-    > /dev/null || warn "寫入同步歷史紀錄失敗（不影響本次同步結果本身）"
+  if d1_query \
+      "INSERT INTO sync_history (run_at, total_merged, total_uploaded, total_excluded_by_native_category, total_whitelisted, status, notes) VALUES (?, ?, ?, ?, ?, ?, ?)" \
+      "$params" | d1_ok; then
+    D1_WRITES_ADDED=$((D1_WRITES_ADDED + 1))
+  else
+    warn "寫入同步歷史紀錄失敗（不影響本次同步結果本身）"
+  fi
+}
+
+write_step_summary() {
+  # 把結果寫成 GitHub Actions 的 Job Summary（Actions 頁面上直接看得到的表格），
+  # 不在 Actions 環境下執行時（例如本機手動跑）就靜靜跳過。
+  # $1 status, $2 total_merged, $3 total_uploaded, $4 原因說明
+  [[ -n "${GITHUB_STEP_SUMMARY:-}" ]] || return 0
+  local status="$1" merged="$2" uploaded="$3" reason="$4"
+  {
+    echo "## 擋廣告清單同步結果"
+    echo
+    if [[ "$status" == "skipped" ]]; then
+      echo "⏭️ **本次略過** — ${reason:-訂閱來源與白名單皆無變動}"
+      echo
+      echo "| 項目 | 數值 |"
+      echo "|---|---|"
+      echo "| 來源合併後網域數 | $merged |"
+      echo "| 對 Cloudflare 的變更 | 無 |"
+    else
+      echo "✅ **同步完成** — $reason"
+      echo
+      echo "| 項目 | 數值 |"
+      echo "|---|---|"
+      echo "| 來源合併後網域數 | $merged |"
+      echo "| 最終上傳網域數 | $uploaded |"
+      echo "| 清單進度 | 上傳 $UPLOAD_STAT_UPLOADED／未變略過 $UPLOAD_STAT_SKIPPED／失敗 $UPLOAD_STAT_FAILED，共 $UPLOAD_STAT_TOTAL 份 |"
+      echo "| 今日 D1 寫入用量 | $((D1_WRITES_TODAY + D1_WRITES_ADDED)) / $D1_DAILY_WRITE_BUDGET |"
+      if [[ $DEFERRED_CACHE_ROWS -gt 0 ]]; then
+        echo "| 延後補寫的分類快取 | $DEFERRED_CACHE_ROWS 筆（UTC 午夜額度重置後自動補上） |"
+      fi
+    fi
+    if [[ -s "$TMP_DIR/failed_sources.txt" ]]; then
+      echo
+      echo "⚠️ 這些訂閱來源本次抓取失敗，已沿用前次狀態："
+      sed 's/^/- /' "$TMP_DIR/failed_sources.txt"
+    fi
+  } >> "$GITHUB_STEP_SUMMARY"
 }
 
 # ── 主流程 ───────────────────────────────────────────────
 
 main() {
   log "開始同步"
+  ensure_schema
+  load_daily_budget
 
+  # ── 閘門（需求 1、2）────────────────────────────────────
+  # 先載入前次狀態（裡面有各來源的 ETag/Last-Modified），才能發條件式請求。
+  PREV_STATE_FILE="$TMP_DIR/prev_state.txt"
+  load_sync_state > "$PREV_STATE_FILE"
+  DEFERRED_BACKLOG=$(awk -F'\t' '$1=="deferred_cache_rows"{print $2}' "$PREV_STATE_FILE")
+  DEFERRED_BACKLOG=${DEFERRED_BACKLOG:-0}
+  [[ $DEFERRED_BACKLOG -gt 0 ]] && log "上次遺留 $DEFERRED_BACKLOG 筆分類快取尚未補寫"
+
+  # 抓取只用到上游 HTTP，不碰 Cloudflare；真正昂貴的是後面的分類查詢與清單上傳。
+  # 帶 If-None-Match/If-Modified-Since，內容沒變的來源會回 304 而不傳 body。
+  fetch_and_merge_sources
+  collect_source_checksums
+
+  local whitelist_file="$TMP_DIR/whitelist.txt"
+  load_whitelist > "$whitelist_file"
+  local custom_block_file="$TMP_DIR/custom_block.txt"
+  load_custom_blocklist > "$custom_block_file"
+
+  # 白名單/自訂封鎖清單也納入閘門判斷。否則會出現這種狀況：使用者把某個誤擋的網域
+  # 加進白名單，但上游來源剛好沒變動，同步就永遠不會觸發，白名單形同沒生效。
+  local wl_sum bl_sum
+  wl_sum=$(checksum_of_lines < "$whitelist_file")
+  bl_sum=$(checksum_of_lines < "$custom_block_file")
+
+  local sync_reason=""
+  if sync_reason=$(decide_should_sync "$PREV_STATE_FILE" "$wl_sum" "$bl_sum"); then
+    log "偵測到變動，執行完整同步 → $sync_reason"
+  else
+    log "所有訂閱來源、白名單與自訂封鎖清單的 checksum 都與上次相同，略過本次同步（完全沒有對 Cloudflare 做任何變更）"
+    # 刻意不寫 sync_history：每小時塞一筆 skipped 會讓歷史表被雜訊淹沒
+    # （一天 24 筆，查最近 N 筆時全是略過紀錄）。只更新一個時間戳記錄「有在檢查」，
+    # sync_history 維持只保留真正執行過同步的紀錄。
+    # 但驗證標頭一定要存：有些來源只是改了檔頭（解析後輸出不變），這次拿到新的
+    # ETag 卻不存的話，下次又會整包下載一次。
+    { printf 'last_check_at\t%s\n' "$(date +%s)"; emit_meta_state; } > "$TMP_DIR/check_state.txt"
+    save_sync_state "$TMP_DIR/check_state.txt"
+    save_daily_budget
+    write_step_summary "skipped" "$(wc -l < "$TMP_DIR/source_list.txt" | xargs)" "0" "訂閱來源與白名單皆無變動，未進行同步"
+    return 0
+  fi
+
+  # 確定要同步了，把先前回應 304 而沒下載內容的來源補抓回來
+  materialize_sources
+  collect_source_checksums
   local merged_file="$TMP_DIR/merged_domains.txt"
-  fetch_and_merge_sources > "$merged_file"
+  build_merged > "$merged_file"
   local total_merged
   total_merged=$(wc -l < "$merged_file" | xargs)
   log "合併去重後總計：$total_merged 筆網域"
 
+  if [[ $total_merged -eq 0 ]]; then
+    echo "❌ 所有來源都沒有可用內容，中止本次同步避免清空 Gateway 清單" >&2
+    record_sync_history "failed" "no source content" "0" "0" "0" "0"
+    exit 1
+  fi
+
   # 扣除白名單
-  local whitelist_file="$TMP_DIR/whitelist.txt"
-  load_whitelist > "$whitelist_file"
   local after_whitelist_file="$TMP_DIR/after_whitelist.txt"
   # 白名單支援兩種寫法：
   #   example.com    → 精確比對，只放行這一筆（子網域仍照擋，例如 ads.youtube.com）
@@ -626,9 +1140,7 @@ main() {
   excluded_by_native=$(( $(wc -l < "$after_whitelist_file" | xargs) - $(wc -l < "$after_native_file" | xargs) ))
   log "扣除已被 Cloudflare 原生 Ads 分類涵蓋的 $excluded_by_native 筆"
 
-  # 加上自訂封鎖清單
-  local custom_block_file="$TMP_DIR/custom_block.txt"
-  load_custom_blocklist > "$custom_block_file"
+  # 加上自訂封鎖清單（已在閘門階段載入，這裡直接沿用）
   local final_file="$TMP_DIR/final.txt"
   cat "$after_native_file" "$custom_block_file" | sort -u > "$final_file"
   local total_uploaded
@@ -657,8 +1169,29 @@ main() {
     exit 1
   fi
 
-  record_sync_history "success" "" "$total_merged" "$total_uploaded" "$excluded_by_native" "$whitelisted_count"
+  # 同步成功才把本次的 checksum 寫回。若中途失敗就不寫，下次執行自然會重跑，
+  # 不會出現「狀態說已同步、實際上沒完成」的落差。
+  local new_state_file="$TMP_DIR/new_state.txt"
+  awk -F'\t' '{print "src:" $1 "\t" $2}' "$TMP_DIR/source_checksums.txt" > "$new_state_file"
+  # 抓取失敗的來源沿用前次 checksum，避免下次把它誤判成「內容變動」
+  if [[ -s "$TMP_DIR/failed_sources.txt" ]]; then
+    awk -F'\t' 'NR==FNR { failed["src:" $1]=1; next } ($1 in failed) { print }' \
+      "$TMP_DIR/failed_sources.txt" "$PREV_STATE_FILE" >> "$new_state_file"
+  fi
+  emit_meta_state >> "$new_state_file"
+  printf 'whitelist\t%s\n' "$wl_sum" >> "$new_state_file"
+  printf 'blocklist\t%s\n' "$bl_sum" >> "$new_state_file"
+  printf 'deferred_cache_rows\t%s\n' "$DEFERRED_CACHE_ROWS" >> "$new_state_file"
+  printf 'last_check_at\t%s\n' "$(date +%s)" >> "$new_state_file"
+  save_sync_state "$new_state_file"
+  save_daily_budget
+
+  local notes=""
+  [[ $DEFERRED_CACHE_ROWS -gt 0 ]] && notes="deferred_cache_rows=$DEFERRED_CACHE_ROWS"
+  [[ ${UPLOAD_STAT_FAILED:-0} -gt 0 ]] && notes="${notes}${notes:+; }failed_lists=${UPLOAD_STAT_FAILED}"
+  record_sync_history "success" "$notes" "$total_merged" "$total_uploaded" "$excluded_by_native" "$whitelisted_count"
   log "同步完成：合併 $total_merged / 白名單扣除 $whitelisted_count / 原生分類扣除 $excluded_by_native / 最終上傳 $total_uploaded"
+  write_step_summary "success" "$total_merged" "$total_uploaded" "$sync_reason"
 }
 
 main "$@"
