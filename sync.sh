@@ -45,7 +45,18 @@ CF_API="https://api.cloudflare.com/client/v4"
 LIST_PREFIX="Block ads"
 LIST_CHUNK_SIZE=1000
 POLICY_NAME="Block ads"
-CACHE_TTL_DAYS=30
+# 分類快取的存活天數。過期的網域會重新向 Intel 查一次分類，並重新寫回 D1，
+# 所以這個數字直接決定「重新查詢」與「重新寫入」的壓力有多大。
+#
+# 為什麼從 30 拉到 90：domain_category_cache 目前有約 462,000 列，而且幾乎都是在
+# 很窄的時間區間內一次建好的，所以 30 天的 TTL 等於讓它們「集體同時過期」——
+# 到期那天要重查重寫將近 46 萬列，以 D1_DAILY_WRITE_BUDGET 的 90,000 筆/天來算
+# 要連續佔滿約五天的額度，期間其他寫入都得排隊。
+# 廣告網域的分類極少變動（會變的通常是新網域，那本來就不在快取裡、走的是新增路徑），
+# 30 天過度保守。拉到 90 天可以把換發壓力攤成三分之一，也把第一次集體到期往後推。
+# 代價是「某網域被 Cloudflare 重新分類」這件事最多晚 90 天才會反映；這類變動很罕見，
+# 真的遇到可以用 FORCE_SYNC=1 或直接清掉該列處理。
+CACHE_TTL_DAYS=90
 BULK_BATCH_SIZE=650        # 實測過上限約 700（更高會被 431 Request Header Fields Too Large 拒絕），650 留安全邊際
 BATCH_SLEEP=0.05           # 每批次間隔；實測 200 個並行請求皆成功、無速率限制，可以壓低間隔
 PARALLEL_WORKERS=15        # 平行處理的分類查詢工作數量；實測驗證過 200 並行皆成功，15 留大量安全邊際
