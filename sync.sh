@@ -115,10 +115,20 @@ parse_adblock() {
   # 2. domain= 排除條件從「只抓 $domain= 開頭」改成「$ 或逗號後面接 domain=」都算，
   #    因為 AdBlock 修飾詞是逗號分隔列表，domain= 常常不是第一個修飾詞
   #    （例如 $media,redirect=noop.mp3,domain=xxx.com 這種會被舊版漏掉）。
+  # 3. 只排除 domain= 不夠：AdBlock 修飾詞裡凡是 name=value 形式的，不是「限定套用範圍」
+  #    （domain= to= from= denyallow= ipaddress= method=）就是「改寫請求/回應內容」
+  #    （removeparam= redirect= redirect-rule= csp= replace= removeheader= urltransform=），
+  #    沒有任何一個代表「整個網域要在 DNS 層封鎖」。例如 ublock-privacy 的
+  #    `||youtube.com^$removeparam=pp` 只是要拿掉網址上的 pp 追蹤參數，舊版卻把
+  #    youtube.com 整站當成廣告網域上傳，導致 YouTube 全站在 Gateway 被擋。
+  #    因此改成「修飾詞裡只要出現 = 就整條丟棄」。$badfilter 是「停用另一條規則」，
+  #    語意跟封鎖相反，一併排除。$popup / $third-party / $all / $doc 這類真正的
+  #    封鎖修飾詞不含 =，不受影響。
   grep -E '^\|\|[a-zA-Z0-9.*_-]+\^(\$[a-zA-Z0-9_,.=~|-]*)?$' \
     | grep -v '^@@' \
     | grep -v '##\|#@#\|#?#' \
-    | grep -vE '(\$|,)domain=' \
+    | grep -vE '\$[a-zA-Z0-9_,.=~|-]*=' \
+    | grep -vE '(\$|,)badfilter(,|$)' \
     | sed -E 's/^\|\|([a-zA-Z0-9.*_-]+)\^.*/\1/' \
     | sed -E 's/^\*\.//' \
     | tr 'A-Z' 'a-z' \
@@ -563,7 +573,24 @@ main() {
   local whitelist_file="$TMP_DIR/whitelist.txt"
   load_whitelist > "$whitelist_file"
   local after_whitelist_file="$TMP_DIR/after_whitelist.txt"
-  comm -23 "$merged_file" <(sort "$whitelist_file") > "$after_whitelist_file"
+  # 白名單支援兩種寫法：
+  #   example.com    → 精確比對，只放行這一筆（子網域仍照擋，例如 ads.youtube.com）
+  #   *.example.com  → 後綴比對，放行其所有子網域（給會輪替的 CDN 主機名用，例如
+  #                    r2.sn-xxxx.googlevideo.com 這類無法逐筆列舉的影片節點）
+  awk 'NR==FNR {
+         if (substr($0, 1, 2) == "*.") { suffix_wl[substr($0, 3)] = 1 }
+         else if (length($0)) { exact_wl[$0] = 1 }
+         next
+       }
+       {
+         if ($0 in exact_wl) next
+         rest = $0
+         while ((dot = index(rest, ".")) > 0) {
+           rest = substr(rest, dot + 1)
+           if (rest in suffix_wl) next
+         }
+         print
+       }' "$whitelist_file" "$merged_file" > "$after_whitelist_file"
   local whitelisted_count
   whitelisted_count=$(( total_merged - $(wc -l < "$after_whitelist_file" | xargs) ))
   log "扣除白名單 $whitelisted_count 筆"
