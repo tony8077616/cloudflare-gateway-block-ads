@@ -11,6 +11,10 @@ on:
         description: "略過 checksum 閘門，強制執行完整同步"
         type: boolean
         default: false
+      rebuild_cache:
+        description: "略過 KV 分類快取快照，從 D1 重讀並重建（快照壞掉時的復原手段）"
+        type: boolean
+        default: false
 
 # 避免排程跟手動觸發重疊執行，或連續手動觸發時互相干擾同一批 Cloudflare 資源
 # （多個 run 同時改 Gateway Lists / Policy 容易互相覆蓋）
@@ -38,6 +42,7 @@ jobs:
           D1_DATABASE_ID: ${{ secrets.CF_D1_DATABASE_ID }}
           # 只有手動觸發並勾選 force 時才會是 1；排程觸發時 inputs 為空，等同 0
           FORCE_SYNC: ${{ github.event.inputs.force == 'true' && '1' || '0' }}
+          REBUILD_CACHE_BLOB: ${{ github.event.inputs.rebuild_cache == 'true' && '1' || '0' }}
         run: |
           chmod +x sync.sh
           # 2>&1 是必要的：sync.sh 的 log/warn 與 ::group:: 標記都寫 stderr，

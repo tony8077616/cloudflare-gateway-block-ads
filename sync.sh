@@ -86,6 +86,30 @@ PREV_STATE_FILE=""
 
 SLOT_FETCH_PARALLEL=10   # 讀取現有清單成員時的平行度（224 份循序讀太慢）
 
+# ── Cloudflare KV：分類快取的讀取側前置快取 ────────────────
+# domain_category_cache 有 46 萬列，而且 checked_at 上沒有（也不該有）索引 ——
+# TTL 內幾乎每一列都命中 WHERE 條件，選擇性接近 0，走索引只會更貴。
+# 所以每次真正同步都是一次 46 萬列的全表掃描，光這一條就把 D1 每日讀取額度吃掉大半。
+#
+# 對策：把快取內容整份存成 KV 上的一個 gzip blob，讀取時抓這一個物件就好，
+# D1 的每次同步讀取量從約 462,000 列降到只剩狀態表的數十列。
+#
+# 定位很重要：KV 只是「讀取側」快取，D1 仍然是權威來源，寫入路徑完全沒有改變。
+# KV 讀取失敗、快照不存在、解壓失敗、格式不符 —— 任何一種情況都會退回讀 D1，
+# 也就是退回這個改動之前的行為，所以最壞情況等於現狀，不會更差。
+KV_NAMESPACE_ID="${KV_NAMESPACE_ID:-8b033b48486e45909750175222437f05}"  # adblock-category-cache
+KV_CACHE_KEY="category-cache-v1"
+KV_MAX_BYTES=$((25 * 1024 * 1024))   # KV 單一值的硬上限
+KV_WARN_BYTES=$((20 * 1024 * 1024))  # 逼近上限時先示警，別等到寫入被拒才發現
+# namespace id 沒設就整個停用，行為完全等同這個改動之前
+if [[ -n "$KV_NAMESPACE_ID" ]]; then KV_ENABLED=1; else KV_ENABLED=0; fi
+# 設為 1 可略過 KV 快照、強制從 D1 重讀並重建快照（快照壞掉時的復原手段）
+REBUILD_CACHE_BLOB="${REBUILD_CACHE_BLOB:-0}"
+
+CACHE_SOURCE="none"      # 本次分類快取實際的來源：kv / d1 / none
+CACHE_BLOB_ROWS=0        # 寫回 KV 的快照列數
+CACHE_BLOB_BYTES=0       # 寫回 KV 的快照壓縮後位元組數
+
 # 清單上傳進度統計（由 sync_slots 填寫，供結尾摘要使用）
 UPLOAD_STAT_UPLOADED=0
 UPLOAD_STAT_SKIPPED=0
@@ -584,17 +608,152 @@ load_custom_blocklist() {
 
 # ── 5. D1：分類快取 ───────────────────────────────────────
 
-load_category_cache() {
-  # 輸出：每行「domain is_ads_category」，只取未過期的快取
-  local cutoff resp
-  cutoff=$(( $(date +%s) - CACHE_TTL_DAYS * 86400 ))
-  resp=$(d1_query "SELECT domain, is_ads_category FROM domain_category_cache WHERE checked_at >= ?" \
+kv_get_to_file() {
+  # $1 = key, $2 = 輸出檔。HTTP 狀態碼印到 stdout（連不上時 curl 會給 000）。
+  local key="$1" out="$2"
+  curl -sS -o "$out" -w '%{http_code}' \
+    -H "Authorization: Bearer $CF_API_TOKEN" \
+    "$CF_API/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$KV_NAMESPACE_ID/values/$key" \
+    2>/dev/null || echo "000"
+}
+
+kv_put_from_file() {
+  # $1 = key, $2 = 輸入檔。回應 JSON 印到 stdout。
+  # 用 --data-binary 送原始位元組；不要用 -F，那會把整包 multipart 當成值存進去。
+  local key="$1" in="$2"
+  curl -sS -X PUT \
+    -H "Authorization: Bearer $CF_API_TOKEN" \
+    -H "Content-Type: application/octet-stream" \
+    --data-binary "@$in" \
+    "$CF_API/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$KV_NAMESPACE_ID/values/$key"
+}
+
+_load_cache_from_kv() {
+  # $1 = cutoff。成功時把「domain\tis_ads\tchecked_at」寫進 $TMP_DIR/cache_full.tsv 並回傳 0。
+  local cutoff="$1"
+  local gz="$TMP_DIR/kv_cache.gz" raw="$TMP_DIR/kv_cache.tsv" code
+
+  code=$(kv_get_to_file "$KV_CACHE_KEY" "$gz")
+  case "$code" in
+    200) ;;
+    404)
+      log "KV 上還沒有分類快取快照（第一次啟用），本次改讀 D1，結束前會建立快照"
+      return 1 ;;
+    *)
+      warn "KV 讀取分類快取失敗（HTTP $code），退回讀 D1"
+      return 1 ;;
+  esac
+
+  # gunzip 在內容被截斷或根本不是 gzip 時會失敗，等於免費得到一次完整性檢查
+  if ! gunzip -c "$gz" > "$raw" 2>/dev/null; then
+    warn "KV 快照解壓失敗（可能是上次寫入不完整），退回讀 D1，結束前會重建快照"
+    return 1
+  fi
+  if [[ ! -s "$raw" ]]; then
+    warn "KV 快照是空的，退回讀 D1，結束前會重建快照"
+    return 1
+  fi
+
+  # 格式檢查與 TTL 過濾一次做完。發現任何一行不符三欄格式就整份不採信 ——
+  # 快照是衍生資料，寧可退回 D1 重建，也不要拿半信半疑的內容去決定要不要擋一個網域。
+  if ! awk -F'\t' -v cutoff="$cutoff" '
+         NF != 3 || $3 !~ /^[0-9]+$/ { bad = 1; exit }
+         $3 >= cutoff { print }
+         END { if (bad) exit 3 }
+       ' "$raw" > "$TMP_DIR/cache_full.tsv"; then
+    warn "KV 快照格式不符預期，退回讀 D1，結束前會重建快照"
+    return 1
+  fi
+
+  log "分類快取來源：KV 快照（$(wc -c < "$gz" | xargs) bytes 壓縮，未過期 $(wc -l < "$TMP_DIR/cache_full.tsv" | xargs) 筆），本次不讀 D1 快取表"
+  return 0
+}
+
+_load_cache_from_d1() {
+  # $1 = cutoff。這是全表掃描（約 46 萬列），只在 KV 不可用時才會走到。
+  local cutoff="$1" resp
+  resp=$(d1_query "SELECT domain, is_ads_category, checked_at FROM domain_category_cache WHERE checked_at >= ?" \
     "$(jq -n --arg c "$cutoff" '[$c]')")
   if ! is_valid_json <<< "$resp" || [[ "$(jq -r '.success' <<< "$resp")" != "true" ]]; then
     warn "讀取分類快取失敗，本次視為無快取，將重新查詢全部網域"
-    return
+    : > "$TMP_DIR/cache_full.tsv"
+    return 1
   fi
-  jq -r '.result[0].results[]? | "\(.domain) \(.is_ads_category)"' <<< "$resp"
+  jq -r '.result[0].results[]? | "\(.domain)\t\(.is_ads_category)\t\(.checked_at)"' <<< "$resp" \
+    > "$TMP_DIR/cache_full.tsv"
+  log "分類快取來源：D1 全表掃描（$(wc -l < "$TMP_DIR/cache_full.tsv" | xargs) 筆）"
+  return 0
+}
+
+load_category_cache() {
+  # 輸出到 stdout：每行「domain is_ads_category」（空白分隔，維持下游既有的欄位語意）。
+  # 副作用：把含 checked_at 的完整三欄內容留在 $TMP_DIR/cache_full.tsv，供結束前重建 KV 快照用。
+  local cutoff
+  cutoff=$(( $(date +%s) - CACHE_TTL_DAYS * 86400 ))
+  : > "$TMP_DIR/cache_full.tsv"
+
+  if [[ "$KV_ENABLED" == "1" && "$REBUILD_CACHE_BLOB" != "1" ]] && _load_cache_from_kv "$cutoff"; then
+    CACHE_SOURCE="kv"
+  else
+    if [[ "$REBUILD_CACHE_BLOB" == "1" ]]; then
+      log "REBUILD_CACHE_BLOB=1：略過 KV 快照，直接從 D1 重讀並重建"
+    fi
+    if _load_cache_from_d1 "$cutoff"; then CACHE_SOURCE="d1"; else CACHE_SOURCE="none"; fi
+  fi
+
+  awk -F'\t' '{print $1, $2}' "$TMP_DIR/cache_full.tsv"
+}
+
+save_category_cache_blob() {
+  # $1 = 本次新查到的結果檔（domain\tis_ads\tcategories_json），可以是空的或不存在。
+  # 把「這次載入後仍有效的快取 + 本次新查到的」合併成新快照寫回 KV。
+  [[ "$KV_ENABLED" == "1" ]] || return 0
+
+  local fresh="${1:-}" now blob="$TMP_DIR/cache_blob.tsv" gz="$TMP_DIR/cache_blob.tsv.gz"
+  local fresh_rows=0
+  [[ -s "$fresh" ]] && fresh_rows=$(wc -l < "$fresh" | xargs)
+
+  # 沒有新資料、而且這次本來就是讀 KV 讀成功的，快照內容不會有實質變化，
+  # 就不要白白多寫一次 KV。反過來說只要是從 D1 讀的（第一次啟用或快照壞掉），
+  # 一定要寫回去，否則下次還是得再掃一次全表。
+  if [[ "$CACHE_SOURCE" == "kv" && "$fresh_rows" -eq 0 ]]; then
+    log "分類快取無新增，KV 快照維持不變"
+    return 0
+  fi
+  if [[ "$CACHE_SOURCE" == "none" ]]; then
+    warn "本次沒有可信的快取來源，不覆寫 KV 快照（避免用殘缺內容蓋掉好的快照）"
+    return 0
+  fi
+
+  now=$(date +%s)
+  # 新查到的放前面、既有的放後面，再用 awk 取每個網域第一次出現的那筆 ——
+  # 這樣同一個網域若同時出現在兩邊，會以本次剛查到的結果為準。
+  {
+    [[ "$fresh_rows" -gt 0 ]] && awk -F'\t' -v now="$now" 'NF >= 2 {print $1 "\t" $2 "\t" now}' "$fresh"
+    cat "$TMP_DIR/cache_full.tsv"
+  } | awk -F'\t' '!seen[$1]++' | sort -t"$(printf '\t')" -k1,1 > "$blob"
+
+  CACHE_BLOB_ROWS=$(wc -l < "$blob" | xargs)
+  gzip -c "$blob" > "$gz"
+  CACHE_BLOB_BYTES=$(wc -c < "$gz" | xargs)
+
+  if [[ "$CACHE_BLOB_BYTES" -ge "$KV_MAX_BYTES" ]]; then
+    warn "分類快取快照壓縮後 $CACHE_BLOB_BYTES bytes，已超過 KV 單值上限 $KV_MAX_BYTES，放棄寫入（下次同步會退回讀 D1）"
+    return 0
+  fi
+  if [[ "$CACHE_BLOB_BYTES" -ge "$KV_WARN_BYTES" ]]; then
+    warn "分類快取快照壓縮後 $CACHE_BLOB_BYTES bytes，正在逼近 KV 單值上限 $KV_MAX_BYTES，該考慮縮短 CACHE_TTL_DAYS 或改用 R2"
+  fi
+
+  local resp
+  resp=$(kv_put_from_file "$KV_CACHE_KEY" "$gz")
+  if is_valid_json <<< "$resp" && [[ "$(jq -r '.success' <<< "$resp")" == "true" ]]; then
+    log "KV 快照已更新：$CACHE_BLOB_ROWS 筆（新增 $fresh_rows），壓縮後 $CACHE_BLOB_BYTES bytes"
+  else
+    warn "KV 快照寫入失敗，下次同步會退回讀 D1 全表（不影響本次結果）"
+    CACHE_BLOB_ROWS=0
+    CACHE_BLOB_BYTES=0
+  fi
 }
 
 save_category_cache_batch() {
@@ -1113,6 +1272,14 @@ write_step_summary() {
       echo "| 最終上傳網域數 | $uploaded |"
       echo "| 清單進度 | 上傳 $UPLOAD_STAT_UPLOADED／未變略過 $UPLOAD_STAT_SKIPPED／失敗 $UPLOAD_STAT_FAILED，共 $UPLOAD_STAT_TOTAL 份 |"
       echo "| 今日 D1 寫入用量 | $((D1_WRITES_TODAY + D1_WRITES_ADDED)) / $D1_DAILY_WRITE_BUDGET |"
+      case "$CACHE_SOURCE" in
+        kv) echo "| 分類快取來源 | KV 快照（未讀 D1 快取表）|" ;;
+        d1) echo "| 分類快取來源 | ⚠️ D1 全表掃描（KV 快照不可用，已重建）|" ;;
+        *)  echo "| 分類快取來源 | ⚠️ 無（讀取失敗，本次全部重查）|" ;;
+      esac
+      if [[ $CACHE_BLOB_BYTES -gt 0 ]]; then
+        echo "| KV 快照 | $CACHE_BLOB_ROWS 筆／$((CACHE_BLOB_BYTES / 1024)) KiB |"
+      fi
       if [[ $DEFERRED_CACHE_ROWS -gt 0 ]]; then
         echo "| 延後補寫的分類快取 | $DEFERRED_CACHE_ROWS 筆（UTC 午夜額度重置後自動補上） |"
       fi
@@ -1235,6 +1402,10 @@ main() {
   fi
 
   cat "$cache_file" "$fresh_results_file" > "$TMP_DIR/all_categories.txt"
+
+  # 把「仍有效的舊快取 + 本次新查到的」寫回 KV，下次同步就不必再掃 D1 全表。
+  # 放在這裡而不是更早，是因為要等 check_native_categories 把新結果落地之後才有得合併。
+  save_category_cache_blob "$TMP_DIR/cache_batch_merged.txt"
 
   # 扣掉已被原生分類涵蓋的網域（is_ads == 1）
   local ads_domains_file="$TMP_DIR/native_ads_domains.txt"
