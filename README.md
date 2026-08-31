@@ -18,6 +18,7 @@ DNS 封鎖清單。整套跑在 GitHub Actions 上，狀態存在 Cloudflare D1 
 - [運作方式](#運作方式)
 - [安裝](#安裝)
 - [日常操作](#日常操作)
+- [即時觀測儀表板](#即時觀測儀表板)
 - [疑難排解](#疑難排解)
 - [參考資料](#參考資料)
 
@@ -290,6 +291,98 @@ Actions → **Sync ad-block lists to Cloudflare Gateway** → **Run workflow**�
 > 或「改寫請求內容」，不代表要在 DNS 層擋掉整個網域。
 > 這裡踩過三次坑，最嚴重的一次是 `||youtube.com^$removeparam=pp` 讓 YouTube 全站被擋。
 
+## 即時觀測儀表板
+
+`sync.sh` 產出的是**意圖**（清單裡有哪些網域），Gateway 的 DNS 查詢記錄才是**結果**
+（實際擋掉了什麼、放行了什麼）。`worker/` 底下是一支 Cloudflare Worker，
+把後者做成一個可以互動的網頁。
+
+```
+worker/
+  wrangler.toml       部署設定與繫結
+  src/index.js        路由、認證、GraphQL 查詢、資料整形
+  src/page.js         儀表板頁面（單一字串，不需要打包工具）
+  test/               邏輯測試與本機模擬伺服器
+```
+
+### 頁面上有什麼
+
+| 功能 | 說明 |
+|---|---|
+| 手動重新整理 | 右上角按鈕；旁邊可勾選每 60 秒自動更新 |
+| 查詢量趨勢圖 | 允許／拒絕堆疊柱狀圖。**點任何一根柱子**，下方明細就縮到那個時間區間，再點一次取消 |
+| 時間範圍 | 1 小時／6 小時／24 小時／7 天，分桶粒度自動跟著換（5 分鐘 → 15 分鐘 → 小時 → 日）|
+| 放行結果篩選 | 全部／僅允許通過／僅拒絕通過 |
+| 網域搜尋 | 子字串比對，在 Cloudflare 端過濾而不是抓回來再篩 |
+| 即時顯示分析條件 | 條件列會即時反映目前在分析什麼；輸入搜尋字串時，尚未送出的條件會用虛線標示「待套用」|
+| 網域明細 | 前 50 個網域的查詢數、允許／拒絕細分、命中的政策名稱。點網域可直接以它搜尋 |
+| 同步狀態 | 最近 5 次 `sync.sh` 的結果與 KV 快照大小 |
+
+### 資料從哪裡來
+
+Cloudflare GraphQL Analytics 的 `gatewayResolverQueriesAdaptiveGroups`。
+儀表板**不讀** `domain_category_cache`，對 D1 的用量只有同步狀態面板那一筆
+`sync_history ... LIMIT 5`（固定 5 列）。
+
+`resolverDecision` 是數字碼，Cloudflare 沒有在 GraphQL 裡宣告成具名列舉，官方文件
+也只給字串形式。`src/index.js` 裡的對照表是實證推導的（2026-08-30，24 小時樣本，
+用 `resolverDecision` × `policyName` 交叉比對）：
+
+| 代碼 | 樣本數 | 伴隨的 policy | 判定 |
+|---|---|---|---|
+| 5 | 63,292 | 無 | 允許（沒有政策命中）|
+| 9 | 9,114 | 一律是 `Block ads` | **拒絕** |
+| 10 | 3,097 | 一律是 Allow 類政策 | 允許（政策明確放行）|
+
+> **沒有列在表裡的代碼會歸到「其他」，在圖表與統計中單獨呈現，不會被算進允許或拒絕，
+> 而且畫面上會出現橫幅提醒。** 猜錯的代價是把「允許」畫成「拒絕」，那比誠實顯示
+> 「未知」糟糕得多。真的遇到時，看它伴隨的政策名稱就知道該歸哪一邊，再補進對照表。
+
+### 部署
+
+> ⚠️ **這個頁面會攤開你的完整 DNS 查詢記錄** —— 你去過哪些網站、用哪些 App、什麼時間。
+> 這等同於瀏覽歷史。所以 `DASH_TOKEN` 沒有設定時，Worker 會回 **503 並拒絕提供任何內容**。
+> 這是刻意的 fail-closed：「忘記設定」的預設結果不可以是「公開在網際網路上」。
+
+1. 編輯 `worker/wrangler.toml`，填入 `CF_ACCOUNT_ID`、D1 資料庫 ID、KV namespace ID。
+   D1 與 KV 兩段是選用的，拿掉只會讓同步狀態面板顯示「沒有繫結」。
+
+   > ⚠️ `name` 決定要部署成哪一支 Worker，`wrangler deploy` 會**直接覆寫同名的既有
+   > Worker 且不會確認**。如果你的帳戶上已經有其他 Worker，先確認名字不會撞到。
+
+2. 設定兩個機密：
+
+   ```bash
+   cd worker
+   npx wrangler secret put DASH_TOKEN     # 自己決定一組夠長的通行碼
+   npx wrangler secret put CF_API_TOKEN   # 需要 Account Analytics: Read
+   ```
+
+   `CF_API_TOKEN` 需要的權限是 **Account Analytics: Read**，跟同步用的那顆 Token 需求
+   不同。可以共用一顆並補上權限，也可以另外開一顆唯讀的 —— 後者比較好，儀表板不需要
+   任何寫入權限。
+
+3. 部署：
+
+   ```bash
+   npx wrangler deploy
+   ```
+
+4. **強烈建議再加一層 Cloudflare Access。** 你已經有 Zero Trust 了，把這支 Worker 的
+   `workers.dev` 網址加進 Access 應用程式並限定你自己的 email，就不必只依賴一組通行碼。
+   內建的通行碼是「絕不預設公開」的底線，不是唯一防線。
+
+### 本機開發
+
+不需要 Cloudflare 憑證就能跑起來看畫面：
+
+```bash
+cd worker
+node test/mockserver.mjs      # http://127.0.0.1:8787，用假資料跑真正的 Worker
+node test/worker.test.mjs     # 認證、判定分類、篩選翻譯的邏輯測試
+node test/page.check.mjs      # 頁面腳本的語法與 id/data-* 對應檢查
+```
+
 ## 疑難排解
 
 | 症狀 | 先檢查 |
@@ -299,6 +392,8 @@ Actions → **Sync ad-block lists to Cloudflare Gateway** → **Run workflow**�
 | 掃不到網域但確定被擋 | 十之八九是被 Cloudflare 原生分類擋掉的（目前 54,742 筆），`find` 會告訴你 |
 | 排程一直「略過」 | 正常。來源沒變動就不做事。要強制執行請用 `force` |
 | 清單上傳失敗 | 目前只會在執行日誌裡留 `⚠` 警告，看 Actions 的日誌。`manage.sh failures` 讀的 `upload_failures` 表**目前沒有任何東西在寫入**（寫入端在穩定槽位改版時一併被移除了），所以會回空 |
+| 儀表板出現「其他／未歸類」 | Cloudflare 回了對照表裡沒有的判定代碼。看明細的「判定」欄取得代碼與政策名稱，補進 `worker/src/index.js` 的 `DECISION` |
+| 儀表板查詢失敗且提到權限 | `CF_API_TOKEN` 缺少 `Account Analytics: Read` |
 | 日誌收折標記錯位 | workflow 必須是 `./sync.sh 2>&1`。`log`/`warn` 與 `::group::` 都寫 stderr，不合流會因緩衝差異而錯位 |
 
 **設計原則：盡力而為，不要跳錯。** `sync.sh` 用 `set -uo pipefail` 但**刻意不用 `-e`**。
@@ -319,6 +414,7 @@ sync.sh                      同步主程式
 manage.sh                    白名單 / 自訂封鎖清單 / 診斷工具
 sources.conf                 訂閱來源設定
 .github/workflows/sync.yml   排程 workflow
+worker/                      即時觀測儀表板（Cloudflare Worker，選用）
 ```
 
 ### D1 資料表
