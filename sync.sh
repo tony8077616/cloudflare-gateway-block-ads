@@ -97,15 +97,20 @@ SLOT_FETCH_PARALLEL=10   # 讀取現有清單成員時的平行度（224 份循�
 # 定位很重要：KV 只是「讀取側」快取，D1 仍然是權威來源，寫入路徑完全沒有改變。
 # KV 讀取失敗、快照不存在、解壓失敗、格式不符 —— 任何一種情況都會退回讀 D1，
 # 也就是退回這個改動之前的行為，所以最壞情況等於現狀，不會更差。
-# 注意這裡是 ${VAR-default} 不是 ${VAR:-default}：少一個冒號，語意差很多。
-# 加冒號的版本連「設成空字串」都會套用預設值，於是 KV_NAMESPACE_ID="" 停用不了快取，
-# 下面的 KV_ENABLED=0 會變成永遠碰不到的死碼。不加冒號才只在「未設定」時套預設。
+# 預設值是空字串，也就是「不使用 KV 快取」。
 #
-# 這個預設值是本 repo 自己的 namespace。**如果你是 fork 過去用的，一定要換掉**：
-# 別人的 namespace id 配上你自己的 token，每次讀都會 404、每次寫都會失敗，
-# 然後靜靜地退回讀 D1 全表掃描 —— 功能還是對的，但每次同步要多讀 46 萬列。
-# 建立自己的 namespace 之後，改這一行或設同名環境變數即可。
-KV_NAMESPACE_ID="${KV_NAMESPACE_ID-8b033b48486e45909750175222437f05}"  # adblock-category-cache
+# 這一行以前的預設值是本 repo 作者自己的 namespace id。那是個有害的預設：fork 的人
+# 沒換掉就會拿別人的 namespace 配自己的 token，每次讀 404、每次寫失敗，然後「靜靜地」
+# 退回讀 D1 全表掃描 —— 結果還是對的，但每次同步要多讀 46 萬列，而且那行警告混在
+# 一大堆輸出裡很容易被當成雜訊。現在把「靜默地用錯別人的資源」換成「明確地不用」。
+#
+# 未設定 = 不用 KV 快取、直接讀 D1：結果完全正確，只是每次同步要多掃約 46 萬列、比較慢。
+# 這條降級路徑本來就已經實作好了（見下面的 KV_ENABLED 與 load_category_cache）。
+#
+# 要啟用快取：自己建一個 KV namespace，把它的 id 設進 KV_NAMESPACE_ID 環境變數即可
+#（GitHub Actions 走 repo variable，見 .github/workflows/sync.yml —— namespace id 不是機密，
+# 它會出現在每一個 Cloudflare API 路徑裡；`./setup.sh --provision` 會幫你建立並設定）。
+KV_NAMESPACE_ID="${KV_NAMESPACE_ID-}"
 KV_CACHE_KEY="category-cache-v1"
 KV_MAX_BYTES=$((25 * 1024 * 1024))   # KV 單一值的硬上限
 KV_WARN_BYTES=$((20 * 1024 * 1024))  # 逼近上限時先示警，別等到寫入被拒才發現
@@ -379,9 +384,121 @@ header_value() {
   grep -i "^$2:" "$1" 2>/dev/null | tail -1 | sed -E "s/^[^:]+:[[:space:]]*//" | tr -d '\r'
 }
 
+# ── sources.conf 的輸入驗證 ───────────────────────────────
+#
+# sources.conf 是「使用者自己會編輯」的檔案，而它的兩個欄位最後都會流進危險的位置：
+#
+#   name → 直接拼進 $TMP_DIR/raw_$name.txt、hdr_$name.txt、parsed_$name.txt、sum_$name.txt。
+#          含 / 或 \ 就能寫到 $TMP_DIR 以外的目錄，連續 .. 可以往上層穿越，
+#          前導 - 會被後面吃到這個檔名的指令當成旗標。
+#   url  → 以前是 curl 的最後一個位置參數，而且沒有 `--` 分隔。所以一行寫成
+#          `evil|-o/tmp/pwned|adblock`，curl 會把 -o/tmp/pwned 當旗標吃掉，
+#          變成「由設定檔決定要覆寫哪個檔案」的任意檔案寫入。
+#
+# name 這裡刻意用「拒絕清單」而不是 ASCII 白名單：本專案出貨的 sources.conf 自己就有
+# 中文來源名（台灣165反詐騙提供、台灣廣告過濾），ASCII 白名單會把它們一起擋掉。
+# 只擋真正會造成路徑/旗標問題的字元，非 ASCII 維持可用。
+#
+# 驗證的呼叫時點在 fetch_and_merge_sources 的 xargs 修剪「之後」——
+# sources.conf 允許 `  name | url | format ` 這種帶空白的寫法，在修剪前驗證會把
+# 合法的行判成前導空白/前導 - 而誤拒。
+INVALID_SOURCE_REASON=""
+
+byte_len() {
+  # 長度上限要算「位元組」不是「字元」：檔名長度上限是位元組計的，
+  # 而中文來源名一個字就佔 3 個位元組。
+  printf '%s' "$1" | wc -c | xargs
+}
+
+sanitize_for_log() {
+  # 不合法的欄位值要印出來讓使用者知道是哪一行出問題，但不能原封不動送進終端機 ——
+  # 裡面可能有 ANSI escape 之類的控制字元。這裡只拔掉控制字元並截短，其餘保留原樣。
+  # LC_ALL=C 是為了讓 tr/cut 按「位元組」處理：中文來源名是合法的，不該被當成多位元組
+  # 字元去解讀而出事；控制字元的判定則本來就該是位元組層級的。
+  printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177' | LC_ALL=C cut -b1-120
+}
+
+has_control_chars() {
+  # 有控制字元就回傳 0（真）。
+  #
+  # 這裡刻意**不用** [[ "$s" =~ [[:cntrl:]] ]]。實測（cygwin + C.UTF-8）那個寫法會把
+  # 「台灣165反詐騙提供」判成含控制字元 —— 字元類別的判定跟 locale 綁在一起，
+  # 而這個專案自己出貨的 sources.conf 就有中文來源名，誤判等於作者把自己的來源擋掉。
+  # 改成用 LC_ALL=C 的 tr 做位元組層級的比對：只刪 0x00-0x1F 與 0x7F，
+  # UTF-8 的多位元組序列（0x80-0xFF）原封不動，不管在哪個 locale 結果都一樣。
+  local stripped
+  stripped="$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177')"
+  [[ "$stripped" != "$1" ]]
+}
+
+validate_source_name() {
+  local name="$1"
+  INVALID_SOURCE_REASON=""
+  if [[ -z "$name" ]]; then
+    INVALID_SOURCE_REASON="欄位是空的"; return 1
+  fi
+  # 拒絕清單裡的 NUL 不需要（也沒辦法）另外寫一條測試：bash 的字串本身就不可能含 NUL，
+  # read 讀到 NUL 會直接截斷，所以走到這裡的 $name 一定已經沒有 NUL 了。
+  # 註：寫成 [[ "$name" == *$'\000'* ]] 是個陷阱 —— $'\000' 在 bash 裡就是空字串，
+  # 整個 pattern 會變成 `**`，於是「檢查有沒有 NUL」實際上會match 每一個字串。
+  if has_control_chars "$name"; then
+    INVALID_SOURCE_REASON="含控制字元"; return 1
+  fi
+  if [[ "$name" == */* ]]; then
+    INVALID_SOURCE_REASON="含 /（會被當成路徑分隔，寫到 \$TMP_DIR 以外的地方）"; return 1
+  fi
+  if [[ "$name" == *\\* ]]; then
+    INVALID_SOURCE_REASON="含 \\（同上，Windows 風格的路徑分隔）"; return 1
+  fi
+  if [[ "$name" == *..* ]]; then
+    INVALID_SOURCE_REASON="含連續兩個點（路徑穿越）"; return 1
+  fi
+  if [[ "$name" == -* ]]; then
+    INVALID_SOURCE_REASON="以 - 開頭（會被指令當成旗標）"; return 1
+  fi
+  local n
+  n=$(byte_len "$name")
+  if [[ "$n" -gt 64 ]]; then
+    INVALID_SOURCE_REASON="長度 $n 位元組，超過上限 64"; return 1
+  fi
+  return 0
+}
+
+validate_source_url() {
+  local url="$1"
+  INVALID_SOURCE_REASON=""
+  if [[ -z "$url" ]]; then
+    INVALID_SOURCE_REASON="欄位是空的"; return 1
+  fi
+  if has_control_chars "$url"; then
+    INVALID_SOURCE_REASON="含控制字元（tab／換行之類）"; return 1
+  fi
+  # tab 與換行已經被上面那條擋掉了，這裡只剩半形空白要處理。
+  # 用字面比對而不是 [[:space:]]，理由同 has_control_chars 的註解：不要跟 locale 綁在一起。
+  if [[ "$url" == *" "* ]]; then
+    INVALID_SOURCE_REASON="含空白字元"; return 1
+  fi
+  # 只收 https://。這一條同時也擋掉了所有「看起來像 curl 旗標」的值（-o、--output…），
+  # 因為它們都不是 https:// 開頭。下面的 curl 還會再加 -- 與 --proto 雙重把關。
+  if [[ "$url" != https://* ]]; then
+    INVALID_SOURCE_REASON="不是 https:// 開頭"; return 1
+  fi
+  if [[ "${#url}" -le 8 ]]; then
+    INVALID_SOURCE_REASON="https:// 後面沒有任何內容"; return 1
+  fi
+  return 0
+}
+
 curl_source() {
   # $1 name, $2 url, $3 是否帶條件式標頭（1/0）
   # 內容寫入 raw_<name>.txt、標頭寫入 hdr_<name>.txt，HTTP 狀態碼輸出到 stdout
+  #
+  # 前提：name/url 都已經過 validate_source_name / validate_source_url。
+  # 這裡的 curl 旗標是第二道防線，就算驗證被繞過也不至於變成任意檔案寫入：
+  #   -q                  不讀 ~/.curlrc；別人的設定檔不能替我們改輸出位置或加 proxy
+  #   --proto '=https'    只准講 https，file:// 之類一律拒絕
+  #   --proto-redir '=https'  轉址也只准轉去 https，避免被導到 file:// / http://
+  #   --                  結束旗標解析，後面的 $url 一定被當成網址而不是旗標
   local name="$1" url="$2" conditional="$3"
   local -a hdrs=()
   if [[ "$conditional" == "1" ]]; then
@@ -391,11 +508,12 @@ curl_source() {
     [[ -n "$et" ]] && hdrs+=(-H "If-None-Match: $et")
     [[ -n "$lm" ]] && hdrs+=(-H "If-Modified-Since: $lm")
   fi
-  curl -sSL --retry 3 --retry-all-errors --max-time 60 \
+  curl -q -sSL --retry 3 --retry-all-errors --max-time 60 \
+    --proto '=https' --proto-redir '=https' \
     -A "cloudflare-gateway-block-ads-sync/1.0" \
     "${hdrs[@]}" \
     -D "$TMP_DIR/hdr_$name.txt" -o "$TMP_DIR/raw_$name.txt" \
-    -w '%{http_code}' "$url" 2>/dev/null
+    -w '%{http_code}' -- "$url" 2>/dev/null
 }
 
 parse_source_into() {
@@ -430,15 +548,40 @@ fetch_and_merge_sources() {
   : > "$TMP_DIR/newmeta.txt"
   : > "$TMP_DIR/source_list.txt"
 
-  local total_sources n=0
+  local total_sources n=0 lineno=0
   total_sources=$(grep -cvE '^[[:space:]]*(#|$)' "$SOURCES_FILE" | xargs)
-  local n_304=0 n_200=0
+  local n_304=0 n_200=0 n_rejected=0
   while IFS='|' read -r name url format; do
+    lineno=$((lineno + 1))
     # 跳過空行與註解
     [[ -z "$name" || "$name" =~ ^[[:space:]]*# ]] && continue
     name="$(echo "$name" | xargs)"
     url="$(echo "$url" | xargs)"
     format="$(echo "$format" | xargs)"
+
+    # 修剪過後再判一次空行／註解。上面那次判斷是在修剪之前做的，遇到 CRLF 結尾的
+    # 設定檔（例如在 Windows 上 checkout 的工作樹）空行會是 "\r" 而不是空字串，
+    # 逃過第一次判斷之後被修剪成空字串，接著就會被下面的驗證誤報成「name 欄是空的」。
+    [[ -z "$name" || "$name" == \#* ]] && continue
+
+    # ── 輸入驗證（一定要在上面三行 xargs 修剪之後）─────────
+    # 被拒的來源要講清楚是「第幾行、哪一欄、為什麼」，不可以靜默略過 ——
+    # 靜默略過的話，使用者只會看到清單莫名其妙少了一批網域。
+    if ! validate_source_name "$name"; then
+      warn "sources.conf 第 $lineno 行的 name 欄不合法（$INVALID_SOURCE_REASON）：'$(sanitize_for_log "$name")'，拒絕這個來源"
+      # 這裡刻意不把不合法的 name 寫進 failed_sources.txt：那個檔案是給下游當索引鍵用的，
+      # 不該塞進未經驗證的內容。用行號當識別即可。
+      echo "sources.conf:$lineno" >> "$TMP_DIR/failed_sources.txt"
+      n_rejected=$((n_rejected + 1))
+      continue
+    fi
+    if ! validate_source_url "$url"; then
+      warn "sources.conf 第 $lineno 行（來源 '$name'）的 url 欄不合法（$INVALID_SOURCE_REASON）：'$(sanitize_for_log "$url")'，拒絕這個來源"
+      echo "$name" >> "$TMP_DIR/failed_sources.txt"
+      n_rejected=$((n_rejected + 1))
+      continue
+    fi
+
     printf '%s\t%s\t%s\n' "$name" "$url" "$format" >> "$TMP_DIR/source_list.txt"
     n=$((n + 1))
 
@@ -489,7 +632,7 @@ fetch_and_merge_sources() {
     log "[$n/$total_sources] $name 解析出 $(wc -l < "$TMP_DIR/parsed_$name.txt" | xargs) 筆網域（checksum $(cut -c1-12 < "$TMP_DIR/sum_$name.txt")）"
   done < "$SOURCES_FILE"
 
-  log "來源抓取完成：$n_200 個有更新、$n_304 個回應 304 未修改、$(wc -l < "$TMP_DIR/failed_sources.txt" | xargs) 個失敗"
+  log "來源抓取完成：$n_200 個有更新、$n_304 個回應 304 未修改、$(wc -l < "$TMP_DIR/failed_sources.txt" | xargs) 個失敗（其中 $n_rejected 個是設定不合法被拒）"
 }
 
 materialize_sources() {
