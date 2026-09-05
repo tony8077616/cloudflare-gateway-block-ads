@@ -8,22 +8,29 @@ compatibility_date = "2026-08-01"
 # 觀察用途，不需要放在自訂網域上。想綁自訂網域的話加 routes 即可。
 workers_dev = true
 
+# 明寫而不是靠預設值。preview_urls 未指定時會跟著 workers_dev（目前 true），
+# 而官方文件明確警告：在後台改了 Preview URLs 卻沒同步改這個檔案，下一次
+# wrangler deploy 就會把後台的設定覆寫回去。這兩個入口都由 Worker-level
+# Cloudflare Access 保護（同一支應用、同一個 aud），改動前請先確認 Access
+# 仍涵蓋你要開的入口。
+preview_urls = true
+
 [vars]
 # 帳戶 ID 不是機密（它會出現在每一個 Cloudflare API 路徑裡），放 vars 就好。
 # 通行碼與 API Token 是機密，一律用 wrangler secret put，不要寫進這個檔案。
-CF_ACCOUNT_ID = "請填入你的 Cloudflare Account ID"
+CF_ACCOUNT_ID = "5a2eeee372c212cf4f77b36057cec75f"
 
 # 同步狀態面板要讀 sync_history。拿掉這一段的話面板會顯示「沒有繫結」，
 # 其餘功能不受影響 —— DNS 查詢記錄是走 GraphQL Analytics，不經過 D1。
 [[d1_databases]]
 binding = "DB"
 database_name = "dns-blocklist-apac"
-database_id = "請填入你的 D1 資料庫 ID"
+database_id = "0918dd23-b75e-4ab5-a82f-bdaa44650fea"
 
 # 用來顯示分類快取快照的大小。同樣是選用的。
 [[kv_namespaces]]
 binding = "CACHE_KV"
-id = "請填入你的 KV namespace ID"
+id = "8b033b48486e45909750175222437f05"
 
 # ── 必要的機密（用指令設定，不要寫在這裡）────────────────
 #   npx wrangler secret put DASH_TOKEN     # 進入儀表板的通行碼
