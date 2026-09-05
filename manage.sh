@@ -33,14 +33,17 @@ LIST_CHUNK_SIZE=1000
 #   20 條 → 224 份掃完約 56 秒（每請求約 5.0 秒，延遲同比例上升，總時間抵消）
 # 瓶頸在伺服器端，不在這裡，所以維持 12 就好，不要再往上調。
 FIND_PARALLEL=12
-# 這裡是 ${VAR-default} 不是 ${VAR:-default}：少一個冒號，語意差很多。
-# 加冒號的版本連「設成空字串」都會套用預設值，那樣就沒有辦法停用 KV 了。
-# 這一行必須跟 sync.sh 的同名設定保持一致，否則兩支工具對同一個環境變數的反應會不同。
+# 預設值是空字串，也就是「不使用 KV 快取」。這一行必須跟 sync.sh 的同名設定保持一致，
+# 否則兩支工具對同一個環境變數的反應會不同。
 #
-# 這個預設值是本 repo 自己的 namespace。**如果你是 fork 過去用的，要換成你自己的**：
-# 沿用別人的 namespace id 配上你自己的 token，find 的分類那一項每次都會 404，
-# 只會印「讀不到 KV 快照，略過這一項」—— 不會出錯，但那一項就永遠查不到東西。
-KV_NAMESPACE_ID="${KV_NAMESPACE_ID-8b033b48486e45909750175222437f05}"
+# 這一行以前的預設值是本 repo 作者自己的 namespace id。fork 的人沒換掉的話，
+# 等於拿別人的 namespace 配自己的 token，find 的分類那一項每次都會 404，
+# 只會印「讀不到 KV 快照，略過這一項」—— 不會出錯，但那一項永遠查不到東西。
+#
+# 未設定 = 不用 KV 快取：find 的「Cloudflare 原生分類」那一項會顯示讀不到快照並略過，
+# 其餘各項照常運作（權威資料在 D1，這裡只是讀取側快取）。
+# 要啟用就把自己的 KV namespace id 設成 KV_NAMESPACE_ID 環境變數。
+KV_NAMESPACE_ID="${KV_NAMESPACE_ID-}"
 KV_CACHE_KEY="category-cache-v1"
 
 TMP_DIR="$(mktemp -d)"
