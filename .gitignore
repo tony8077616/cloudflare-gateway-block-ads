@@ -3,3 +3,15 @@ oisd_small_domainswild2.txt.*
 # setup.sh 產生的本機設定：只存非機密的資源 ID（帳戶 ID / D1 ID / KV namespace ID），
 # 絕不存 API token。即使如此也不進版控 —— 這些 ID 是「你的帳戶的」，不是 template 的。
 .setup.local
+
+# Worker 的本機機密。.dev.vars 與 .env 會放真的 API Token，絕不能進版控。
+#
+# ⚠️ 官方文件建議的寫法是 .dev.vars*，但那個樣式會把 .dev.vars.example 一起吃掉 ——
+# 而範例檔正是一鍵部署用來知道「要跟使用者要哪些機密」的依據，必須留在版控裡。
+# 所以這裡先用寬樣式擋掉，再用否定規則把範例檔放回來。否定規則一定要排在後面才有效。
+.dev.vars
+.dev.vars.*
+.env
+.env.*
+!.dev.vars.example
+!.env.example

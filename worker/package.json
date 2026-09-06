@@ -6,5 +6,18 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "test": "node test/worker.test.mjs"
+  },
+  "cloudflare": {
+    "bindings": {
+      "CF_ACCOUNT_ID": {
+        "description": "你的 Cloudflare Account ID。在儀表板網址列或任一 API 路徑裡都看得到，不是機密。"
+      },
+      "ACCESS_AUD": {
+        "description": "保護這個儀表板的 Cloudflare Access 應用的 Application Audience (AUD) Tag。第一次部署時留空即可 —— Access 應用要先有已部署的 Worker 才能建立。留空時 Worker 會回 503 拒絕一切，等你建好 Access 應用再把 AUD 填進 wrangler.toml 重新部署。"
+      },
+      "CF_API_TOKEN": {
+        "description": "讀取 DNS 查詢記錄用的 API Token，只需要 Account Analytics: Read 權限。建議另外開一顆唯讀的，儀表板不需要任何寫入權限。"
+      }
+    }
   }
 }
