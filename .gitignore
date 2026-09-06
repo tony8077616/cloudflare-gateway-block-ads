@@ -1,1 +1,5 @@
 oisd_small_domainswild2.txt.*
+
+# setup.sh 產生的本機設定：只存非機密的資源 ID（帳戶 ID / D1 ID / KV namespace ID），
+# 絕不存 API token。即使如此也不進版控 —— 這些 ID 是「你的帳戶的」，不是 template 的。
+.setup.local
