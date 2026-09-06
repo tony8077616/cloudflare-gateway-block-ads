@@ -1,34 +1,101 @@
-# ⚠️ 這個 name 決定要部署成哪一支 Worker。wrangler deploy 會直接覆寫同名的既有
-# Worker，不會有任何確認提示。這個帳戶上已經有一支 gateway-dns-dashboard
-# （建立於 2026-08-23），**不要**把下面這行改成那個名字。
+# ⚠️ 這個 name 決定要部署成哪一支 Worker。wrangler deploy 會**直接覆寫同名的既有
+# Worker，不會有任何確認提示**。部署之前先確認你的帳戶上沒有同名的 Worker，
+# 或直接改成你自己的名字。（一鍵部署的設定頁會讓你在部署前改，手動部署則沒人提醒你。）
 name = "adblock-dashboard"
 main = "src/index.js"
 compatibility_date = "2026-08-01"
 
-# 觀察用途，不需要放在自訂網域上。想綁自訂網域的話加 routes 即可。
+# 觀察用途，不需要放在自訂網域上。
+#
+# ⚠️ 想綁自訂網域（加 routes）之前先讀這段：進入權限是由 Worker-level Cloudflare
+# Access 控制的，而 Access 應用綁的是特定的入口。新加的自訂網域如果沒有被同一支
+# Access 應用涵蓋，請求進到 Worker 時 ctx.access 不會被填，Worker 一律回 403 ——
+# 安全上沒問題（fail closed），但你會得到一個查不出原因的故障。要加 routes，
+# 就要同步把新網址加進 Access 應用。
 workers_dev = true
+
+# 明寫而不是靠預設值。preview_urls 未指定時會跟著 workers_dev（目前 true），
+# 而官方文件明確警告：在後台改了 Preview URLs 卻沒同步改這個檔案，下一次
+# wrangler deploy 就會把後台的設定覆寫回去。
+#
+# 這裡刻意設 false：一個人裝一支自己的儀表板，用不到分支預覽。而且一旦你之後
+# 打開了「非 production 分支建置」（預設是關的），每個分支都會多一個公開入口，
+# 那些入口同樣必須被同一支 Access 應用涵蓋，否則就是上面說的那種查不出原因的 403。
+preview_urls = false
+
+# 接上 Workers Builds（一鍵部署會自動接上）之後，這個檔案就是線上設定的唯一真實
+# 來源，而 `wrangler deploy` 會把沒寫在這裡的 observability 設定清掉 —— 2026-09-05
+# 實測過：建置前後台是 logs/traces 開啟，建置後整個 observability 欄位從 API 回應
+# 中消失。官方「唯一真實來源」的說明只點名 vars 與 routes，沒有提到這一項，
+# 所以只能靠實測。
+# 沒有日誌的話，Access 擋人擋錯了也查不出原因，因此明寫成開啟。
+[observability]
+enabled = true
+
+  [observability.logs]
+  enabled = true
+  head_sampling_rate = 1
+  invocation_logs = true
+
+  [observability.traces]
+  enabled = true
+  head_sampling_rate = 1
 
 [vars]
 # 帳戶 ID 不是機密（它會出現在每一個 Cloudflare API 路徑裡），放 vars 就好。
-# 通行碼與 API Token 是機密，一律用 wrangler secret put，不要寫進這個檔案。
+# API Token 是機密，一律用 wrangler secret put，不要寫進這個檔案。
 CF_ACCOUNT_ID = "請填入你的 Cloudflare Account ID"
 
-# 同步狀態面板要讀 sync_history。拿掉這一段的話面板會顯示「沒有繫結」，
-# 其餘功能不受影響 —— DNS 查詢記錄是走 GraphQL Analytics，不經過 D1。
-[[d1_databases]]
-binding = "DB"
-database_name = "dns-blocklist-apac"
-database_id = "請填入你的 D1 資料庫 ID"
+# 這支 Worker 所屬的 Cloudflare Access 應用的 Application Audience (AUD) Tag。
+#
+# 這不是機密：它會出現在每一個 Access 重導向 URL 的 query string 裡，任何看得到
+# 登入流程的人都拿得到。它的作用是「指名是哪一支應用」，不是「證明身分」——
+# 驗證由 Access 在請求進到 Worker 之前完成，Worker 只用它確認驗過的那張通行證
+# 屬於本應用，而不是同一個 team domain 底下的其他 Access 應用。
+#
+# ⚠️ 出貨是空字串，這是刻意的。Access 應用要先有一支已部署的 Worker 才能建立，
+# 所以你在第一次部署的當下不可能知道這個值。順序是：
+#   部署（此時 Worker 一律回 503，正常）→ 建立 Worker 型的 Access 應用
+#   → 複製它的 AUD Tag 填到這裡 → 重新部署。
+# 沒填就 503、拒絕提供任何內容，因為這個頁面攤開的是完整的 DNS 查詢記錄，
+# 「忘記設定」的預設結果絕對不可以是「公開在網際網路上」。
+#
+# 換掉 Access 應用（刪掉重建也算）就會換一組 aud，記得同步更新這裡並重新部署，
+# 否則 Worker 會把所有人擋在 403。
+ACCESS_AUD = ""
 
-# 用來顯示分類快取快照的大小。同樣是選用的。
-[[kv_namespaces]]
-binding = "CACHE_KV"
-id = "請填入你的 KV namespace ID"
+# ── 選用的繫結 ──────────────────────────────────────────
+#
+# 儀表板的主要功能（DNS 查詢記錄）走 GraphQL Analytics，完全不經過 D1 與 KV，
+# 所以沒有這兩個繫結也是完整可用的，只是「同步狀態」面板會顯示「沒有繫結」。
+#
+# 這也是為什麼這兩段預設是註解掉的：建立 D1 與 KV 的是 setup.sh，儀表板只是去讀。
+# 如果讓一鍵部署也去佈建一組，你會拿到兩組 D1／KV，其中一組永遠是空的。
+#
+# 要接上同步狀態面板，把下面兩段的註解拿掉，填入 setup.sh 建好之後印給你的 ID：
+#
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "你的 D1 資料庫名稱"
+# database_id = "你的 D1 資料庫 ID"
+#
+# [[kv_namespaces]]
+# binding = "CACHE_KV"
+# id = "你的 KV namespace ID"
+#
+# ⚠️ 要加繫結請改這個檔案，不要只在 Cloudflare 後台加。接上 Workers Builds 之後，
+# 這個檔案是唯一真實來源，只在後台加的繫結會被下一次建置**靜默清掉** ——
+# 跟上面 observability 那段講的是同一個機制。
+#
+# 註：維持註解狀態時，setup.sh --check 會來這個檔案裡找 database_id 與 KV id，
+# 找不到就報「檔案裡找不到這個鍵」。看到這兩則訊息是正常的，它們是提醒不是錯誤。
 
 # ── 必要的機密（用指令設定，不要寫在這裡）────────────────
-#   npx wrangler secret put DASH_TOKEN     # 進入儀表板的通行碼
 #   npx wrangler secret put CF_API_TOKEN   # 需要 Account Analytics: Read
 #
-# DASH_TOKEN 沒設定時，Worker 會回 503 並且拒絕提供任何內容。
-# 這是刻意的：這個頁面攤開的是完整的 DNS 查詢記錄，
-# 「忘記設定」的預設結果絕對不可以是「公開在網際網路上」。
+# 一鍵部署的設定頁會直接問你這個值（它讀的是 .dev.vars.example），存成 Worker secret。
+# 本機開發則是複製 .dev.vars.example 成 .dev.vars 再填 —— .dev.vars 已被 .gitignore
+# 忽略，不會進版控。
+#
+# 進入儀表板的權限完全由 Worker-level Cloudflare Access 控制，這支 Worker 沒有任何
+# 自帶的登入表單、通行碼或 cookie。

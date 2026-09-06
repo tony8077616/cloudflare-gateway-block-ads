@@ -3,7 +3,9 @@
 import { createServer } from "node:http";
 import worker from "../src/index.js";
 
-const TOKEN = "local-dev-token";
+// 本機模擬 Cloudflare Access：真的部署時 aud 由 wrangler.toml 的 ACCESS_AUD 決定，
+// 這裡隨便給一組固定值，讓 Worker 的 aud 比對能通過即可。
+const AUD = "local-dev-aud";
 
 // 造 24 個小時桶，量體有起伏，最後一桶刻意塞一個未歸類的判定代碼，
 // 用來確認「其他」的警告橫幅真的會出現。
@@ -59,7 +61,7 @@ globalThis.fetch = async (url, init) => {
 };
 
 const env = {
-  DASH_TOKEN: TOKEN,
+  ACCESS_AUD: AUD,
   CF_API_TOKEN: "mock",
   CF_ACCOUNT_ID: "mock-account",
   DB: {
@@ -77,11 +79,13 @@ const env = {
 
 createServer(async (req, res) => {
   const url = "http://127.0.0.1:8787" + req.url;
-  // 自動帶上憑證，省去每次手動登入
+  // 直接冒充「Access 已經驗過本應用」的 ctx，省去每次手動登入。
+  // 線上是由 Worker-level Cloudflare Access 在請求進到 Worker 之前產生這個東西。
+  const ctx = { access: { aud: AUD, email: "local-dev@example.com" } };
   const r = await worker.fetch(new Request(url, {
     method: req.method,
-    headers: { ...req.headers, Authorization: "Bearer " + TOKEN },
-  }), env);
+    headers: { ...req.headers },
+  }), env, ctx);
   res.writeHead(r.status, Object.fromEntries(r.headers));
   res.end(Buffer.from(await r.arrayBuffer()));
 }).listen(8787, "127.0.0.1", () => console.log("mock server on http://127.0.0.1:8787"));

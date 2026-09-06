@@ -6,8 +6,10 @@
  * 是兩回事：清單是意圖，這裡是結果。
  *
  * 安全性：這個頁面會攤開你的完整 DNS 查詢記錄 —— 你去過哪些網站、用哪些 App、
- * 什麼時間用。這是高度敏感的資料。因此 DASH_TOKEN 沒設定時，這個 Worker 會
- * 拒絕提供任何內容（fail closed），而不是預設公開。詳見 README。
+ * 什麼時間用。這是高度敏感的資料。進入權限一律由 Worker-level Cloudflare Access
+ * 把關；這支 Worker 只負責確認 Access 真的驗過這個請求，而且驗的是這支應用（比對
+ * aud）。ACCESS_AUD 沒設定時，這個 Worker 會拒絕提供任何內容（fail closed），
+ * 而不是預設公開。詳見 README。
  */
 
 import { PAGE } from "./page.js";
@@ -48,33 +50,25 @@ const RANGES = {
 };
 
 // ── 認證 ─────────────────────────────────────────────────
+//
+// 改用 Worker-level Cloudflare Access 之後，JWT 由執行環境在請求進到 Worker 之前就
+// 驗完了，ctx.access 拿到的是已經驗過的結果 —— 官方文件明載不需要自行驗證 JWT。
+// Access 沒有驗證這個請求時，ctx.access 會是 undefined。
 
-/** 定時比較，避免用字串相等洩漏前綴資訊 */
-function safeEqual(a, b) {
-  if (typeof a !== "string" || typeof b !== "string") return false;
-  const ab = new TextEncoder().encode(a);
-  const bb = new TextEncoder().encode(b);
-  if (ab.length !== bb.length) return false;
-  let diff = 0;
-  for (let i = 0; i < ab.length; i++) diff |= ab[i] ^ bb[i];
-  return diff === 0;
-}
-
-function readCookie(request, name) {
-  const raw = request.headers.get("Cookie") || "";
-  for (const part of raw.split(";")) {
-    const [k, ...v] = part.trim().split("=");
-    if (k === name) return decodeURIComponent(v.join("="));
-  }
-  return null;
-}
-
-function isAuthed(request, env) {
-  const token = env.DASH_TOKEN;
-  if (!token) return false; // 沒設定就是誰都進不來
-  const auth = request.headers.get("Authorization") || "";
-  if (auth.startsWith("Bearer ") && safeEqual(auth.slice(7), token)) return true;
-  return safeEqual(readCookie(request, "dash_token") || "", token);
+/**
+ * 比對 Access 應用的 aud。
+ *
+ * 原始 JWT 裡的 aud 是陣列，而 ctx.access.aud 的型別官方文件沒有明確保證，
+ * 所以字串與陣列兩種形式都要能處理。
+ *
+ * **一定要相等比對，不可以用 String(aud).includes(expected) 之類的子字串比對。**
+ * 同一個 team domain 底下所有 Access 應用共用簽章金鑰，aud 相等是區隔本應用與
+ * 其他應用的唯一依據；寬鬆比對等於把別支應用的通行證也一併放了進來。
+ */
+function audMatches(aud, expected) {
+  if (!expected) return false;
+  if (Array.isArray(aud)) return aud.includes(expected);
+  return aud === expected;
 }
 
 // ── Cloudflare GraphQL Analytics ─────────────────────────
@@ -276,62 +270,30 @@ function html(body, status = 200) {
   });
 }
 
-const LOGIN_PAGE = (msg) => `<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>需要驗證</title>
-<style>
-:root{color-scheme:light dark}
-body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0f1115;color:#e6e8eb;
-font:15px/1.6 ui-sans-serif,system-ui,"Noto Sans TC",sans-serif}
-form{background:#171a21;border:1px solid #262b36;border-radius:14px;padding:28px;width:min(380px,90vw)}
-h1{margin:0 0 6px;font-size:17px}p{margin:0 0 18px;color:#9aa4b2;font-size:13px}
-input{width:100%;box-sizing:border-box;padding:10px 12px;border-radius:8px;border:1px solid #333a47;
-background:#0f1115;color:#e6e8eb;font-size:14px}
-button{margin-top:12px;width:100%;padding:10px;border:0;border-radius:8px;background:#3b82f6;color:#fff;
-font-size:14px;font-weight:600;cursor:pointer}
-.err{color:#f87171;font-size:13px;margin-top:10px}
-</style></head><body>
-<form method="POST" action="/login">
-<h1>擋廣告觀測儀表板</h1>
-<p>這個頁面會顯示完整的 DNS 查詢記錄，需要通行碼。</p>
-<input type="password" name="token" placeholder="通行碼" autofocus autocomplete="current-password">
-<button type="submit">進入</button>
-${msg ? `<div class="err">${msg}</div>` : ""}
-</form></body></html>`;
-
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // 沒有設定通行碼就什麼都不給。
-    // 這是刻意的 fail-closed：這個頁面攤開的是使用者的完整 DNS 查詢記錄，
-    // 「忘記設定」的預設結果絕對不可以是「公開在網際網路上」。
-    if (!env.DASH_TOKEN) {
+    // 沒有設定 ACCESS_AUD 就什麼都不給。維持原本的 fail-closed 哲學：
+    // 這個頁面攤開完整 DNS 查詢記錄，設定漏掉的預設結果不可以是「公開」。
+    if (!env.ACCESS_AUD) {
       return html(
-        `<h1>尚未設定 DASH_TOKEN</h1><p>這個儀表板會顯示完整的 DNS 查詢記錄，在設定通行碼之前不會提供任何內容。</p>
-         <p>請執行 <code>npx wrangler secret put DASH_TOKEN</code> 之後重試。</p>`,
+        `<h1>尚未設定 ACCESS_AUD</h1><p>這個儀表板會顯示完整的 DNS 查詢記錄，在指定它所屬的 Cloudflare Access 應用之前不會提供任何內容。</p>
+         <p>請把 Access 應用的 Application Audience (AUD) Tag 填進 <code>wrangler.toml</code> 的 <code>[vars] ACCESS_AUD</code>，重新部署之後再試。</p>`,
         503,
       );
     }
 
-    if (url.pathname === "/login" && request.method === "POST") {
-      const form = await request.formData();
-      if (safeEqual(String(form.get("token") || ""), env.DASH_TOKEN)) {
-        return new Response(null, {
-          status: 302,
-          headers: {
-            Location: "/",
-            // Secure + HttpOnly + SameSite=Strict：不讓腳本讀到、不跟著跨站請求送出
-            "Set-Cookie": `dash_token=${encodeURIComponent(env.DASH_TOKEN)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=604800`,
-            ...SECURITY_HEADERS,
-          },
-        });
-      }
-      return html(LOGIN_PAGE("通行碼不正確"), 401);
-    }
-
-    if (!isAuthed(request, env)) {
-      if (url.pathname.startsWith("/api/")) return json({ error: "未通過驗證" }, 401);
-      return html(LOGIN_PAGE(""), 401);
+    // Cloudflare Access 沒有驗證這個請求，或驗證的是別的應用 → 拒絕。
+    // 這道關卡刻意放在所有路由之前、也刻意放在 try 之外：它涵蓋每一個路徑與方法
+    //（含 /api/*、404 分支、OPTIONS、HEAD），而且不留任何能繞過它的例外分支。
+    if (!ctx.access || !audMatches(ctx.access.aud, env.ACCESS_AUD)) {
+      if (url.pathname.startsWith("/api/")) return json({ error: "未通過驗證" }, 403);
+      return html(
+        `<h1>需要透過 Cloudflare Access 進入</h1><p>這個請求沒有經過 Cloudflare Access 驗證，或者驗證的是另一支 Access 應用。</p>
+         <p>請從 Access 應用涵蓋的網址進入，並用政策允許的帳號登入。</p>`,
+        403,
+      );
     }
 
     try {

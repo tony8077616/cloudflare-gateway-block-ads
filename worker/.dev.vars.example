@@ -1,0 +1,8 @@
+# 這個檔案是「範例」，會進版控。真正的值請寫在同目錄的 .dev.vars，該檔已被 .gitignore 忽略。
+#
+# 這裡只放「機密」。CF_ACCOUNT_ID 與 ACCESS_AUD 不是機密，它們寫在 wrangler.toml 的
+# [vars]，不要重複寫進這裡 —— 重複宣告會讓一鍵部署的表單把它們當成機密再問一次。
+#
+# CF_API_TOKEN：儀表板讀取 DNS 查詢記錄用。需要的權限只有 Account Analytics: Read，
+# 跟同步用的那顆 token 需求不同。建議另外開一顆唯讀的 —— 儀表板不需要任何寫入權限。
+CF_API_TOKEN="請填入你的 Cloudflare API Token"

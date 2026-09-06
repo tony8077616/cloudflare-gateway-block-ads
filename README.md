@@ -341,20 +341,58 @@ Cloudflare GraphQL Analytics 的 `gatewayResolverQueriesAdaptiveGroups`。
 ### 部署
 
 > ⚠️ **這個頁面會攤開你的完整 DNS 查詢記錄** —— 你去過哪些網站、用哪些 App、什麼時間。
-> 這等同於瀏覽歷史。所以 `DASH_TOKEN` 沒有設定時，Worker 會回 **503 並拒絕提供任何內容**。
+> 這等同於瀏覽歷史。所以 `ACCESS_AUD` 沒有設定時，Worker 會回 **503 並拒絕提供任何內容**。
 > 這是刻意的 fail-closed：「忘記設定」的預設結果不可以是「公開在網際網路上」。
 
-1. 編輯 `worker/wrangler.toml`，填入 `CF_ACCOUNT_ID`、D1 資料庫 ID、KV namespace ID。
-   D1 與 KV 兩段是選用的，拿掉只會讓同步狀態面板顯示「沒有繫結」。
+進入儀表板的權限由 **Worker-level Cloudflare Access** 控制。這支 Worker 沒有自己的
+登入表單、通行碼或 cookie —— 驗證在請求進到 Worker 之前就由 Access 完成了。
+
+兩種裝法，選一種。
+
+#### 裝法 A：一鍵部署
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/tony8077616/cloudflare-gateway-block-ads/tree/main/worker)
+
+> ⚠️ **這個按鈕只裝儀表板，不裝同步引擎。** 儀表板是觀測用的，真正在擋廣告的是
+> `sync.sh` 加 GitHub Actions（見[安裝](#安裝)）。只按這個按鈕不會擋掉任何一則廣告。
+
+按下去之後 Cloudflare 會把 `worker/` 複製成你自己 GitHub 帳戶底下的一個新 repo、
+建立 Worker、接上 Workers Builds，並在設定頁問你 `CF_ACCOUNT_ID` 與 `CF_API_TOKEN`。
+`ACCESS_AUD` 留空即可，原因見下面「設定 Access」。
+
+**按之前先知道你授權了什麼**，這幾點沒有人會在流程中特別提醒你：
+
+- **接上 Workers Builds 之後，任何能推到 production branch 的人，都能在你的
+  Cloudflare 帳戶上執行程式碼** —— 而那個執行環境持有你剛填進去的 `CF_API_TOKEN`。
+  這不是這個專案特有的性質，是所有 Git 連動部署的共同性質，但值得你在按下去之前想一遍：
+  這個 repo 是不是公開的、你會不會合併別人的 PR。
+- **授權 Cloudflare 的 GitHub App 是持續性的**，不是一次性的。之後要收回是另一個
+  獨立動作（GitHub → Settings → Applications）。
+- **你拿到的是當下的快照。** 這個上游 repo 之後修的任何東西（包含安全性修補）
+  都**不會**自動傳播到你的 repo，要自己 merge。
+
+#### 裝法 B：手動部署
+
+1. 編輯 `worker/wrangler.toml`，填入 `CF_ACCOUNT_ID`。
 
    > ⚠️ `name` 決定要部署成哪一支 Worker，`wrangler deploy` 會**直接覆寫同名的既有
    > Worker 且不會確認**。如果你的帳戶上已經有其他 Worker，先確認名字不會撞到。
 
-2. 設定兩個機密：
+   D1 與 KV 兩段預設是**註解掉的**。儀表板的主要功能（DNS 查詢記錄）走 GraphQL
+   Analytics，完全不經過 D1 與 KV，所以不接也是完整可用的，只是「同步狀態」面板會
+   顯示「沒有繫結」。要接上就把註解拿掉，填入 `setup.sh` 建好之後印給你的 ID。
+
+   > 維持註解狀態時，`setup.sh --check` 會來這個檔案裡找 `database_id` 與 KV `id`，
+   > 找不到就報「**找不到這個鍵**」。看到這兩則訊息是正常的，它們是提醒不是錯誤。
+
+   > ⚠️ 要加繫結請改這個檔案，**不要只在 Cloudflare 後台加**。接上 Workers Builds
+   > 之後這個檔案是唯一真實來源，只在後台加的繫結會被下一次建置靜默清掉。
+   > `observability` 也是同一個機制 —— 這一點是實測出來的，官方文件沒寫。
+
+2. 設定機密：
 
    ```bash
    cd worker
-   npx wrangler secret put DASH_TOKEN     # 自己決定一組夠長的通行碼
    npx wrangler secret put CF_API_TOKEN   # 需要 Account Analytics: Read
    ```
 
@@ -368,9 +406,35 @@ Cloudflare GraphQL Analytics 的 `gatewayResolverQueriesAdaptiveGroups`。
    npx wrangler deploy
    ```
 
-4. **強烈建議再加一層 Cloudflare Access。** 你已經有 Zero Trust 了，把這支 Worker 的
-   `workers.dev` 網址加進 Access 應用程式並限定你自己的 email，就不必只依賴一組通行碼。
-   內建的通行碼是「絕不預設公開」的底線，不是唯一防線。
+#### 設定 Access（兩種裝法都要做）
+
+部署完之後打開網址，你會看到 **503**。**這是正常的**，不是壞了。
+
+原因是先有雞先有蛋：Access 應用要先有一支已經部署好的 Worker 才能建立，所以你在
+第一次部署的當下不可能知道要填什麼。順序只能是這樣：
+
+1. 部署（此時一律 503）。
+2. 在 Zero Trust 後台建立一個 **Worker 型**的 Access 應用，選這支 Worker。
+
+   > ⚠️ 不是把 `workers.dev` 網址加進 self-hosted 應用。那是另一種應用型別，
+   > 它不會讓 `ctx.access` 出現在 Worker 裡，結果是你永遠停在 403 而且查不出原因。
+
+3. **把 policy 限定成你自己的身分**（你自己的 email，或你信任的那個群組）。
+
+   > ⚠️ 這一步不是「加強」，是**唯一**的身分控制。Worker 端只驗「這張通行證屬於
+   > 本應用」，**不驗「你是誰」** —— 它比對的是 Access 應用的 aud，那個值對同一支
+   > 應用的每個人都一樣。所以 policy 如果設成 `Everyone` 或 Bypass，任何人登入後
+   > 都會拿到正確的 aud，Worker 照樣放行，你的完整 DNS 查詢記錄就公開了。
+
+4. 複製該應用的 **Application Audience (AUD) Tag**，填進 `wrangler.toml` 的
+   `[vars] ACCESS_AUD`，然後**重新部署**一次。
+
+   AUD 不是機密：它會出現在每一個 Access 重導向 URL 的 query string 裡。它的作用是
+   「指名是哪一支應用」，用來區隔同一個 team domain 底下的其他 Access 應用。
+
+之後如果你刪掉重建 Access 應用，aud 會換一組，記得同步更新並重新部署，否則 Worker
+會把所有人擋在 403。同理，之後想綁自訂網域（在 `wrangler.toml` 加 `routes`）的話，
+新網址也必須被同一支 Access 應用涵蓋，否則一樣是永遠的 403。
 
 ### 本機開發
 
