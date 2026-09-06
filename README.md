@@ -163,27 +163,127 @@ flowchart TD
 
 ## 安裝
 
-### 需要準備
+要備齊四樣東西：一個啟用了 Zero Trust 的 Cloudflare 帳戶、一個 D1 資料庫、
+一個 KV namespace、一顆 API Token，然後把它們接到你自己 repo 的 GitHub Actions 上。
 
-1. 一個 Cloudflare 帳戶，並啟用 **Zero Trust**（Gateway）
-2. 一個 **D1 資料庫**（本專案用的是 APAC 區的 `dns-blocklist-apac`）
-3. 一個 **KV namespace**（本專案用的是 `adblock-category-cache`）
-4. 一個 **API Token**，權限如下：
+下面兩條路徑做的是**同一件事**，差別只在誰動手：
 
-   | 類型 | 權限 | 等級 |
-   |---|---|---|
-   | Account | Zero Trust | Edit |
-   | Account | D1 | Edit |
-   | Account | Intel | Read |
-   | Account | Workers KV Storage | Edit |
+| | 路徑 A：引導式 | 路徑 B：手動 |
+|---|---|---|
+| 建 D1 / KV | `./setup.sh --provision` 幫你建 | 你自己在 Cloudflare 後台點 |
+| 寫 GitHub secret | `./setup.sh --provision` 幫你寫 | 你自己在 repo 設定頁貼 |
+| 事前檢查 | 有：token 權限、憑證範圍、上游殘留值、來源可解析 | 無 |
+| 需要 | `bash`、`curl`、`gh`（已登入）、`python3` 或 `jq` | 一個瀏覽器 |
 
-> ⚠️ 這顆 Token 能改你的 Gateway 規則。請**單獨申請一顆**給這個專案用，不要跟其他用途共用。
-> 之後如果要補權限，**編輯既有 Token 不會換掉密鑰**，GitHub Secret 不用重設；
-> 只有按「Roll」才會換值。
+**建議走 A。** 不是因為比較快，是因為它會**在你花錢之前先檢查**：token 權限夠不夠、
+是不是誤用了 Global API Key、範圍有沒有開太大、有沒有把上游的預設值留在設定裡。
+路徑 B 沒有任何一道這種閘門，錯了要等到第一次同步失敗才知道，而那時候要回頭查
+「是哪一步做錯」比現在難得多。
 
-### 設定
+`gh` 沒裝、不想裝、或這台機器不方便登入 GitHub，就走 B。B 同時也是「這個專案到底需要
+哪些資源」的規格說明——只想讀懂架構、不打算真的裝的人，看 B 就夠了。
 
-Fork 這個 repo，然後到 **Settings → Secrets and variables → Actions** 新增：
+### 開始之前（兩條路徑都一樣）
+
+1. **先建立你自己的 repo。** 按 **Use this template**（或 fork）。
+   這不只是禮貌問題：`setup.sh --provision` 偵測到 `origin` 還指著上游會**直接拒絕執行**，
+   因為那些 secret 會被寫到別人的 repo 上（或直接失敗）。
+
+2. **一個 Cloudflare 帳戶，並啟用 Zero Trust（Gateway）。**
+
+3. **一顆 API Token。** 全部選 **Account** 範圍，而且**只挑你自己那一個帳戶**，
+   不要選 All accounts：
+
+   | 類型 | 權限 | 等級 | 用途 |
+   |---|---|---|---|
+   | Account | Zero Trust | Edit | 建立／更新 Gateway 清單與 Policy |
+   | Account | D1 | Edit | 讀寫網域資料表 |
+   | Account | Workers KV Storage | Edit | 分類快取快照 |
+   | Account | Intel | Read | 查詢網域的原生分類 |
+
+   這四項就是全部，不要多給。`./setup.sh` 的步驟 5 會逐項唯讀探測它們。
+
+   > ⚠️ 這顆 Token 能改你的 Gateway 規則。請**單獨申請一顆**給這個專案用，
+   > 不要跟其他用途共用。
+   >
+   > 不要用 **Global API Key**。它等於你整個帳戶的萬能鑰匙，而且沒有辦法限制範圍。
+   > `setup.sh` 認得出 Global API Key 的形狀並會拒絕接受。
+   >
+   > 之後要補權限的話，**編輯既有 Token 不會換掉密鑰**，GitHub Secret 不用重設；
+   > 只有按「Roll」才會換值。
+
+   申請路徑與逐項說明：`./setup.sh --help`。
+
+### 路徑 A：引導式（`setup.sh`）
+
+這支腳本有兩種模式，語意刻意分得很開。
+
+#### A-1. 先跑唯讀檢查
+
+```bash
+./setup.sh
+```
+
+**這個模式只發 GET 請求，對你的 Cloudflare 帳戶與 GitHub repo 零變更。** 它會做六件事：
+工具檢查、認出你的目標 repo 並確認它不是上游、六處上游預設值健檢、收 API Token、
+Token 唯讀探測（有效嗎？範圍是不是開太大？看得到幾個帳戶？）、真的抓一個訂閱來源
+解析並印出筆數。
+
+關於 Token，這支腳本的作法是硬約束而不是建議：
+
+- **沒有任何接受 token 的命令列旗標。** 要用的時候會用不回顯的方式請你貼上
+  （`read -rs`），所以它不會進 shell history，也不會出現在 `ps` 的輸出裡。
+- **絕不寫進任何檔案。** 它產生的 `.setup.local` 只存非機密 ID（帳戶 ID、D1 ID、
+  KV namespace ID）——這些本來就會出現在每一個 API 路徑裡。
+- 每一次 Cloudflare 呼叫的 `Authorization` 都經 stdin 餵進 curl，不會出現在 argv。
+
+> 想從密碼管理器取值的話，請先在互動的 shell 裡 `export` 好再執行本腳本。
+> 注意「在指令列同一行前面臨時指定變數」那種寫法，會連同 token 一起寫進 shell history。
+
+檢查全綠再往下。有紅的先修——這一步的成本是零。
+
+#### A-2. 建立資源並寫入設定
+
+```bash
+./setup.sh --provision
+```
+
+> ⚠️ **這個模式會產生後果，而且有些不可逆。** 它會建立**會計費**的 Cloudflare 資源
+> （D1 與 KV 都有免費額度，超過之後照價目表收費），並且覆寫 GitHub secret ——
+> **secret 一旦被覆寫，舊值永遠取不回來。**
+
+它會先把上面那套檢查完整跑一遍，**全部通過**而且**你逐項打字確認**之後，才會做任何寫入。
+中途任何一步失敗就立刻停下，並印出「已經完成到哪、還有什麼沒做、怎麼回頭」——
+不會留給你一份建了一半的設定。
+
+跑完之後它會列出**本次建立的每一項資源，以及逐項的人工撤銷指令**。
+這支腳本不會、也不應該替你刪任何東西；要撤銷請照它印的指令自己執行。
+
+沒裝 `gh`（或 `gh` 沒登入）也還是可以跑：寫 GitHub 的那一段會降級成「印出你要手動去貼
+的內容」，其餘步驟照常完成。
+
+> `setup.sh` 偵測到 CI 環境（`CI` 或 `GITHUB_ACTIONS`）會**直接拒絕執行**，
+> 不會降級成非互動模式。它每一個有後果的步驟都要人在終端機前面確認，而 token 的取得
+> 方式是互動輸入——在 CI 上跑就得改成從環境變數讀，等於把上面那套憑證處理整個拆掉。
+> 要在 CI 上跑的是 `.github/workflows/sync.yml`，不是這支腳本。
+
+### 路徑 B：手動
+
+#### B-1. 建立資源
+
+在 Cloudflare 後台各建一個：
+
+- 一個 **D1 資料庫**（本專案用的是 APAC 區的 `dns-blocklist-apac`）
+- 一個 **KV namespace**（本專案用的是 `adblock-category-cache`）
+
+七張資料表由 `sync.sh` 的 `ensure_schema()` 在第一次執行時自動建立（全部是
+`CREATE TABLE IF NOT EXISTS`，對既有資料庫是無操作），不需要手動下 SQL。
+
+#### B-2. 寫進 GitHub
+
+到你 repo 的 **Settings → Secrets and variables → Actions**。
+
+**Secrets** 分頁：
 
 | Secret | 值 |
 |---|---|
@@ -191,28 +291,30 @@ Fork 這個 repo，然後到 **Settings → Secrets and variables → Actions** 
 | `CF_API_TOKEN_ADBLOCK` | 上一步申請的 Token |
 | `CF_D1_DATABASE_ID` | 你的 D1 資料庫 ID |
 
-> ⚠️ **Fork 之後一定要換掉 `KV_NAMESPACE_ID`。**
-> `sync.sh` 與 `manage.sh` 的設定區各有一份預設值，都是本 repo 自己的 namespace。
-> 沿用它配上你自己的 Token，每次讀都會 404、每次寫都會失敗，然後**靜靜地退回讀 D1
-> 全表掃描** —— 封鎖結果仍然正確，但每次同步要多讀 46 萬列，下面那張配額表的
-> 「≤ 約 136 列」對你就不成立。建立自己的 namespace 之後把**兩支腳本都改掉**，
-> 或設同名環境變數（環境變數會同時涵蓋兩支）。
+**Variables** 分頁（注意不是 Secrets）：
 
-KV namespace ID 不是機密。把 `KV_NAMESPACE_ID` **設成空字串**就會整個停用 KV 快取、
-退回讀 D1，功能不受影響。注意是設成空字串，不是不設定 —— 兩支腳本用的都是
-`${KV_NAMESPACE_ID-預設值}`（沒有冒號），所以「未設定」會套用預設值，
-只有「設成空字串」才是停用。
+| Variable | 值 |
+|---|---|
+| `KV_NAMESPACE_ID` | 你的 KV namespace ID |
 
-D1 的七張資料表由 `sync.sh` 的 `ensure_schema()` 在第一次執行時自動建立
-（全部是 `CREATE TABLE IF NOT EXISTS`，對既有資料庫是無操作），不需要手動下 SQL。
+KV namespace ID **不是機密**——它會出現在每一個 Cloudflare API 路徑裡，設成 secret
+只會讓日誌變成一堆 `***` 而難以排查，所以它放 Variables 而不是 Secrets。
 
-### 第一次執行
+**不設定 `KV_NAMESPACE_ID` 也可以。** `sync.sh` 與 `manage.sh` 的預設值都是**空字串**，
+也就是「不使用 KV 快取」：封鎖結果完全一樣，只是每次同步要多掃約 46 萬列 D1，
+上面配額表的「≤ 約 136 列」對你就不成立。想省那些讀取量再回來設。
+
+### 第一次執行（兩條路徑都要做）
 
 到 Actions 頁面手動觸發一次（**Run workflow**），勾選 **force** 略過 checksum 閘門。
 第一次會因為 KV 上還沒有快照而退回讀 D1，並在結束前把快照建起來 —— 這是預期行為。
 
 執行完看 Job Summary 的統計數字是否合理：合併總數、扣除白名單與原生分類後的數量、
 最終上傳數量、清單進度。確認沒問題之後就可以放著讓它照排程跑。
+
+> 到這一步之前，所有的綠燈都只代表「讀得到」。Token 的 **Edit（寫入）權限**要到第一次
+> 真正同步才會被證明 —— `setup.sh` 刻意不用「建一個測試清單再刪掉」去驗證寫入權限，
+> 因為那本身就是一次帳戶變更，跟 `--check` 的唯讀承諾直接衝突。
 
 ## 日常操作
 
@@ -370,6 +472,10 @@ Cloudflare GraphQL Analytics 的 `gatewayResolverQueriesAdaptiveGroups`。
   獨立動作（GitHub → Settings → Applications）。
 - **你拿到的是當下的快照。** 這個上游 repo 之後修的任何東西（包含安全性修補）
   都**不會**自動傳播到你的 repo，要自己 merge。
+- **按鈕帶入的永遠是這個上游 repo 的 `main`，不是你的 fork。** 就算你已經 fork 並改過
+  `worker/` 底下的東西，按這顆按鈕拿到的還是上游那份。要部署自己的修改，把上面那個
+  網址裡的 `tony8077616/cloudflare-gateway-block-ads` 換成你自己的
+  `帳號/repo` 再開啟。
 
 #### 裝法 B：手動部署
 
@@ -508,6 +614,18 @@ worker/                      即時觀測儀表板（Cloudflare Worker，選用�
 
 `bash`、`curl`、`jq`、`gzip`、`coreutils`（`sort` / `comm` / `awk` / `sed` 等）。
 `ubuntu-24.04` runner 全部內建，不需要額外安裝步驟，也不需要 Python。
+
+### 依賴的 GitHub Action 已釘住 commit SHA
+
+`.github/workflows/sync.yml` 用的 `actions/checkout` **釘的是 commit SHA 而不是 `@v7`**。
+`@v7` 是可變標籤，上游隨時可以把它移到別的 commit；而那個 job 的環境裡有一顆能改你
+Gateway 規則的 token，所以「上游換掉標籤指向」對這個 repo 來說是一條實際的供應鏈路徑。
+
+代價是**升級要自己來**：釘住之後不會自動收到上游的修補（包含安全性修補）。
+這是刻意接受的殘餘風險，責任在 repo 擁有者身上。作法是去看
+[`actions/checkout` 的 releases](https://github.com/actions/checkout/releases)，
+把 workflow 裡的 SHA 與後面那個版本註解**一起**換掉——只換註解不換 SHA 等於沒升級，
+只換 SHA 不換註解則會讓下一個人看不出現在釘的是哪一版。
 
 ### 設計參考
 

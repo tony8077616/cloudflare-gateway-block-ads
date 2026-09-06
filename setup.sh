@@ -141,6 +141,23 @@ mask_token() {
   fi
 }
 
+trim() {
+  # 修剪頭尾空白。
+  #
+  # 刻意不用 `echo "$x" | xargs`：xargs 會把引號當成語法。遇到未配對的引號它會失敗
+  # （在 set -e 的腳本裡整支中止，在沒有 -e 的腳本裡回傳空字串而被當成空行略過），
+  # 遇到配對的引號會把引號吃掉，還會壓縮字串內部的連續空白、處理反斜線跳脫。
+  # 這些都不是「修剪頭尾空白」該做的事。
+  #
+  # 也刻意不用 [[:space:]]：字元類別的判定跟 locale 綁在一起，而本專案出貨的
+  # sources.conf 就有中文來源名。這裡直接列舉實際會遇到的空白位元組。
+  # CR 是必要的 —— 在 Windows 上 checkout 的工作樹，設定檔是 CRLF 結尾。
+  local s="$1"
+  while [[ "$s" == [$' \t\r\n']* ]]; do s="${s#?}"; done
+  while [[ "$s" == *[$' \t\r\n'] ]]; do s="${s%?}"; done
+  printf '%s' "$s"
+}
+
 confirm() {
   # $1 = 提示文字。必須輸入完整的 yes 才算數（y 不算）——
   # 這些確認後面接的是會計費／不可復原的動作，不該是一個鍵就過。
@@ -380,10 +397,13 @@ usage() {
 要申請什麼樣的 token：
   Cloudflare Dashboard → My Profile → API Tokens → Create Token → Custom token
   權限（全部選 Account 範圍，**只挑你自己那一個帳戶**，不要選 All accounts）：
-    Account │ Zero Trust                    │ Edit
-    Account │ Account Firewall Access Rules │ Read      （Intel 網域分類查詢要用）
-    Account │ D1                            │ Edit
-    Account │ Workers KV Storage            │ Edit
+    Account │ Zero Trust          │ Edit
+    Account │ D1                  │ Edit
+    Account │ Workers KV Storage  │ Edit
+    Account │ Intel               │ Read      （網域的原生分類查詢要用）
+  這四項就是全部，不要多給。--check 的步驟 5 會逐項唯讀探測它們，其中
+  「Intel 網域分類查詢」那一項驗的就是上面最後一列 —— 那一項亮紅燈，
+  通常代表 Intel 這個權限沒勾到，而不是 token 整個無效。
   不要用 Global API Key。它等於你整個帳戶的萬能鑰匙，而且沒有辦法限制範圍。
 USAGE
 }
@@ -799,9 +819,9 @@ check_one_source() {
     return 0
   fi
   IFS='|' read -r name url format <<< "$line"
-  name="$(printf '%s' "$name" | xargs)"
-  url="$(printf '%s' "$url" | xargs)"
-  format="$(printf '%s' "$format" | xargs)"
+  name="$(trim "$name")"
+  url="$(trim "$url")"
+  format="$(trim "$format")"
   info "取 sources.conf 的第一個來源：$name（$format）"
   info "$url"
 

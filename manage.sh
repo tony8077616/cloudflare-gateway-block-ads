@@ -49,6 +49,23 @@ KV_CACHE_KEY="category-cache-v1"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+trim() {
+  # 修剪頭尾空白。
+  #
+  # 刻意不用 `echo "$x" | xargs`：xargs 會把引號當成語法。遇到未配對的引號它會失敗
+  # （在 set -e 的腳本裡整支中止，在沒有 -e 的腳本裡回傳空字串而被當成空行略過），
+  # 遇到配對的引號會把引號吃掉，還會壓縮字串內部的連續空白、處理反斜線跳脫。
+  # 這些都不是「修剪頭尾空白」該做的事。
+  #
+  # 也刻意不用 [[:space:]]：字元類別的判定跟 locale 綁在一起，而本專案出貨的
+  # sources.conf 就有中文來源名。這裡直接列舉實際會遇到的空白位元組。
+  # CR 是必要的 —— 在 Windows 上 checkout 的工作樹，設定檔是 CRLF 結尾。
+  local s="$1"
+  while [[ "$s" == [$' \t\r\n']* ]]; do s="${s#?}"; done
+  while [[ "$s" == *[$' \t\r\n'] ]]; do s="${s%?}"; done
+  printf '%s' "$s"
+}
+
 d1_query() {
   local sql="$1" params="${2:-[]}"
   local body
@@ -68,9 +85,17 @@ table_for() {
 
 cmd_add() {
   local table_key="$1" domain="$2" reason="${3:-}"
-  domain=$(echo "$domain" | xargs | tr 'A-Z' 'a-z')
+  domain="$(trim "$domain")"
+  domain="$(printf '%s' "$domain" | tr 'A-Z' 'a-z')"
 
-  if ! echo "$domain" | grep -qE "$DOMAIN_REGEX"; then
+  # 用 bash 的 =~ 而不是 `echo "$domain" | grep -qE`：grep 是**行導向**的，
+  # 只要任何一行匹配就算通過，所以 ^…$ 錨點對含換行的值形同虛設。
+  # （以前靠 xargs 把換行併成空格而僥倖擋住，換成只修剪頭尾的 trim 之後就擋不住了。
+  # 一個 $'example.com\n*.com' 進得了白名單表，sync.sh 讀回來會建立 com 後綴白名單，
+  # 結果是所有 .com 網域靜默停止上傳。）
+  # bash 的 =~ 不啟用 REG_NEWLINE，$ 錨的是字串結尾而不是行尾。
+  # $DOMAIN_REGEX 右邊**不可以加引號**，加了會被當成字面字串。
+  if [[ ! "$domain" =~ $DOMAIN_REGEX ]]; then
     echo "❌ '$domain' 看起來不是合法的網域格式，沒有寫入。請確認拼字（例如是否誤帶了 http:// 或路徑）"
     return
   fi
@@ -92,7 +117,11 @@ cmd_add() {
 
 cmd_remove() {
   local table_key="$1" domain="$2"
-  domain=$(echo "$domain" | xargs | tr 'A-Z' 'a-z')
+  domain="$(trim "$domain")"
+  domain="$(printf '%s' "$domain" | tr 'A-Z' 'a-z')"
+  # 這裡刻意**不做**格式驗證（add 與 find 都有做）。刪除路徑要留得住「把已經寫進去的
+  # 不合格資料清掉」這個能力 —— 在刪除端套上跟寫入端一樣的閘門，等於讓最需要被清掉的
+  # 那些列永遠清不掉。刪除本身是參數化的（下面 jq -n --arg 綁定），沒有注入風險。
   local table
   table=$(table_for "$table_key")
   local resp
@@ -263,9 +292,11 @@ _find_scan_gateway_lists() {
 
 cmd_find() {
   local domain="$1"
-  domain=$(echo "$domain" | xargs | tr 'A-Z' 'a-z')
+  domain="$(trim "$domain")"
+  domain="$(printf '%s' "$domain" | tr 'A-Z' 'a-z')"
 
-  if ! echo "$domain" | grep -qE "$DOMAIN_REGEX"; then
+  # 同 cmd_add：用 bash 的 =~ 而不是行導向的 grep，理由見 cmd_add 的註解。
+  if [[ ! "$domain" =~ $DOMAIN_REGEX ]]; then
     echo "❌ '$domain' 看起來不是合法的網域格式（注意不要帶 http:// 或路徑）"
     return 1
   fi

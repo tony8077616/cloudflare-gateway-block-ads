@@ -384,6 +384,23 @@ header_value() {
   grep -i "^$2:" "$1" 2>/dev/null | tail -1 | sed -E "s/^[^:]+:[[:space:]]*//" | tr -d '\r'
 }
 
+trim() {
+  # 修剪頭尾空白。
+  #
+  # 刻意不用 `echo "$x" | xargs`：xargs 會把引號當成語法。遇到未配對的引號它會失敗
+  # （在 set -e 的腳本裡整支中止，在沒有 -e 的腳本裡回傳空字串而被當成空行略過），
+  # 遇到配對的引號會把引號吃掉，還會壓縮字串內部的連續空白、處理反斜線跳脫。
+  # 這些都不是「修剪頭尾空白」該做的事。
+  #
+  # 也刻意不用 [[:space:]]：字元類別的判定跟 locale 綁在一起，而本專案出貨的
+  # sources.conf 就有中文來源名。這裡直接列舉實際會遇到的空白位元組。
+  # CR 是必要的 —— 在 Windows 上 checkout 的工作樹，設定檔是 CRLF 結尾。
+  local s="$1"
+  while [[ "$s" == [$' \t\r\n']* ]]; do s="${s#?}"; done
+  while [[ "$s" == *[$' \t\r\n'] ]]; do s="${s%?}"; done
+  printf '%s' "$s"
+}
+
 # ── sources.conf 的輸入驗證 ───────────────────────────────
 #
 # sources.conf 是「使用者自己會編輯」的檔案，而它的兩個欄位最後都會流進危險的位置：
@@ -399,7 +416,7 @@ header_value() {
 # 中文來源名（台灣165反詐騙提供、台灣廣告過濾），ASCII 白名單會把它們一起擋掉。
 # 只擋真正會造成路徑/旗標問題的字元，非 ASCII 維持可用。
 #
-# 驗證的呼叫時點在 fetch_and_merge_sources 的 xargs 修剪「之後」——
+# 驗證的呼叫時點在 fetch_and_merge_sources 的 trim 修剪「之後」——
 # sources.conf 允許 `  name | url | format ` 這種帶空白的寫法，在修剪前驗證會把
 # 合法的行判成前導空白/前導 - 而誤拒。
 INVALID_SOURCE_REASON=""
@@ -555,16 +572,16 @@ fetch_and_merge_sources() {
     lineno=$((lineno + 1))
     # 跳過空行與註解
     [[ -z "$name" || "$name" =~ ^[[:space:]]*# ]] && continue
-    name="$(echo "$name" | xargs)"
-    url="$(echo "$url" | xargs)"
-    format="$(echo "$format" | xargs)"
+    name="$(trim "$name")"
+    url="$(trim "$url")"
+    format="$(trim "$format")"
 
     # 修剪過後再判一次空行／註解。上面那次判斷是在修剪之前做的，遇到 CRLF 結尾的
     # 設定檔（例如在 Windows 上 checkout 的工作樹）空行會是 "\r" 而不是空字串，
     # 逃過第一次判斷之後被修剪成空字串，接著就會被下面的驗證誤報成「name 欄是空的」。
     [[ -z "$name" || "$name" == \#* ]] && continue
 
-    # ── 輸入驗證（一定要在上面三行 xargs 修剪之後）─────────
+    # ── 輸入驗證（一定要在上面三行 trim 修剪之後）─────────
     # 被拒的來源要講清楚是「第幾行、哪一欄、為什麼」，不可以靜默略過 ——
     # 靜默略過的話，使用者只會看到清單莫名其妙少了一批網域。
     if ! validate_source_name "$name"; then

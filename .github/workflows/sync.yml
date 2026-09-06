@@ -31,7 +31,17 @@ jobs:
     runs-on: ubuntu-24.04    # 固定版本，避免 ubuntu-latest 未來悄悄升級造成環境突變
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7   # 原生支援 Node 24，不再出現棄用警告
+      # 釘成 commit SHA 而不是 @v7。v7 是**可變標籤**，上游隨時可以把它移到別的 commit，
+      # 而這個 job 的 env 裡有 CF_API_TOKEN_ADBLOCK（Zero Trust / D1 / KV 都是 Edit），
+      # 也就是「上游改標籤 → 我的 runner 跑新程式碼 → 那顆 token 就在同一個環境裡」。
+      # 釘住之後，上游要換掉這裡執行的程式碼就必須先經過這個 repo 一次明確的 commit。
+      # 升級方式：查 actions/checkout 的新 release，把 SHA 與後面的版本註解一起換掉。
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          # 預設是 true，會把 GITHUB_TOKEN 寫進 .git/config 的 http.extraheader，
+          # 然後留在磁碟上陪著 sync.sh 跑完整趟。這個 workflow 從不推送任何東西，
+          # 關掉零成本。
+          persist-credentials: false
 
       # 不需要額外安裝步驟：curl、jq（1.7.1+）、coreutils 都已內建在 ubuntu-24.04 runner image 上
 
