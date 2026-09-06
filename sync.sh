@@ -1544,20 +1544,38 @@ main() {
   #   example.com    → 精確比對，只放行這一筆（子網域仍照擋，例如 ads.youtube.com）
   #   *.example.com  → 後綴比對，放行其所有子網域（給會輪替的 CDN 主機名用，例如
   #                    r2.sn-xxxx.googlevideo.com 這類無法逐筆列舉的影片節點）
-  awk 'NR==FNR {
-         if (substr($0, 1, 2) == "*.") { suffix_wl[substr($0, 3)] = 1 }
-         else if (length($0)) { exact_wl[$0] = 1 }
-         next
-       }
-       {
-         if ($0 in exact_wl) next
-         rest = $0
-         while ((dot = index(rest, ".")) > 0) {
-           rest = substr(rest, dot + 1)
-           if (rest in suffix_wl) next
+  # 空白名單必須先擋掉，不能直接餵給下面那段 awk。
+  # NR==FNR 這個兩檔慣用法在**第一個檔案是空的**時候會失效：空檔案貢獻 0 筆記錄，
+  # 於是輪到 $merged_file 第一行時 NR 與 FNR 都是 1，條件成立，整份合併清單會被
+  # 當成白名單條目吃光、輸出 0 筆，接著在「最終清單是空的」那道守衛中止整趟同步。
+  #
+  # 這不是邊緣情況：custom_whitelist 沒有任何預設資料（本檔只 CREATE TABLE，唯一的
+  # 寫入端是 manage.sh whitelist add），所以**全新安裝的第一次同步**白名單就是空的。
+  # load_whitelist 在 D1 讀取失敗而降級時同樣輸出空，兩條路徑都會走到這裡。
+  #
+  # 用 -s 而不是把 NR==FNR 換成 FILENAME == ARGV[1]：後者依賴 awk 實作在跳過空檔案時
+  # 對 FILENAME 的處理（runner 上是 mawk，使用者本機可能是 gawk），-s 與實作無關。
+  # 本檔另外兩處相同慣用法（沿用前次 checksum、decide_should_sync）用的也是 -s。
+  # 附帶一提：這段在改成 awk 以支援 *.suffix 之前是 comm -23，
+  # 而 comm 對空的第二個檔案本來就會正確輸出 file1 的全部。
+  if [[ -s "$whitelist_file" ]]; then
+    awk 'NR==FNR {
+           if (substr($0, 1, 2) == "*.") { suffix_wl[substr($0, 3)] = 1 }
+           else if (length($0)) { exact_wl[$0] = 1 }
+           next
          }
-         print
-       }' "$whitelist_file" "$merged_file" > "$after_whitelist_file"
+         {
+           if ($0 in exact_wl) next
+           rest = $0
+           while ((dot = index(rest, ".")) > 0) {
+             rest = substr(rest, dot + 1)
+             if (rest in suffix_wl) next
+           }
+           print
+         }' "$whitelist_file" "$merged_file" > "$after_whitelist_file"
+  else
+    cp "$merged_file" "$after_whitelist_file"
+  fi
   local whitelisted_count
   whitelisted_count=$(( total_merged - $(wc -l < "$after_whitelist_file" | xargs) ))
   log "扣除白名單 $whitelisted_count 筆"
@@ -1607,7 +1625,16 @@ main() {
   log "最終總計：$total_uploaded 筆"
 
   if [[ $total_uploaded -eq 0 ]]; then
-    echo "❌ 最終清單是空的，可能所有來源都抓取失敗，中止本次上傳避免清空 Gateway 清單" >&2
+    # 這裡刻意不猜原因。以前這句寫的是「可能所有來源都抓取失敗」，但清單被扣到 0
+    # 的階段有三個（白名單、原生分類、來源本身），猜錯會把人帶去查完全無關的地方 ——
+    # 實際發生過一次：15 個來源全部抓取成功，是白名單那段把 278,678 筆扣光的，
+    # 而日誌卻叫人去查來源。改成把每個階段的數字攤開，讓看的人自己看出是哪一段。
+    local n_failed_sources
+    n_failed_sources=$(wc -l < "$TMP_DIR/failed_sources.txt" | xargs)
+    echo "❌ 最終清單是空的，中止本次上傳避免清空 Gateway 清單" >&2
+    echo "   各階段：合併 $total_merged 筆 → 白名單扣除 $whitelisted_count → 原生分類扣除 $excluded_by_native → 最終 0" >&2
+    echo "   來源抓取失敗 $n_failed_sources 個" >&2
+    echo "   從「哪一個階段把數字扣到 0」查起。來源失敗數是 0 時，問題就不在來源。" >&2
     record_sync_history "failed" "final list empty, aborted" "$total_merged" "0" "$excluded_by_native" "$whitelisted_count"
     exit 1
   fi
