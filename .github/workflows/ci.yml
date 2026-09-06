@@ -1,0 +1,57 @@
+name: CI
+
+# 這個 repo 有 76 項檢查（Worker 邏輯 58、頁面 12、白名單扣除 6），但在這支 workflow
+# 之前，全部只有「人記得手動跑」才會跑。
+#
+# PR #6 修掉的那個回歸 —— 空的白名單會把整份清單扣光、讓全新安裝的第一次同步必定
+# 失敗 —— 正是因為當初的白名單比對測試沒有進 repo、也沒有自動執行，才能無聲出貨。
+# 補了回歸測試卻不接上自動執行，等於把同一個坑再挖一次。
+#
+# 這裡不需要任何 secret：三組測試都在本機跑完，不連 Cloudflare、不連網路。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# push 到 main 與 PR 各觸發一次就好。同一個 ref 上有新的 push 時，
+# 取消還在跑的那次 —— 反正結果會被新的取代。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# 最小權限：只需要讀取程式碼，不寫入任何 GitHub 資源
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04    # 固定版本，理由同 sync.yml：避免 ubuntu-latest 悄悄升級
+    timeout-minutes: 10
+    steps:
+      # SHA 與 sync.yml 釘的是同一顆（v7.0.1）。這支 workflow 的環境裡沒有任何憑證，
+      # 所以供應鏈風險遠低於 sync.yml，但版本保持一致比較好一起升級。
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          persist-credentials: false
+
+      # 逐檔呼叫，不要寫成 `bash -n sync.sh manage.sh setup.sh`。
+      # bash 只接受一個腳本檔，後面兩個會變成該腳本的 $1/$2 —— 那兩支完全沒有被
+      # 解析，指令卻回傳 0。那是個假綠燈，比沒有檢查更糟。
+      - name: shell 語法檢查
+        run: |
+          # 明寫 set -e，不要依賴 Actions 對 run: 的預設 shell 旗標。
+          set -e
+          for f in sync.sh manage.sh setup.sh; do
+            echo "檢查 $f"
+            bash -n "$f"
+          done
+
+      # 這一項就是 PR #6 那個回歸的守門員。
+      - name: 白名單扣除的回歸測試
+        run: bash test/whitelist-empty.test.sh
+
+      - name: Worker 邏輯測試
+        run: node worker/test/worker.test.mjs
+
+      - name: 頁面腳本檢查
+        run: node worker/test/page.check.mjs
