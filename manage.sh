@@ -23,6 +23,10 @@ set -uo pipefail
 : "${D1_DATABASE_ID:?請先 export D1_DATABASE_ID}"
 
 CF_API="https://api.cloudflare.com/client/v4"
+# 等待上限。理由與選值依據見 sync.sh 的同名設定（用停滯而不是總時間當判準，
+# 因為總時間上限會誤殺合法的大回應）。這支腳本沒有大回應的路徑，所以不需要 BULK 那一組。
+CF_CONNECT_TIMEOUT=15
+CF_STALL_TIMEOUT=60
 DOMAIN_REGEX='^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$'
 
 # find 子指令用得到的設定（跟 sync.sh 保持一致）
@@ -118,7 +122,7 @@ d1_query() {
   local sql="$1" params="${2:-[]}"
   local body
   body=$(jq -n --arg sql "$sql" --argjson params "$params" '{sql: $sql, params: $params}')
-  cf_config_stdin | curl -sS -X POST "$CF_API/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
+  cf_config_stdin | curl -sS --connect-timeout "$CF_CONNECT_TIMEOUT" --speed-limit 1 --speed-time "$CF_STALL_TIMEOUT" -X POST "$CF_API/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
     -H "Content-Type: application/json" \
     --config - \
     --data "$body"
@@ -207,7 +211,7 @@ cmd_list() {
 }
 
 cf_get() {
-  cf_config_stdin | curl -sS --config - "$CF_API$1"
+  cf_config_stdin | curl -sS --connect-timeout "$CF_CONNECT_TIMEOUT" --speed-limit 1 --speed-time "$CF_STALL_TIMEOUT" --config - "$CF_API$1"
 }
 
 _domain_and_parents() {
@@ -273,7 +277,7 @@ _kv_fetch_cache() {
   # .../namespaces//values/... 這種畸形 URL，照樣送出一次注定失敗的往返。
   [[ -n "$KV_NAMESPACE_ID" ]] || return 1
 
-  code=$(cf_config_stdin | curl -sS -o "$gz" -w '%{http_code}' \
+  code=$(cf_config_stdin | curl -sS --connect-timeout "$CF_CONNECT_TIMEOUT" --speed-limit 1 --speed-time "$CF_STALL_TIMEOUT" -o "$gz" -w '%{http_code}' \
     --config - \
     "$CF_API/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$KV_NAMESPACE_ID/values/$KV_CACHE_KEY" \
     2>/dev/null || echo 000)
