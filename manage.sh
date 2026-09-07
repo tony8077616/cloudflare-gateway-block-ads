@@ -77,12 +77,50 @@ sanitize_for_log() {
   printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177' | LC_ALL=C cut -b1-120
 }
 
+# ── Cloudflare API 的憑證處理 ─────────────────────────────
+#
+# 跟 setup.sh 與 sync.sh 同一套：Authorization 經 `curl --config -` 由 stdin 餵進去，
+# 不放進 argv。printf 是內建指令、不產生新行程，所以 token 沒有進過任何 argv。
+#
+# 這支腳本是三支裡最需要這個的：它跑在使用者自己的工作機上。共用主機上其他帳號的
+# ps aux 撈得到命令列，而企業管控的機器會把完整命令列送進 EDR/SIEM 保存數個月。
+#
+# 這裡**刻意不加 sync.sh 用的 -q**。-q 會讓 curl 不讀 ~/.curlrc，在 CI 上是零成本的
+# 強化；但在使用者自己的機器上，企業環境的人可能正是靠 ~/.curlrc 裡的 proxy = 才連得
+# 出去，加了會當場讓他們連不上。
+cf_config_stdin() {
+  # 這個函式的輸出只會接到 curl 的 stdin，絕不落地成檔案。
+  printf 'header = "Authorization: Bearer %s"\n' "$CF_API_TOKEN"
+}
+
+validate_api_token() {
+  # 與 sync.sh 同一套閘門。理由見 sync.sh 裡的完整說明，摘要：
+  #   1. 格式不對的 token 若不在這裡擋下，每個呼叫都會 401 然後被 best-effort 吞掉。
+  #   2. cf_config_stdin 會把這個值放進 curl 設定檔的 header = "..." 字串，值裡有
+  #      " 或 \ 或換行就能跳出字串、多塞一個設定項目。閘門與那個改動必須同時存在。
+  #   3. 先 trim 再驗，避免打斷「secret 尾端多一個空白但一直正常運作」的使用者。
+  # 訊息只描述長度與「含預期外字元」，絕不印值、片段或遮罩後的形式。
+  CF_API_TOKEN="$(trim "$CF_API_TOKEN")"
+  local LC_ALL=C
+  if [[ ! "$CF_API_TOKEN" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    echo "❌ CF_API_TOKEN 含有預期外的字元，中止。Cloudflare 的 API token 只由英數字、底線、連字號組成。" >&2
+    echo "   長度 ${#CF_API_TOKEN}。（刻意不印出內容或任何片段。）" >&2
+    echo "   常見原因：export 時多帶了引號、空白或換行。" >&2
+    exit 1
+  fi
+  if [[ "${#CF_API_TOKEN}" -lt 20 ]]; then
+    echo "❌ CF_API_TOKEN 只有 ${#CF_API_TOKEN} 碼，短得不像 Cloudflare 的 API token（一般是 40 碼），中止。" >&2
+    exit 1
+  fi
+}
+
 d1_query() {
   local sql="$1" params="${2:-[]}"
   local body
   body=$(jq -n --arg sql "$sql" --argjson params "$params" '{sql: $sql, params: $params}')
-  curl -sS -X POST "$CF_API/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
-    -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
+  cf_config_stdin | curl -sS -X POST "$CF_API/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
+    -H "Content-Type: application/json" \
+    --config - \
     --data "$body"
 }
 
@@ -169,7 +207,7 @@ cmd_list() {
 }
 
 cf_get() {
-  curl -sS "$CF_API$1" -H "Authorization: Bearer $CF_API_TOKEN"
+  cf_config_stdin | curl -sS --config - "$CF_API$1"
 }
 
 _domain_and_parents() {
@@ -235,8 +273,8 @@ _kv_fetch_cache() {
   # .../namespaces//values/... 這種畸形 URL，照樣送出一次注定失敗的往返。
   [[ -n "$KV_NAMESPACE_ID" ]] || return 1
 
-  code=$(curl -sS -o "$gz" -w '%{http_code}' \
-    -H "Authorization: Bearer $CF_API_TOKEN" \
+  code=$(cf_config_stdin | curl -sS -o "$gz" -w '%{http_code}' \
+    --config - \
     "$CF_API/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$KV_NAMESPACE_ID/values/$KV_CACHE_KEY" \
     2>/dev/null || echo 000)
   [[ "$code" == "200" ]] || return 1
@@ -455,6 +493,8 @@ EOF
 }
 
 main() {
+  # 第一件事就是驗 token，理由見 validate_api_token 的說明。
+  validate_api_token
   if [[ $# -lt 1 ]]; then
     usage
     exit 1

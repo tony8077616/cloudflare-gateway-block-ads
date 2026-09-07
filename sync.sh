@@ -168,13 +168,13 @@ cf_curl() {
   # $1 = method, $2 = path (含 query string), $3 = body（可省略）
   local method="$1" path="$2" body="${3:-}"
   if [[ -n "$body" ]]; then
-    curl -sS -X "$method" "$CF_API$path" \
-      -H "Authorization: Bearer $CF_API_TOKEN" \
+    cf_config_stdin | curl -q -sS -X "$method" "$CF_API$path" \
       -H "Content-Type: application/json" \
+      --config - \
       --data "$body"
   else
-    curl -sS -X "$method" "$CF_API$path" \
-      -H "Authorization: Bearer $CF_API_TOKEN"
+    cf_config_stdin | curl -q -sS -X "$method" "$CF_API$path" \
+      --config -
   fi
 }
 
@@ -183,14 +183,14 @@ cf_curl_with_status() {
   # 供需要記錄失敗診斷資訊的呼叫點使用（不影響 cf_curl 本身，避免動到其他呼叫點）。
   local method="$1" path="$2" body="${3:-}"
   if [[ -n "$body" ]]; then
-    curl -sS -X "$method" "$CF_API$path" \
-      -H "Authorization: Bearer $CF_API_TOKEN" \
+    cf_config_stdin | curl -q -sS -X "$method" "$CF_API$path" \
       -H "Content-Type: application/json" \
+      --config - \
       --data "$body" \
       -w "__HTTP_STATUS__%{http_code}"
   else
-    curl -sS -X "$method" "$CF_API$path" \
-      -H "Authorization: Bearer $CF_API_TOKEN" \
+    cf_config_stdin | curl -q -sS -X "$method" "$CF_API$path" \
+      --config - \
       -w "__HTTP_STATUS__%{http_code}"
   fi
 }
@@ -401,6 +401,67 @@ trim() {
   printf '%s' "$s"
 }
 
+
+# ── Cloudflare API 的憑證處理 ─────────────────────────────
+#
+# Authorization 一律經 `curl --config -` 由 stdin 餵進去，不放進 argv。
+# printf 是 bash 內建指令、不會產生新行程，所以 token 從頭到尾沒有進過任何 argv。
+#
+# 誠實地說這件事擋到了什麼：在 Actions 的 runner 上（單租戶、用完即丟）增量幾乎是零
+# —— token 本來就在該 step 的 env 裡，讀得到 /proc/*/cmdline 的東西同樣讀得到
+# /proc/*/environ。真正有差的是 manage.sh 執行的地方，也就是使用者自己的工作機：
+# 共用主機上其他帳號的 ps aux 撈得到，而企業管控的機器會把完整命令列送進 EDR/SIEM
+# 保存數個月。這裡跟 setup.sh 用同一套做法，讓三支腳本的憑證合約一致。
+cf_config_stdin() {
+  # 這個函式的輸出只會接到 curl 的 stdin，絕不落地成檔案。
+  printf 'header = "Authorization: Bearer %s"\n' "$CF_API_TOKEN"
+}
+
+TOKEN_WAS_TRIMMED=0
+
+validate_api_token() {
+  # 在發出第一個請求之前就把格式不對的 token 擋下來。
+  #
+  # 今天一顆格式不對的 token 不會當場失敗：每一個 Cloudflare 呼叫都 401，然後被沿路的
+  # best-effort 處理器逐一吞掉 —— 狀態表建不起來、白名單讀成空、快取讀不到，上千次
+  # 注定失敗的請求發完，最後才在上傳階段紅燈。一趟數十分鐘，日誌裡看不出根因是憑證。
+  #
+  # 另一個理由：上面的 cf_config_stdin 會把這個值放進 curl 設定檔的 `header = "..."`
+  # 字串裡，而設定檔語法會解譯引號與反斜線。值裡有 " 或 \ 或換行就能跳出那個字串、
+  # 多塞一個設定項目（例如 output = 或 proxy =）。這道閘門必須跟 cf_config_stdin
+  # 同時存在，不能只有其中一半。
+  #
+  # 先 trim 再驗，而不是直接拒絕帶空白的值：貼進 secret 時很容易多帶一個尾端空白或
+  # 換行，而 HTTP 標頭值前後的空白依 RFC 9110 由接收端剝除，所以那種 token 今天很可能
+  # 一直是正常運作的，直接 fail-closed 會把這些人打斷。trim 之後兩種情況都沒有回歸：
+  # 接收端本來就會剝除的話，送出的位元組跟今天相同；不剝除的話，那顆 token 今天本來
+  # 就從來沒成功過。
+  local raw="$CF_API_TOKEN"
+  CF_API_TOKEN="$(trim "$CF_API_TOKEN")"
+  if [[ "$CF_API_TOKEN" != "$raw" ]]; then
+    TOKEN_WAS_TRIMMED=1
+    warn "CF_API_TOKEN 的前後有多餘的空白或換行，已修剪後使用"
+    warn "  建議回 Settings → Secrets 重新存一次、不要包含結尾的換行 —— 否則同一個值貼到"
+    warn "  別的地方（wrangler、手動 curl）不會被修剪，會變成「這裡能用那裡不能用」"
+  fi
+
+  # 以下訊息刻意只描述「長度」與「含預期外字元」，絕不印出值、片段或遮罩後的形式。
+  # 平台的 secret 遮蔽是**精確字串比對**：任何遮罩或裁切都會產生一個與 secret 不同的
+  # 字串，因此不會被遮成 ***，而會明文寫進這個公開 repo 的執行日誌。
+  #
+  # LC_ALL=C 讓 [A-Za-z0-9] 是位元組範圍而不是 locale 的定序範圍。
+  local LC_ALL=C
+  if [[ ! "$CF_API_TOKEN" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    echo "❌ CF_API_TOKEN 含有預期外的字元，中止。Cloudflare 的 API token 只由英數字、底線、連字號組成。" >&2
+    echo "   長度 ${#CF_API_TOKEN}。（刻意不印出內容或任何片段：日誌的 secret 遮蔽是精確比對，印片段等於明文外洩。）" >&2
+    echo "   常見原因：貼上時多帶了引號、空白或換行。" >&2
+    exit 1
+  fi
+  if [[ "${#CF_API_TOKEN}" -lt 20 ]]; then
+    echo "❌ CF_API_TOKEN 只有 ${#CF_API_TOKEN} 碼，短得不像 Cloudflare 的 API token（一般是 40 碼），中止。" >&2
+    exit 1
+  fi
+}
 # ── sources.conf 的輸入驗證 ───────────────────────────────
 #
 # sources.conf 是「使用者自己會編輯」的檔案，而它的兩個欄位最後都會流進危險的位置：
@@ -786,8 +847,8 @@ load_custom_blocklist() {
 kv_get_to_file() {
   # $1 = key, $2 = 輸出檔。HTTP 狀態碼印到 stdout（連不上時 curl 會給 000）。
   local key="$1" out="$2"
-  curl -sS -o "$out" -w '%{http_code}' \
-    -H "Authorization: Bearer $CF_API_TOKEN" \
+  cf_config_stdin | curl -q -sS -o "$out" -w '%{http_code}' \
+    --config - \
     "$CF_API/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$KV_NAMESPACE_ID/values/$key" \
     2>/dev/null || echo "000"
 }
@@ -796,9 +857,9 @@ kv_put_from_file() {
   # $1 = key, $2 = 輸入檔。回應 JSON 印到 stdout。
   # 用 --data-binary 送原始位元組；不要用 -F，那會把整包 multipart 當成值存進去。
   local key="$1" in="$2"
-  curl -sS -X PUT \
-    -H "Authorization: Bearer $CF_API_TOKEN" \
+  cf_config_stdin | curl -q -sS -X PUT \
     -H "Content-Type: application/octet-stream" \
+    --config - \
     --data-binary "@$in" \
     "$CF_API/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$KV_NAMESPACE_ID/values/$key"
 }
@@ -984,8 +1045,9 @@ save_category_cache_batch() {
 
     local body resp
     body=$(jq -n --argjson batch "$batch_json" '{batch: $batch}')
-    resp=$(curl -sS --max-time 30 -X POST "$CF_API/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
-      -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
+    resp=$(cf_config_stdin | curl -q -sS --max-time 30 -X POST "$CF_API/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
+      -H "Content-Type: application/json" \
+      --config - \
       --data "$body")
     case "$(echo "$resp" | jq -r '.success // false')" in
       true)
@@ -1030,8 +1092,8 @@ _check_categories_worker() {
     query="${query#&}"
 
     local resp
-    resp=$(curl -sS --max-time 30 "$CF_API/accounts/$CF_ACCOUNT_ID/intel/domain/bulk?$query" \
-      -H "Authorization: Bearer $CF_API_TOKEN")
+    resp=$(cf_config_stdin | curl -q -sS --max-time 30 --config - \
+      "$CF_API/accounts/$CF_ACCOUNT_ID/intel/domain/bulk?$query")
 
     # 先把回應歸成單一分類再用 case 分派（取代原本的 if-elif-else 鏈）
     local resp_kind
@@ -1480,6 +1542,9 @@ write_step_summary() {
 # ── 主流程 ───────────────────────────────────────────────
 
 main() {
+  # 第一件事就是驗 token。格式不對的話這裡一秒內中止，而不是讓後面上千次
+  # 注定 401 的請求跑滿數十分鐘、再由沿路的 best-effort 處理器把根因埋掉。
+  validate_api_token
   log "開始同步"
   ensure_schema
   load_daily_budget

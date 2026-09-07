@@ -50,6 +50,14 @@ jobs:
       - name: 白名單扣除的回歸測試
         run: bash test/whitelist-empty.test.sh
 
+      # 這兩項驗的是「token 有沒有真的送到」與「格式不對時有沒有擋下來」。
+      # 前者會起一個只綁 127.0.0.1 的小伺服器實際收請求 —— 不連外、不需要憑證。
+      - name: Cloudflare 呼叫的 Authorization 標頭
+        run: bash test/cf-auth-header.test.sh
+
+      - name: CF_API_TOKEN 格式閘門
+        run: bash test/token-gate.test.sh
+
       - name: Worker 邏輯測試
         run: node worker/test/worker.test.mjs
 
