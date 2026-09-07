@@ -236,6 +236,8 @@ Token 唯讀探測（有效嗎？範圍是不是開太大？看得到幾個帳�
 - **絕不寫進任何檔案。** 它產生的 `.setup.local` 只存非機密 ID（帳戶 ID、D1 ID、
   KV namespace ID）——這些本來就會出現在每一個 API 路徑裡。
 - 每一次 Cloudflare 呼叫的 `Authorization` 都經 stdin 餵進 curl，不會出現在 argv。
+  這一條 `setup.sh`、`sync.sh`、`manage.sh` 三支都適用（上面兩條只描述 `setup.sh`：
+  另外兩支不會提示輸入、也不產生 `.setup.local`，它們只從環境變數取值）。
 
 > 想從密碼管理器取值的話，請先在互動的 shell 裡 `export` 好再執行本腳本。
 > 注意「在指令列同一行前面臨時指定變數」那種寫法，會連同 token 一起寫進 shell history。
