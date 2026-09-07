@@ -553,6 +553,17 @@ node test/worker.test.mjs     # 認證、判定分類、篩選翻譯的邏輯測
 node test/page.check.mjs      # 頁面腳本的語法與 id/data-* 對應檢查
 ```
 
+回到 repo 根目錄還有一組 shell 測試：
+
+```bash
+bash test/whitelist-empty.test.sh   # 白名單扣除：空白名單不可以把整份清單扣光
+```
+
+它會直接從 `sync.sh` 抽出**正在跑的那一段**來執行，而不是另外抄一份平行實作 ——
+抄的那份不會跟著 `sync.sh` 一起改，測過也不代表出貨的程式是對的。
+
+上面每一項都會在 push 到 `main` 與開 PR 時自動執行（見 CI workflow）。
+
 ## 疑難排解
 
 | 症狀 | 先檢查 |

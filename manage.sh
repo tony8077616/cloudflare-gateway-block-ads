@@ -66,6 +66,17 @@ trim() {
   printf '%s' "$s"
 }
 
+# 逐位元照抄 sync.sh 的同名函式。兩邊必須一致：這個 repo 有過「兩份平行實作各自
+# 漂移」的前例（find 的白名單後綴比對曾經和 sync.sh 不一致，於是同一個畫面上先說
+# 命中、兩行後又說不會被擋）。要改就兩邊一起改。
+sanitize_for_log() {
+  # 不合法的欄位值要印出來讓使用者知道是哪一行出問題，但不能原封不動送進終端機 ——
+  # 裡面可能有 ANSI escape 之類的控制字元。這裡只拔掉控制字元並截短，其餘保留原樣。
+  # LC_ALL=C 是為了讓 tr/cut 按「位元組」處理：中文來源名是合法的，不該被當成多位元組
+  # 字元去解讀而出事；控制字元的判定則本來就該是位元組層級的。
+  printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177' | LC_ALL=C cut -b1-120
+}
+
 d1_query() {
   local sql="$1" params="${2:-[]}"
   local body
@@ -96,7 +107,7 @@ cmd_add() {
   # bash 的 =~ 不啟用 REG_NEWLINE，$ 錨的是字串結尾而不是行尾。
   # $DOMAIN_REGEX 右邊**不可以加引號**，加了會被當成字面字串。
   if [[ ! "$domain" =~ $DOMAIN_REGEX ]]; then
-    echo "❌ '$domain' 看起來不是合法的網域格式，沒有寫入。請確認拼字（例如是否誤帶了 http:// 或路徑）"
+    echo "❌ '$(sanitize_for_log "$domain")' 看起來不是合法的網域格式，沒有寫入。請確認拼字（例如是否誤帶了 http:// 或路徑）"
     return
   fi
 
@@ -297,7 +308,7 @@ cmd_find() {
 
   # 同 cmd_add：用 bash 的 =~ 而不是行導向的 grep，理由見 cmd_add 的註解。
   if [[ ! "$domain" =~ $DOMAIN_REGEX ]]; then
-    echo "❌ '$domain' 看起來不是合法的網域格式（注意不要帶 http:// 或路徑）"
+    echo "❌ '$(sanitize_for_log "$domain")' 看起來不是合法的網域格式（注意不要帶 http:// 或路徑）"
     return 1
   fi
 

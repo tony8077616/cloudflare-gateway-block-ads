@@ -926,7 +926,11 @@ save_category_cache_blob() {
     log "KV 快照已更新：$CACHE_BLOB_ROWS 筆（新增 $fresh_rows），壓縮後 $CACHE_BLOB_BYTES bytes"
   else
     warn "KV 快照寫入失敗，下次同步會退回讀 D1 全表（不影響本次結果）"
-    warn "  若這是 fork 後的第一次執行，請確認 KV_NAMESPACE_ID 已換成你自己的 namespace"
+    # 走到這裡代表 KV 是啟用狀態（KV_NAMESPACE_ID 非空，否則上面早就 return 了），
+    # 所以「請確認換成你自己的 namespace」這種提示已經沒有意義 —— 預設值就是空字串，
+    # 沒有內建的作者 namespace 可換。實際可能的原因只有下面這三個。
+    warn "  可能原因：token 缺 Workers KV Storage: Edit、namespace id 不屬於這個帳號、或快照超過大小上限"
+    warn "  用 ./setup.sh --check 可以逐項唯讀探測 token 的各個 scope"
     CACHE_BLOB_ROWS=0
     CACHE_BLOB_BYTES=0
   fi
