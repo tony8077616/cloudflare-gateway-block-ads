@@ -42,6 +42,33 @@ trap cleanup_on_exit EXIT
 : "${D1_DATABASE_ID:?請設定 D1_DATABASE_ID}"
 
 CF_API="https://api.cloudflare.com/client/v4"
+# ── Cloudflare 呼叫的等待上限 ─────────────────────────────
+# 在這之前，帶憑證的呼叫沒有任何上限：一個接得上但不回應的連線會讓整趟同步一直等下去，
+# 直到 workflow 的 timeout-minutes 才被砍掉，而 sync.yml 的 concurrency 是
+# cancel-in-progress: false，所以下一個整點的排程還得排隊。
+#
+# 用「停滯」而不是「總時間」當判準：總時間上限會誤殺合法的大回應（見下面的 BULK）。
+# --speed-limit 1 --speed-time N 的意思是「連續 N 秒吞吐量低於 1 byte/s 就放棄」。
+# 實測（本地伺服器）：每 500ms 送 1 byte 共 10 秒，配 --speed-time 3 仍正常完成 ——
+# 慢但有進展不會被中止。
+#
+# **低速檢查會不會把「首位元組延遲」算成停滯，取決於請求有沒有上傳內容**（實測）：
+#   無 body 的請求：算。伺服器靜默 6 秒才回應，配 --speed-time 2 會在第 2 秒中止。
+#   帶 --data 的請求：上傳活動讓計時重新起算，同一組情境反而正常完成（6 秒）；
+#                     伺服器若完全不回應，最終仍會中止，只是比門檻晚一些。
+# 所以這個值要看的是「伺服器組裝回應要多久」，不只是「傳輸間隔多長」。
+# test/cf-auth-header.test.sh 有把這兩種行為都釘住。
+CF_CONNECT_TIMEOUT=15    # TCP/TLS 握手上限。握手超過 15 秒實務上就是壞掉，與 payload 無關。
+CF_STALL_TIMEOUT=60      # 一般呼叫的停滯上限。
+# 分類快取的 D1 全表讀取是特例：單一次查詢取回約 46 萬列，Cloudflare 要先把整份回應組好
+# 才會送出第一個位元組。它是帶 body 的 POST，依上面的實測對這種延遲比較寬容，
+# 但「比較寬容」不是「不會中止」，而這條路徑一旦被誤殺，代價很大。
+#
+# 誠實說明：**沒有這條路徑首位元組延遲的量測值**，600 秒是刻意取的高上界，不是量出來的。
+# 取太大的後果只是「有界的等待」而不是今天的「無限等待」，仍嚴格優於現狀；取太小則會
+# 誤殺 fork 的預設路徑（KV_NAMESPACE_ID 預設為空 → KV 停用 → 就走這條），而它的降級是
+# 「視為無快取、重查全部網域」再撞每日寫入額度，不是安全的那一側。所以寧可取大。
+CF_STALL_TIMEOUT_BULK=600
 LIST_PREFIX="Block ads"
 LIST_CHUNK_SIZE=1000
 POLICY_NAME="Block ads"
@@ -168,12 +195,12 @@ cf_curl() {
   # $1 = method, $2 = path (含 query string), $3 = body（可省略）
   local method="$1" path="$2" body="${3:-}"
   if [[ -n "$body" ]]; then
-    cf_config_stdin | curl -q -sS -X "$method" "$CF_API$path" \
+    cf_config_stdin | curl -q -sS --connect-timeout "$CF_CONNECT_TIMEOUT" --speed-limit 1 --speed-time "$CF_STALL_TIMEOUT" -X "$method" "$CF_API$path" \
       -H "Content-Type: application/json" \
       --config - \
       --data "$body"
   else
-    cf_config_stdin | curl -q -sS -X "$method" "$CF_API$path" \
+    cf_config_stdin | curl -q -sS --connect-timeout "$CF_CONNECT_TIMEOUT" --speed-limit 1 --speed-time "$CF_STALL_TIMEOUT" -X "$method" "$CF_API$path" \
       --config -
   fi
 }
@@ -183,13 +210,13 @@ cf_curl_with_status() {
   # 供需要記錄失敗診斷資訊的呼叫點使用（不影響 cf_curl 本身，避免動到其他呼叫點）。
   local method="$1" path="$2" body="${3:-}"
   if [[ -n "$body" ]]; then
-    cf_config_stdin | curl -q -sS -X "$method" "$CF_API$path" \
+    cf_config_stdin | curl -q -sS --connect-timeout "$CF_CONNECT_TIMEOUT" --speed-limit 1 --speed-time "$CF_STALL_TIMEOUT" -X "$method" "$CF_API$path" \
       -H "Content-Type: application/json" \
       --config - \
       --data "$body" \
       -w "__HTTP_STATUS__%{http_code}"
   else
-    cf_config_stdin | curl -q -sS -X "$method" "$CF_API$path" \
+    cf_config_stdin | curl -q -sS --connect-timeout "$CF_CONNECT_TIMEOUT" --speed-limit 1 --speed-time "$CF_STALL_TIMEOUT" -X "$method" "$CF_API$path" \
       --config - \
       -w "__HTTP_STATUS__%{http_code}"
   fi
@@ -847,7 +874,7 @@ load_custom_blocklist() {
 kv_get_to_file() {
   # $1 = key, $2 = 輸出檔。HTTP 狀態碼印到 stdout（連不上時 curl 會給 000）。
   local key="$1" out="$2"
-  cf_config_stdin | curl -q -sS -o "$out" -w '%{http_code}' \
+  cf_config_stdin | curl -q -sS --connect-timeout "$CF_CONNECT_TIMEOUT" --speed-limit 1 --speed-time "$CF_STALL_TIMEOUT" -o "$out" -w '%{http_code}' \
     --config - \
     "$CF_API/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$KV_NAMESPACE_ID/values/$key" \
     2>/dev/null || echo "000"
@@ -857,7 +884,7 @@ kv_put_from_file() {
   # $1 = key, $2 = 輸入檔。回應 JSON 印到 stdout。
   # 用 --data-binary 送原始位元組；不要用 -F，那會把整包 multipart 當成值存進去。
   local key="$1" in="$2"
-  cf_config_stdin | curl -q -sS -X PUT \
+  cf_config_stdin | curl -q -sS --connect-timeout "$CF_CONNECT_TIMEOUT" --speed-limit 1 --speed-time "$CF_STALL_TIMEOUT" -X PUT \
     -H "Content-Type: application/octet-stream" \
     --config - \
     --data-binary "@$in" \
@@ -908,7 +935,9 @@ _load_cache_from_kv() {
 _load_cache_from_d1() {
   # $1 = cutoff。這是全表掃描（約 46 萬列），只在 KV 不可用時才會走到。
   local cutoff="$1" resp
-  resp=$(d1_query "SELECT domain, is_ads_category, checked_at FROM domain_category_cache WHERE checked_at >= ?" \
+  # 這一次查詢會取回約 46 萬列，伺服器端組裝回應的時間會被低速檢查算成停滯，
+  # 所以只有這裡把停滯上限換成刻意取高的 BULK 值（理由見設定區）。
+  resp=$(CF_STALL_TIMEOUT="$CF_STALL_TIMEOUT_BULK" d1_query "SELECT domain, is_ads_category, checked_at FROM domain_category_cache WHERE checked_at >= ?" \
     "$(jq -n --arg c "$cutoff" '[$c]')")
   if ! is_valid_json <<< "$resp" || [[ "$(jq -r '.success' <<< "$resp")" != "true" ]]; then
     warn "讀取分類快取失敗，本次視為無快取，將重新查詢全部網域"
@@ -1045,7 +1074,7 @@ save_category_cache_batch() {
 
     local body resp
     body=$(jq -n --argjson batch "$batch_json" '{batch: $batch}')
-    resp=$(cf_config_stdin | curl -q -sS --max-time 30 -X POST "$CF_API/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
+    resp=$(cf_config_stdin | curl -q -sS --max-time 30 --connect-timeout "$CF_CONNECT_TIMEOUT" --speed-limit 1 --speed-time "$CF_STALL_TIMEOUT" -X POST "$CF_API/accounts/$CF_ACCOUNT_ID/d1/database/$D1_DATABASE_ID/query" \
       -H "Content-Type: application/json" \
       --config - \
       --data "$body")
@@ -1092,7 +1121,7 @@ _check_categories_worker() {
     query="${query#&}"
 
     local resp
-    resp=$(cf_config_stdin | curl -q -sS --max-time 30 --config - \
+    resp=$(cf_config_stdin | curl -q -sS --max-time 30 --connect-timeout "$CF_CONNECT_TIMEOUT" --speed-limit 1 --speed-time "$CF_STALL_TIMEOUT" --config - \
       "$CF_API/accounts/$CF_ACCOUNT_ID/intel/domain/bulk?$query")
 
     # 先把回應歸成單一分類再用 case 分派（取代原本的 if-elif-else 鏈）
@@ -1423,7 +1452,13 @@ sync_slots() {
     [[ -n "$eidx" ]] || continue
     eid="${slot_id[$eidx]:-}"
     [[ -n "$eid" ]] || continue
-    if cf_curl DELETE "/accounts/$CF_ACCOUNT_ID/gateway/lists/$eid" > /dev/null; then
+    # 不能用 `if cf_curl DELETE ...` 判斷成敗：curl 沒有 -f/--fail，HTTP 403/404/500
+    # 一律回 0，所以那種寫法幾乎永遠走成功分支，Cloudflare 拒絕刪除時照樣印「已刪除」。
+    # 改用本檔既有的判定慣用法：看回應的 .success。
+    # 訊息刻意不帶回應內容 —— 失敗時回應可能是 HTML 錯誤頁，而這是公開 repo 的日誌。
+    local del_resp
+    del_resp=$(cf_curl DELETE "/accounts/$CF_ACCOUNT_ID/gateway/lists/$eid")
+    if is_valid_json <<< "$del_resp" && [[ "$(jq -r '.success' <<< "$del_resp")" == "true" ]]; then
       log "清單編號 $eidx 已無任何網域，刪除（編號保留給日後重用）"
     else
       warn "刪除空清單（編號 $eidx）失敗（不影響本次結果）"
