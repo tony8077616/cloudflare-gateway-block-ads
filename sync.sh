@@ -1554,7 +1554,6 @@ record_upload_failure() {
   fi
   # 只剝控制字元。這些都是單位元組的 ASCII 控制碼，對多位元組序列安全；
   # 截斷交給下面的 jq 以 codepoint 為單位做，避免把 UTF-8 切半。
-  detail="$(printf '%s' "$detail" | LC_ALL=C tr -d '\000-\037\177')"
 
   # 參數順序必須與下面 INSERT 的欄位順序一致。
   local params
@@ -1569,7 +1568,7 @@ record_upload_failure() {
 
   local ins_resp
   ins_resp="$(CF_STALL_TIMEOUT="$UPLOAD_FAILURE_STALL_TIMEOUT" d1_query \
-    "INSERT INTO upload_failures (run_at, list_name, http_status, error_detail, domain_count_affected, attempt_count) VALUES (?, ?, ?, ?, ?, ?)" \
+    "INSERT INTO upload_failures (run_at, list_name, http_status, error_detail, attempt_count, domain_count_affected) VALUES (?, ?, ?, ?, ?, ?)" \
     "$params")"
 
   if is_valid_json <<< "$ins_resp" && [[ "$(jq -r '.success' <<< "$ins_resp")" == "true" ]]; then
