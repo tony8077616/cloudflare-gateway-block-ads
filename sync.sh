@@ -69,6 +69,25 @@ CF_STALL_TIMEOUT=60      # 一般呼叫的停滯上限。
 # 誤殺 fork 的預設路徑（KV_NAMESPACE_ID 預設為空 → KV 停用 → 就走這條），而它的降級是
 # 「視為無快取、重查全部網域」再撞每日寫入額度，不是安全的那一側。所以寧可取大。
 CF_STALL_TIMEOUT_BULK=600
+
+# ── 上傳失敗紀錄（upload_failures）─────────────────────────
+# 這條路徑是「上傳已經失敗之後」的盡力而為診斷寫入，設計上必須比它要記錄的失敗更保守：
+# 大量上傳失敗最典型的原因就是 Cloudflare 整個不可用，而那正是這些 INSERT 也會失敗的
+# 時候。若每一列都等到一般的停滯上限才放棄，上傳迴圈（224 份 × 3 次重試）之上再疊
+# 數十分鐘純空轉，會把「有失敗但仍完成」的執行推成被 job timeout 砍掉 —— 修一個診斷
+# 缺口卻讓故障時的行為更糟，那是淨負面。所以這裡有三道自我節制：
+#   1. 狀態表不可用就完全不記錄（建表失敗必然伴隨大量上傳失敗）。
+#   2. 第一次寫入失敗就整趟放棄，只留一則彙總警告。
+#   3. 這條路徑用自己的短停滯上限，不沿用一般值。
+UPLOAD_FAILURE_LOG_MAX=20          # 一次執行最多記錄幾列；超過只留彙總警告
+UPLOAD_FAILURE_STALL_TIMEOUT=10    # 這條路徑專用的短停滯上限（一般呼叫是 CF_STALL_TIMEOUT）
+# error_detail 的截斷長度，以 **codepoint** 計而不是位元組。
+# 不能沿用 sanitize_for_log：那是為「印到終端機」設計的，用 cut -b 按位元組切，
+# 會把 UTF-8 序列從中切半，殘缺位元組接著進 jq --arg 就可能整列靜默消失。
+# 120 bytes 也放不下一則 Cloudflare 的 .errors 訊息，欄位補了也等於沒內容。
+UPLOAD_FAILURE_DETAIL_MAX=400
+UPLOAD_FAILURE_LOGGED=0
+UPLOAD_FAILURE_LOG_GAVE_UP=0
 LIST_PREFIX="Block ads"
 LIST_CHUNK_SIZE=1000
 POLICY_NAME="Block ads"
@@ -1434,6 +1453,9 @@ sync_slots() {
         ;;
       *)
         n_fail=$((n_fail + 1))
+        # 這一行必須留在失敗分支裡。移到 case 外面的話，每一份**成功**上傳也會寫一列
+        # 假的失敗紀錄，manage.sh failures 的輸出會變成雜訊，還白白吃掉 D1 寫入額度。
+        record_upload_failure "$name" "$http_status" "$affected" "$attempt" "$resp"
         # 上傳失敗但清單本來就存在的話，Gateway 上仍是上一次的內容。讓 Policy 繼續
         # 引用它，比整份拿掉（等於那些網域全部解除封鎖）安全得多。下次執行會再從
         # Cloudflare 讀到實況，自動判定需要重傳。
@@ -1507,6 +1529,58 @@ ensure_policy() {
   log "Policy 「$POLICY_NAME」已更新，引用 $list_count 個清單"
 }
 
+record_upload_failure() {
+  # $1 = 清單名, $2 = HTTP 狀態, $3 = 受影響網域數, $4 = 嘗試次數, $5 = 最後一次的回應
+  # 任何路徑都 return 0：這是診斷用的旁支，絕不能影響同步結果或結束碼。
+  local name="$1" status="$2" affected="$3" attempts="$4" resp="$5"
+
+  # 狀態表不可用時，upload_failures 這張表不保證存在（ensure_schema 失敗就會這樣），
+  # 再送 INSERT 只是製造註定失敗的請求。本檔其他狀態讀寫也都先擋這個旗標。
+  [[ "${STATE_AVAILABLE:-0}" -eq 1 ]] || return 0
+  [[ "${UPLOAD_FAILURE_LOG_GAVE_UP:-0}" -eq 0 ]] || return 0
+
+  if [[ "${UPLOAD_FAILURE_LOGGED:-0}" -ge "$UPLOAD_FAILURE_LOG_MAX" ]]; then
+    UPLOAD_FAILURE_LOG_GAVE_UP=1
+    warn "上傳失敗紀錄已達本次上限（$UPLOAD_FAILURE_LOG_MAX 列），後續失敗不再寫入 D1；每一份的警告在上面的日誌裡仍然齊全"
+    return 0
+  fi
+
+  # 回應是合法 JSON 就只取 .errors（真正有用的部分），否則保留原始回應。
+  local detail
+  if is_valid_json <<< "$resp"; then
+    detail="$(jq -c '.errors' <<< "$resp" 2>/dev/null)"
+  else
+    detail="$resp"
+  fi
+  # 只剝控制字元。這些都是單位元組的 ASCII 控制碼，對多位元組序列安全；
+  # 截斷交給下面的 jq 以 codepoint 為單位做，避免把 UTF-8 切半。
+  detail="$(printf '%s' "$detail" | LC_ALL=C tr -d '\000-\037\177')"
+
+  # 參數順序必須與下面 INSERT 的欄位順序一致。
+  local params
+  if ! params="$(jq -n \
+        --arg t "$(date +%s)" --arg n "$name" --arg s "$status" \
+        --arg d "$detail" --arg a "$affected" --arg c "$attempts" \
+        --argjson lim "$UPLOAD_FAILURE_DETAIL_MAX" \
+        '[($t|tonumber), $n, $s, ($d[0:$lim]), ($a|tonumber), ($c|tonumber)]' 2>/dev/null)"; then
+    warn "上傳失敗紀錄的參數組不起來（回應可能不是合法 UTF-8），略過這一列"
+    return 0
+  fi
+
+  local ins_resp
+  ins_resp="$(CF_STALL_TIMEOUT="$UPLOAD_FAILURE_STALL_TIMEOUT" d1_query \
+    "INSERT INTO upload_failures (run_at, list_name, http_status, error_detail, domain_count_affected, attempt_count) VALUES (?, ?, ?, ?, ?, ?)" \
+    "$params")"
+
+  if is_valid_json <<< "$ins_resp" && [[ "$(jq -r '.success' <<< "$ins_resp")" == "true" ]]; then
+    UPLOAD_FAILURE_LOGGED=$((UPLOAD_FAILURE_LOGGED + 1))
+    D1_WRITES_ADDED=$((D1_WRITES_ADDED + 1))
+  else
+    UPLOAD_FAILURE_LOG_GAVE_UP=1
+    warn "寫入上傳失敗紀錄失敗，本次執行不再嘗試（不影響同步結果）"
+  fi
+  return 0
+}
 record_sync_history() {
   # $1 status, $2 notes, $3..$6 統計數字
   local status="$1" notes="$2" total_merged="$3" total_uploaded="$4" excluded_by_native="$5" whitelisted="$6"

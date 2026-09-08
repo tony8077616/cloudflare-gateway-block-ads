@@ -574,7 +574,7 @@ bash test/whitelist-empty.test.sh   # 白名單扣除：空白名單不可以把
 | 某網站被誤擋 | `./manage.sh find <domain>` 找出是哪一個來源造成的，再決定加白名單還是修解析器 |
 | 掃不到網域但確定被擋 | 十之八九是被 Cloudflare 原生分類擋掉的（目前 54,742 筆），`find` 會告訴你 |
 | 排程一直「略過」 | 正常。來源沒變動就不做事。要強制執行請用 `force` |
-| 清單上傳失敗 | 目前只會在執行日誌裡留 `⚠` 警告，看 Actions 的日誌。`manage.sh failures` 讀的 `upload_failures` 表**目前沒有任何東西在寫入**（寫入端在穩定槽位改版時一併被移除了），所以會回空 |
+| 清單上傳失敗 | `./manage.sh failures` 會列出診斷紀錄（時間、清單名、HTTP 狀態、受影響網域數、錯誤內容）。執行日誌裡每一份也都有 `⚠` 警告。若紀錄比日誌裡的警告少，看下一列 |
 | 儀表板出現「其他／未歸類」 | Cloudflare 回了對照表裡沒有的判定代碼。看明細的「判定」欄取得代碼與政策名稱，補進 `worker/src/index.js` 的 `DECISION` |
 | 儀表板查詢失敗且提到權限 | `CF_API_TOKEN` 缺少 `Account Analytics: Read` |
 | 日誌收折標記錯位 | workflow 必須是 `./sync.sh 2>&1`。`log`/`warn` 與 `::group::` 都寫 stderr，不合流會因緩衝差異而錯位 |
@@ -614,7 +614,7 @@ worker/                      即時觀測儀表板（Cloudflare Worker，選用�
 | `sync_state` | 各來源的 checksum、ETag、Last-Modified，以及延後補寫的筆數 |
 | `d1_daily_writes` | 每日（UTC）寫入用量，跨執行累計 |
 | `sync_history` | 每次同步的統計數字 |
-| `upload_failures` | 清單上傳失敗的診斷紀錄。**目前沒有寫入端**，寫入邏輯在穩定槽位改版時被移除，尚未補回 |
+| `upload_failures` | 清單上傳失敗的診斷紀錄，由 `sync.sh` 在上傳失敗時寫入。刻意保守：狀態表不可用時不記錄、一次執行最多 20 列、第一次寫入失敗就整趟放棄（只留一則彙總警告）、`error_detail` 截到 400 個字元。理由是這條路徑跑在「上傳已經失敗」之後，而大量失敗最典型的原因就是 Cloudflare 不可用 —— 這時每一列都硬等只會讓執行被 job timeout 砍掉 |
 
 ### 主要設定常數（`sync.sh`）
 

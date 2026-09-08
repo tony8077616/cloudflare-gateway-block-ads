@@ -42,7 +42,7 @@ const server = createServer((req, res) => {
   let body = "";
   req.on("data", (c) => { body += c; });
   req.on("end", () => {
-    appendFileSync(log, JSON.stringify({ method: req.method, url: req.url, headers: req.headers }) + "\n");
+    appendFileSync(log, JSON.stringify({ method: req.method, url: req.url, headers: req.headers, body }) + "\n");
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ success: true, result: [] }));
   });
@@ -500,6 +500,217 @@ fi
 fi
 
 [[ -n "$MODE_PID" ]] && kill "$MODE_PID" 2>/dev/null
+
+# ══════════════════════════════════════════════════════════
+# upload_failures 的寫入端
+# ══════════════════════════════════════════════════════════
+#
+# 這條路徑是「上傳已經失敗之後」的診斷寫入，所以驗收要同時證明兩件事：
+#   (a) 真的寫得出可用的紀錄（欄位順序、每一格的值、error_detail 有內容）；
+#   (b) 故障時不會讓事情更糟（狀態表不可用就不寫、第一次失敗就放棄、不會空轉）。
+#
+# 只驗 (a) 是不夠的：一個「永遠寫空字串」或「把受影響筆數和重試次數綁反」的實作，
+# 在寬鬆的驗收下能全綠，而使用者看到的仍然是沒用的東西。
+
+echo "upload_failures 的寫入端"
+
+# ── 呼叫點必須落在失敗分支裡 ──
+# 移到 case 外面的話，每一份**成功**上傳也會寫一列假的失敗紀錄。
+n_def=$(grep -c '^record_upload_failure() {' "$SYNC")
+n_call=$(grep -c '^\s*record_upload_failure "' "$SYNC")
+if [[ "$n_def" -ne 1 || "$n_call" -ne 1 ]]; then
+  echo "  ❌ record_upload_failure 的定義應為 1 個、呼叫應為 1 個，實際 $n_def / $n_call"
+  FAIL=$((FAIL + 1))
+else
+  fail_anchor=$(grep -n 'n_fail=$((n_fail + 1))' "$SYNC" | head -1 | cut -d: -f1)
+  # 從錨點往後抓到該分支的 ;; 為止
+  awk -v start="$fail_anchor" 'NR >= start { print; if ($0 ~ /^[[:space:]]*;;[[:space:]]*$/) exit }' \
+    "$SYNC" > "$WORK/fail_branch.sh"
+  in_branch=$(grep -c 'record_upload_failure "' "$WORK/fail_branch.sh")
+  if [[ "$in_branch" -eq 1 ]]; then
+    echo "  ✅ 呼叫落在上傳失敗分支內（定義 1、呼叫 1）"
+    PASS=$((PASS + 1))
+  else
+    echo "  ❌ 呼叫不在失敗分支內（分支內找到 $in_branch 次）—— 成功上傳也會寫失敗紀錄"
+    FAIL=$((FAIL + 1))
+  fi
+fi
+
+# ── 引數順序 ──
+# $resp_raw 仍帶著 __HTTP_STATUS__NNN 的尾巴，傳錯會讓 error_detail 混進狀態碼。
+if grep -q 'record_upload_failure "\$name" "\$http_status" "\$affected" "\$attempt" "\$resp"' "$SYNC"; then
+  echo "  ✅ 呼叫的引數順序正確（用 \$resp 而不是 \$resp_raw）"
+  PASS=$((PASS + 1))
+else
+  echo "  ❌ 呼叫的引數順序不符預期"
+  FAIL=$((FAIL + 1))
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "  ⏭  跳過執行期斷言：這台機器沒有 jq（CI 上會實際執行）"
+  SKIPPED=$((${SKIPPED:-0} + 7))
+else
+
+uf_harness() {
+  # $1 = STATE_AVAILABLE, $2 = 目標埠, $3.. = 額外的行
+  local state="$1" port="$2"; shift 2
+  local h="$WORK/uf.sh"
+  {
+    echo 'set -uo pipefail'
+    echo "CF_API=\"http://127.0.0.1:$port\""
+    echo "CF_API_TOKEN='$TOKEN'"
+    echo 'CF_ACCOUNT_ID=acct123'
+    echo 'D1_DATABASE_ID=db123'
+    echo "STATE_AVAILABLE=$state"
+    echo 'D1_WRITES_ADDED=0'
+    echo "CF_CONNECT_TIMEOUT=$(read_default CF_CONNECT_TIMEOUT "$SYNC")"
+    echo "CF_STALL_TIMEOUT=$(read_default CF_STALL_TIMEOUT "$SYNC")"
+    echo "UPLOAD_FAILURE_LOG_MAX=${UF_MAX_OVERRIDE:-$(read_default UPLOAD_FAILURE_LOG_MAX "$SYNC")}"
+    echo "UPLOAD_FAILURE_STALL_TIMEOUT=${UF_STALL_OVERRIDE:-$(read_default UPLOAD_FAILURE_STALL_TIMEOUT "$SYNC")}"
+    echo "UPLOAD_FAILURE_DETAIL_MAX=$(read_default UPLOAD_FAILURE_DETAIL_MAX "$SYNC")"
+    echo 'UPLOAD_FAILURE_LOGGED=0'
+    echo 'UPLOAD_FAILURE_LOG_GAVE_UP=0'
+    echo 'log() { :; }'
+    echo 'warn() { :; }'
+    sed -n '/^cf_config_stdin() {/,/^}/p' "$SYNC"
+    sed -n '/^is_valid_json() {/,/^}/p' "$SYNC"
+    sed -n '/^cf_curl() {/,/^}/p' "$SYNC"
+    sed -n '/^d1_query() {/,/^}/p' "$SYNC"
+    sed -n '/^record_upload_failure() {/,/^}/p' "$SYNC"
+    for line in "$@"; do echo "$line"; done
+  } > "$h"
+  : > "$LOG"
+  bash "$h" >/dev/null 2>&1
+  UF_RC=$?
+  sleep 0.2
+}
+
+body_of_last() { tail -1 "$LOG" | jq -r '.body'; }
+
+# ── 欄位順序與每一格的值 ──
+TARGET_PORT="$PORT"
+uf_harness 1 "$PORT" 'record_upload_failure "Block ads - 042" "502" "777" "3" "{\"errors\":[{\"code\":10001,\"message\":\"ZQXJ-detail\"}]}"'
+b="$(body_of_last)"
+sql="$(jq -r '.sql' <<< "$b" 2>/dev/null)"
+if [[ "$sql" == *"INSERT INTO upload_failures (run_at, list_name, http_status, error_detail, domain_count_affected, attempt_count) VALUES (?, ?, ?, ?, ?, ?)"* ]]; then
+  echo "  ✅ SQL 的欄位清單與順序正確"
+  PASS=$((PASS + 1))
+else
+  echo "  ❌ SQL 的欄位清單或順序不符：$sql"
+  FAIL=$((FAIL + 1))
+fi
+
+p0="$(jq -r '.params[0]' <<< "$b" 2>/dev/null)"
+p1="$(jq -r '.params[1]' <<< "$b" 2>/dev/null)"
+p2="$(jq -r '.params[2]' <<< "$b" 2>/dev/null)"
+p3="$(jq -r '.params[3]' <<< "$b" 2>/dev/null)"
+p4="$(jq -r '.params[4]' <<< "$b" 2>/dev/null)"
+p5="$(jq -r '.params[5]' <<< "$b" 2>/dev/null)"
+now="$(date +%s)"
+ok=1
+[[ "$p0" =~ ^[0-9]+$ ]] && [[ $((now - p0)) -ge 0 && $((now - p0)) -le 120 ]] || ok=0
+[[ "$p1" == "Block ads - 042" ]] || ok=0
+[[ "$p2" == "502" ]] || ok=0
+[[ "$p4" == "777" ]] || ok=0
+[[ "$p5" == "3" ]] || ok=0
+if [[ "$ok" -eq 1 ]]; then
+  echo "  ✅ 六格參數逐格正確（run_at 是接近當下的整數、受影響筆數與重試次數沒有綁反）"
+  PASS=$((PASS + 1))
+else
+  echo "  ❌ 參數逐格比對失敗：[$p0, $p1, $p2, ..., $p4, $p5]"
+  FAIL=$((FAIL + 1))
+fi
+
+# error_detail 必須真的有內容 —— 一個永遠送空字串的實作在別的斷言下全都能過。
+if [[ "$p3" == *"ZQXJ-detail"* ]]; then
+  echo "  ✅ error_detail 那一格確實帶著錯誤內容"
+  PASS=$((PASS + 1))
+else
+  echo "  ❌ error_detail 那一格沒有內容：[$p3]"
+  FAIL=$((FAIL + 1))
+fi
+
+# ── 控制字元：原始位元組與 jq 的轉義形式都不可以出現 ──
+# 只驗「原始位元組不在」是不夠的：jq --arg 本來就會把它們編碼成 ，
+# 所以那種斷言在「完全沒有剝除」的實作上也會通過。
+uf_harness 1 "$PORT" 'evil=$(printf "AAA\033[31mRED\007BBB")' 'record_upload_failure "L" "500" "1" "1" "$evil"'
+b="$(body_of_last)"
+# 兩種形式都要檢查。第一版只比對了原始位元組，結果「完全拿掉剝除步驟」的版本
+# 照樣綠燈 —— 因為 jq --arg 會把控制位元組編碼成 \u001b 這種**純 ASCII 轉義文字**，
+# 原始位元組當然就不在 body 裡了。這個洞是把缺陷推上 CI 實跑才發現的。
+if [[ "$b" == *$'\033'* || "$b" == *$'\007'* ]]; then
+  echo "  ❌ 控制字元沒有被剝除：body 裡仍有原始控制位元組"
+  FAIL=$((FAIL + 1))
+elif printf '%s' "$b" | grep -q '\\u00'; then
+  echo "  ❌ 控制字元沒有被剝除：被 jq 編成 \\u00XX 轉義後寫進去了"
+  FAIL=$((FAIL + 1))
+else
+  echo "  ✅ 控制字元已在寫入前剝除（原始位元組與 \\u00XX 轉義形式都不存在）"
+  PASS=$((PASS + 1))
+fi
+
+# ── UTF-8 安全：截斷不可以把多位元組序列切半 ──
+long_cjk="$(python -c "print('中文錯誤訊息' * 120)" 2>/dev/null || printf '中文錯誤訊息%.0s' $(seq 1 120))"
+uf_harness 1 "$PORT" "long='$long_cjk'" 'record_upload_failure "L" "500" "1" "1" "$long"'
+n_req=$(wc -l < "$LOG" | tr -d ' ')
+b="$(body_of_last)"
+if [[ "$n_req" -eq 1 ]] && jq -e . >/dev/null 2>&1 <<< "$b" && printf '%s' "$b" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+  echo "  ✅ 跨過截斷邊界的中文內容：仍是合法 JSON 且是合法 UTF-8"
+  PASS=$((PASS + 1))
+else
+  echo "  ❌ 截斷把 UTF-8 切半了（請求數 $n_req）"
+  FAIL=$((FAIL + 1))
+fi
+
+# ── 狀態表不可用時完全不寫 ──
+uf_harness 0 "$PORT" 'record_upload_failure "L" "500" "1" "1" "{}"'
+n_req=$(wc -l < "$LOG" | tr -d ' ')
+if [[ "$n_req" -eq 0 && "$UF_RC" -eq 0 ]]; then
+  echo "  ✅ STATE_AVAILABLE=0 時一個請求都不送（結束碼 0）"
+  PASS=$((PASS + 1))
+else
+  echo "  ❌ 狀態表不可用時仍送了 $n_req 個請求（結束碼 $UF_RC）"
+  FAIL=$((FAIL + 1))
+fi
+
+# ── 故障時不空轉：第一次寫入失敗就放棄 ──
+# 這是這一片最重要的一項。大量上傳失敗最典型的原因就是 Cloudflare 不可用，
+# 若每一列都等到停滯上限才放棄，會把「有失敗但完成」的執行推成被 job timeout 砍掉。
+start_mode stall
+calls=""
+i=1
+while [[ $i -le 22 ]]; do
+  calls="$calls"$'\n''record_upload_failure "L'"$i"'" "500" "1" "1" "{}"'
+  i=$((i + 1))
+done
+printf '%s' "$calls" > "$WORK/uf_calls.txt"
+s=$(date +%s)
+UF_STALL_OVERRIDE=2 uf_harness 1 "$MODE_PORT" "$(cat "$WORK/uf_calls.txt")"
+e=$(date +%s)
+n_req=$(wc -l < "$LOG" | tr -d ' ')
+if [[ "$n_req" -le 1 && $((e - s)) -lt 10 && "$UF_RC" -eq 0 ]]; then
+  echo "  ✅ 伺服器不回應時：只送出 $n_req 個請求、$((e - s)) 秒內結束、結束碼 0（不會空轉）"
+  PASS=$((PASS + 1))
+else
+  echo "  ❌ 故障時空轉了：送出 $n_req 個請求、耗時 $((e - s)) 秒、結束碼 $UF_RC"
+  FAIL=$((FAIL + 1))
+fi
+
+# ── 上限 ──
+TARGET_PORT="$PORT"
+UF_MAX_OVERRIDE=3 uf_harness 1 "$PORT" "$(cat "$WORK/uf_calls.txt")"
+n_req=$(wc -l < "$LOG" | tr -d ' ')
+if [[ "$n_req" -eq 3 ]]; then
+  echo "  ✅ 達到上限（3）之後不再寫入：實際送出 $n_req 個請求"
+  PASS=$((PASS + 1))
+else
+  echo "  ❌ 上限沒有生效：送出 $n_req 個請求，預期 3"
+  FAIL=$((FAIL + 1))
+fi
+
+[[ -n "$MODE_PID" ]] && kill "$MODE_PID" 2>/dev/null
+
+fi
 if [[ "${SKIPPED:-0}" -gt 0 ]]; then
   echo "通過 $PASS / 失敗 $FAIL / 跳過 ${SKIPPED}（缺少 jq）"
 else
