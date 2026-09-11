@@ -335,6 +335,24 @@ KV namespace ID **不是機密**——它會出現在每一個 Cloudflare API �
 > 或 `gh workflow enable sync.yml`。官方說明：
 > [Disabling and enabling a workflow](https://docs.github.com/en/actions/managing-workflow-runs/disabling-and-enabling-a-workflow)
 
+#### 選用：自動保持活躍（keepalive）
+
+`.github/workflows/keepalive.yml` 預設**不會執行**。要啟用，到 repo 的 Settings → Secrets and variables →
+Actions → **Variables** 新增 `KEEPALIVE_ENABLED`，值設為 `true`。
+
+啟用後它每週檢查一次：預設分支最新 commit 的 committer 時間若已超過 35 天，就用 `GITHUB_TOKEN`
+推一個**不改任何檔案的空 commit**；35 天內有 commit 就什麼都不做。它不帶任何 secret、不用任何
+第三方 action，權限只有 `contents: write`，而且在上游這個 template repo 本身永遠不會執行。
+
+啟用前請先知道：
+
+- **官方文件沒有說明這種空 commit 算不算「repository 活動」。** 這是社群常見的做法，但沒有官方保證。
+- **keepalive 本身也是排程 workflow，一樣可能被停用。** 所以仍然要偶爾到 Actions 頁看一眼。
+- **如果你把 Cloudflare Workers Builds 接在這個 repo 上**，每個空 commit 都會觸發一次重新部署。
+- **如果預設分支有保護規則**（必須透過 PR、必須通過檢查），它的推送會失敗、執行會變紅。這時請
+  關掉 keepalive，**不要為了讓它通過而改給它 PAT 或更高權限**：這個 job 能改到每小時帶著
+  Cloudflare token 執行的 `sync.sh`，權限越高，出事時的範圍越大。
+
 ## 日常操作
 
 ### 白名單與自訂封鎖清單

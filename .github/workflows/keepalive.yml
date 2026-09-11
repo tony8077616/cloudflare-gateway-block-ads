@@ -1,0 +1,132 @@
+name: Keepalive (optional)
+
+# OPT-IN ONLY. This workflow does nothing unless the repository variable
+# KEEPALIVE_ENABLED is set to "true" (Settings > Secrets and variables > Actions > Variables).
+#
+# Why it exists: GitHub disables scheduled workflows in a public repository after 60 days
+# without repository activity, and sync.yml never commits. When enabled, this job pushes an
+# empty commit (same tree, no file changes) only when the head of the default branch is older
+# than SKIP_IF_RECENT_DAYS days. GitHub's docs do not define "repository activity", so this is
+# best effort, not a guarantee. See the README.
+#
+# Security notes. This is the only job in the repository that holds a write token:
+# - No third-party actions and no secrets. Only curl and jq from the runner image.
+# - A job with contents: write could modify sync.sh, which sync.yml later runs with the
+#   Cloudflare token. That is why test/keepalive.test.sh pins this file's structure line by
+#   line and rejects any byte outside printable ASCII. Any change here must update that test.
+# - The token reaches curl only through --config - on stdin, never through argv.
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    if: vars.KEEPALIVE_ENABLED == 'true' && github.repository != 'tony8077616/cloudflare-gateway-block-ads'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Keep repository activity alive
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SKIP_IF_RECENT_DAYS: "35"
+        run: |
+          # keepalive-script-marker
+          set -euo pipefail
+
+          api() {
+            # $1 = method, $2 = path, $3 = optional JSON body.
+            # The token reaches curl only through --config - on stdin, never through argv.
+            local method="$1" path="$2" body="${3:-}"
+            if [[ -n "$body" ]]; then
+              printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN" | curl -q -sS --fail-with-body \
+                --connect-timeout 15 --speed-limit 1 --speed-time 30 --config - \
+                -X "$method" -H "Accept: application/vnd.github+json" \
+                -H "Content-Type: application/json" --data "$body" \
+                "$GITHUB_API_URL$path"
+            else
+              printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN" | curl -q -sS --fail-with-body \
+                --connect-timeout 15 --speed-limit 1 --speed-time 30 --config - \
+                -X "$method" -H "Accept: application/vnd.github+json" \
+                "$GITHUB_API_URL$path"
+            fi
+          }
+
+          if [[ ! "$GH_TOKEN" =~ ^[A-Za-z0-9_]+$ ]]; then
+            echo "GH_TOKEN has unexpected characters; refusing to place it in a curl config string." >&2
+            exit 1
+          fi
+          if [[ ! "$SKIP_IF_RECENT_DAYS" =~ ^[0-9]+$ ]]; then
+            echo "SKIP_IF_RECENT_DAYS must be a whole number of days." >&2
+            exit 1
+          fi
+
+          repo_json="$(api GET "/repos/$REPO")"
+          default_branch="$(jq -r '.default_branch // empty' <<< "$repo_json")"
+          if [[ ! "$default_branch" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "Default branch name is empty or has unexpected characters; refusing." >&2
+            exit 1
+          fi
+          if [[ "${GITHUB_REF:-}" != "refs/heads/$default_branch" ]]; then
+            echo "Runs only on the default branch ($default_branch), not ${GITHUB_REF:-unset}." >&2
+            exit 1
+          fi
+
+          # Read the branch exactly once and take both parent and tree from that one commit.
+          # Reading it twice would let a concurrent push produce a commit whose parent is the new
+          # head but whose tree is the old one. A normal branch update accepts that as a fast
+          # forward and silently reverts the other push.
+          ref_json="$(api GET "/repos/$REPO/git/ref/heads/$default_branch")"
+          head_sha="$(jq -r '.object.sha // empty' <<< "$ref_json")"
+          if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Could not read the head commit of $default_branch." >&2
+            exit 1
+          fi
+          commit_json="$(api GET "/repos/$REPO/git/commits/$head_sha")"
+          tree_sha="$(jq -r '.tree.sha // empty' <<< "$commit_json")"
+          committer_date="$(jq -r '.committer.date // empty' <<< "$commit_json")"
+          if [[ ! "$tree_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Could not read the tree of $head_sha." >&2
+            exit 1
+          fi
+
+          # Skip when the head commit is recent. A date in the future, or one that does not parse,
+          # is treated as stale on purpose: failing toward committing is safer than silently
+          # skipping forever.
+          now="$(date -u +%s)"
+          if [[ -n "$committer_date" ]] && head_epoch="$(date -u -d "$committer_date" +%s 2>/dev/null)"; then
+            if (( head_epoch <= now + 86400 )) && (( now - head_epoch < SKIP_IF_RECENT_DAYS * 86400 )); then
+              echo "Head of $default_branch was committed at $committer_date; nothing to do."
+              exit 0
+            fi
+          fi
+
+          message="chore: keepalive (no file changes; keeps scheduled workflows enabled)"
+          payload="$(jq -n --arg m "$message" --arg t "$tree_sha" --arg p "$head_sha" '{message: $m, tree: $t, parents: [$p]}')"
+          new_json="$(api POST "/repos/$REPO/git/commits" "$payload")"
+          new_sha="$(jq -r '.sha // empty' <<< "$new_json")"
+          new_tree="$(jq -r '.tree.sha // empty' <<< "$new_json")"
+          new_parent="$(jq -r '.parents[0].sha // empty' <<< "$new_json")"
+          if [[ ! "$new_sha" =~ ^[0-9a-f]{40}$ || "$new_tree" != "$tree_sha" || "$new_parent" != "$head_sha" ]]; then
+            echo "The created commit does not match the pinned head and tree; not updating the branch." >&2
+            exit 1
+          fi
+
+          update="$(jq -n --arg s "$new_sha" '{sha: $s}')"
+          updated="$(api PATCH "/repos/$REPO/git/refs/heads/$default_branch" "$update")"
+          if [[ "$(jq -r '.object.sha // empty' <<< "$updated")" != "$new_sha" ]]; then
+            echo "The branch update did not land." >&2
+            exit 1
+          fi
+          echo "Pushed keepalive commit $new_sha to $default_branch."
