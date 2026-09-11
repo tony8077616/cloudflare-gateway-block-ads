@@ -458,7 +458,11 @@ REAL_CURL="$(command -v curl)"
 mkdir -p "$WORK/bin"
 cat > "$WORK/bin/curl" <<'WRAPEOF'
 #!/usr/bin/env bash
-printf '%s\037' "$@" >> "$CURL_ARGV_LOG"
+# %q 而不是 %s：--data 送出的 JSON 會含換行。用 %s 的話一次呼叫會佔好幾行，
+# 下面「用行數算呼叫次數」就會算錯 —— 第一版就是這樣，CI 上 5 次呼叫被算成 13 行。
+# %q 把換行寫成 $'\n' 這種跳脫形式，一次呼叫固定只佔一行；--config、- 與 token
+# 本身都沒有需要跳脫的字元，所以另外兩條斷言不受影響。
+printf '%q\037' "$@" >> "$CURL_ARGV_LOG"
 printf '\n' >> "$CURL_ARGV_LOG"
 exec "$REAL_CURL" "$@"
 WRAPEOF
