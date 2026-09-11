@@ -521,7 +521,7 @@ detect_repo() {
   if [[ "$GH_REPO" == "$TEMPLATE_UPSTREAM" ]]; then
     if [[ "$MODE" == "provision" ]]; then
       bad "這個 clone 指向的是本 template 的上游 $TEMPLATE_UPSTREAM。"
-      info "你要先在 GitHub 上按 Use this template（或 fork）建立自己的 repo，把 origin 換成它，再跑 --provision。"
+      info "你要先在 GitHub 上按 Use this template 建立自己的 repo（不建議 fork：GitHub 對 fork 預設停用排程 workflow），把 origin 換成它，再跑 --provision。"
       info "直接對上游寫 secret 不是你想做的事（多半也會因為沒有權限而失敗）。"
     else
       soft "這個 clone 指向本 template 的上游 $TEMPLATE_UPSTREAM。--check 沒問題，但 --provision 會拒絕執行。"
@@ -1114,7 +1114,7 @@ provision() {
   fi
   if [[ "$GH_REPO" == "$TEMPLATE_UPSTREAM" ]]; then
     die "這個 clone 指向本 template 的上游 $TEMPLATE_UPSTREAM。
-    請先在 GitHub 上用 Use this template（或 fork）建立你自己的 repo、把 origin 換成它，再跑 --provision。"
+    請先在 GitHub 上用 Use this template 建立你自己的 repo（不建議 fork：GitHub 對 fork 預設停用排程 workflow）、把 origin 換成它，再跑 --provision。"
   fi
 
   printf '\n' >&2

@@ -185,8 +185,9 @@ flowchart TD
 
 ### 開始之前（兩條路徑都一樣）
 
-1. **先建立你自己的 repo。** 按 **Use this template**（或 fork）。
-   這不只是禮貌問題：`setup.sh --provision` 偵測到 `origin` 還指著上游會**直接拒絕執行**，
+1. **先建立你自己的 repo。** 按 **Use this template**。**不建議 fork**：GitHub 對 fork 預設會
+   停用排程 workflow，每小時同步從一開始就不會跑（詳見下面「第一次執行」）。
+   建立自己的 repo 也不只是禮貌問題：`setup.sh --provision` 偵測到 `origin` 還指著上游會**直接拒絕執行**，
    因為那些 secret 會被寫到別人的 repo 上（或直接失敗）。
 
 2. **一個 Cloudflare 帳戶，並啟用 Zero Trust（Gateway）。**
@@ -317,6 +318,22 @@ KV namespace ID **不是機密**——它會出現在每一個 Cloudflare API �
 > 到這一步之前，所有的綠燈都只代表「讀得到」。Token 的 **Edit（寫入）權限**要到第一次
 > 真正同步才會被證明 —— `setup.sh` 刻意不用「建一個測試清單再刪掉」去驗證寫入權限，
 > 因為那本身就是一次帳戶變更，跟 `--check` 的唯讀承諾直接衝突。
+
+> **排程可能被 GitHub 停用，而且停用之後不會有明顯症狀。** 兩種情況官方文件都有明寫：
+>
+> - **用 fork 建立的 repo，排程 workflow 預設是停用的。** 所以上面第一步建議用
+>   Use this template。已經 fork 了的話，先到 Actions 頁啟用 workflow 再手動觸發。
+> - **公開 repo 若 60 天內沒有任何 repository 活動，排程 workflow 會被自動停用。**
+>   這個專案的同步只讀不寫、從不 commit，不要指望它自己維持存活 —— 「設好之後就放著
+>   不管」正好是最容易踩到這條規則的用法。
+>
+> 停用之後 Gateway 上的舊清單仍會繼續擋，所以你不會注意到任何異常 —— 只是新出現的
+> 廣告與惡意網域從此不再被加進去。官方文件沒有逐項說明什麼算「活動」，也沒有說停用前後
+> 會不會通知你，所以最可靠的做法是偶爾到 Actions 頁看一眼最近一次執行的時間。
+>
+> 重新啟用：Actions → **Sync ad-block lists to Cloudflare Gateway** → **Enable workflow**，
+> 或 `gh workflow enable sync.yml`。官方說明：
+> [Disabling and enabling a workflow](https://docs.github.com/en/actions/managing-workflow-runs/disabling-and-enabling-a-workflow)
 
 ## 日常操作
 
@@ -574,7 +591,8 @@ bash test/whitelist-empty.test.sh   # 白名單扣除：空白名單不可以把
 | 某網站被誤擋 | `./manage.sh find <domain>` 找出是哪一個來源造成的，再決定加白名單還是修解析器 |
 | 掃不到網域但確定被擋 | 十之八九是被 Cloudflare 原生分類擋掉的（目前 54,742 筆），`find` 會告訴你 |
 | 排程一直「略過」 | 正常。來源沒變動就不做事。要強制執行請用 `force` |
-| 清單上傳失敗 | `./manage.sh failures` 會列出診斷紀錄（時間、清單名、HTTP 狀態、受影響網域數、錯誤內容）。執行日誌裡每一份也都有 `⚠` 警告。若紀錄比日誌裡的警告少，看下一列 |
+| 清單很久沒更新，Actions 也沒有最近的執行紀錄 | 排程可能已被 GitHub 停用：fork 預設停用、公開 repo 60 天沒有活動也會自動停用（見「第一次執行」）。到 Actions 頁看這個 workflow 是否標示為停用，按 **Enable workflow** 或 `gh workflow enable sync.yml` |
+| 清單上傳失敗 | `./manage.sh failures` 會列出診斷紀錄（時間、清單名、HTTP 狀態、受影響網域數、錯誤內容）。執行日誌裡每一份也都有 `⚠` 警告。若紀錄比日誌裡的警告少，那是刻意的上限，見 [D1 資料表](#d1-資料表) 的 `upload_failures` 那一列 |
 | 儀表板出現「其他／未歸類」 | Cloudflare 回了對照表裡沒有的判定代碼。看明細的「判定」欄取得代碼與政策名稱，補進 `worker/src/index.js` 的 `DECISION` |
 | 儀表板查詢失敗且提到權限 | `CF_API_TOKEN` 缺少 `Account Analytics: Read` |
 | 日誌收折標記錯位 | workflow 必須是 `./sync.sh 2>&1`。`log`/`warn` 與 `::group::` 都寫 stderr，不合流會因緩衝差異而錯位 |
