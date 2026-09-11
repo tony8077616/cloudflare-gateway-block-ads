@@ -58,6 +58,11 @@ jobs:
       - name: CF_API_TOKEN 格式閘門
         run: bash test/token-gate.test.sh
 
+      # 選用式保活 workflow 是 repo 裡唯一持有寫入權限 token 的 job，
+      # 它的每一行結構都由這項測試釘死，並對著模擬的 GitHub API 實際跑一次。
+      - name: 選用式保活的守門與行為
+        run: bash test/keepalive.test.sh
+
       - name: Worker 邏輯測試
         run: node worker/test/worker.test.mjs
 
