@@ -9,6 +9,13 @@ name: Keepalive (optional)
 # than SKIP_IF_RECENT_DAYS days. GitHub's docs do not define "repository activity", so this is
 # best effort, not a guarantee. See the README.
 #
+# There is exactly one gate: KEEPALIVE_ENABLED. This workflow used to carry a second one
+# that excluded this repository by name, from back when this repository was only a template
+# and the production sync ran from a separate private repository. That repository is gone
+# and the production sync now runs here, so the name gate would have meant keepalive could
+# never run on the one repository whose scheduled sync depends on staying enabled.
+# test/keepalive.test.sh pins the absence of any such gate; see the readd-repo-gate case.
+#
 # Security notes. This is the only job in the repository that holds a write token:
 # - No third-party actions and no secrets. Only curl and jq from the runner image.
 # - A job with contents: write could modify sync.sh, which sync.yml later runs with the
@@ -29,7 +36,7 @@ concurrency:
 
 jobs:
   keepalive:
-    if: vars.KEEPALIVE_ENABLED == 'true' && github.repository != 'tony8077616/cloudflare-gateway-block-ads'
+    if: vars.KEEPALIVE_ENABLED == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:

@@ -64,7 +64,7 @@ EXPECTED = [
     '  cancel-in-progress: false',
     'jobs:',
     '  keepalive:',
-    "    if: vars.KEEPALIVE_ENABLED == 'true' && github.repository != 'tony8077616/cloudflare-gateway-block-ads'",
+    "    if: vars.KEEPALIVE_ENABLED == 'true'",
     '    runs-on: ubuntu-24.04',
     '    timeout-minutes: 5',
     '    permissions:',
@@ -214,6 +214,7 @@ text = open(src, 'rb').read().replace(b'\r\n', b'\n').decode('ascii')
 MARKER = '          # keepalive-script-marker\n'
 STEPS = '    steps:\n'
 REPO = '          REPO: ${{ github.repository }}\n'
+IFLINE = "    if: vars.KEEPALIVE_ENABLED == 'true'\n"
 ON = 'on:\n  schedule:\n    - cron: "17 4 * * 1"\n  workflow_dispatch:\n'
 JOBPERM = '    permissions:\n      contents: write\n'
 THRESH = re.compile(r'(          SKIP_IF_RECENT_DAYS: ")([0-9]+)(")')
@@ -231,6 +232,12 @@ if name == 'crlf':
     out = text.replace('\n', '\r\n').encode('ascii')
 elif name == 'add-uses-step':
     out = once(text, STEPS, STEPS + '      - uses: evil/a@v1\n')
+elif name == 'readd-repo-gate':
+    # The gate this slice removed. Reintroducing it would make keepalive silently never
+    # run on this repository, which is the one that needs it.
+    out = once(text, IFLINE,
+               "    if: vars.KEEPALIVE_ENABLED == 'true' && "
+               "github.repository != 'tony8077616/cloudflare-gateway-block-ads'\n")
 elif name == 'add-secret-env':
     out = once(text, REPO, REPO + '          EVIL: ${{ secrets.X }}\n')
 elif name == 'force-in-body':
@@ -318,6 +325,7 @@ check_rejected() {
 
 check_rejected add-uses-step    skeleton
 check_rejected add-secret-env   skeleton
+check_rejected readd-repo-gate  skeleton
 check_rejected force-in-body    body-force
 check_rejected expr-in-body     body-expression
 check_rejected add-pr-trigger   skeleton
@@ -354,7 +362,7 @@ for phrase in \
   "keepalive 本身也是排程 workflow" \
   "Workers Builds" \
   "不要為了讓它通過而改給它 PAT" \
-  "上游這個 template repo 本身永遠不會執行"; do
+  "唯一的開關就是"; do
   if ! grep -qF -- "$phrase" "$README"; then
     bad "README 缺少：$phrase"
     readme_ok=0
