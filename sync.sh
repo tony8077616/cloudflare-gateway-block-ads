@@ -1324,8 +1324,52 @@ report_category_breakdown() {
 # ── 7. Cloudflare Gateway 清單上傳 ────────────────────────
 
 get_existing_lists() {
-  cf_curl GET "/accounts/$CF_ACCOUNT_ID/gateway/lists" \
-    | jq -r --arg prefix "$LIST_PREFIX" '.result[] | select(.name | startswith($prefix)) | "\(.id) \(.name)"'
+  # 成功：每行「id name」印到 stdout。**零份也算成功** —— 那是第一次安裝的必經路徑。
+  # 失敗：不印任何東西到 stdout，回傳 1。
+  #
+  # 這裡曾經是本檔**唯一一個沒有檢查回應**的 Cloudflare 呼叫：輸出直接接進 jq，
+  # 而呼叫端用行程替換讀它，於是離開狀態被整個丟掉。後果是 401／500／HTML 錯誤頁
+  # 通通變成「零份清單」，被下游解讀成「Gateway 上還沒有任何清單」，接著在既有
+  # 225 份清單還在的情況下另外新建一整批，再把 policy 改成只指向新的那批。
+  # 兩道空清單守衛都不會攔：上傳的網域數與清單數都很大，它們只看「是不是 0」。
+  local resp
+  resp=$(cf_curl GET "/accounts/$CF_ACCOUNT_ID/gateway/lists")
+
+  if ! is_valid_json <<< "$resp"; then
+    # curl 掛掉（空輸出）、HTML 錯誤頁、被截斷的 JSON 都會落在這裡。
+    warn "列舉 Gateway 清單失敗：回應不是合法的 JSON"
+    return 1
+  fi
+  if [[ "$(jq -r '.success' <<< "$resp")" != "true" ]]; then
+    # 只取數字錯誤碼。回應內容本身不取 —— 失敗時可能是錯誤頁，而這是公開 repo 的日誌。
+    local err_code
+    err_code=$(jq -r '.errors[0].code // empty' <<< "$resp" 2>/dev/null)
+    [[ "$err_code" =~ ^[0-9]+$ ]] || err_code=""
+    warn "列舉 Gateway 清單失敗：Cloudflare 回報 success 不是 true${err_code:+（錯誤碼 $err_code）}"
+    return 1
+  fi
+  if ! jq -e '.result | type == "array"' <<< "$resp" >/dev/null 2>&1; then
+    # success 是 true 但 result 不是陣列。把這種回應當成「零份」，結果就是上面那場災難，
+    # 所以寧可中止。全新安裝時 Cloudflare 回的是空陣列 []，會通過這道檢查。
+    warn "列舉 Gateway 清單失敗：success 是 true，但 result 不是陣列"
+    return 1
+  fi
+
+  # 截斷守衛。這個端點目前（2026-09 實測）**不回** result_info，所以這段今天不會觸發；
+  # 寫上去是因為一旦 Cloudflare 日後改成分頁，只讀到第一頁就會被當成「世界的全貌」，
+  # 那是上面那場災難的另一個入口。理由跟 _load_domain_column 的筆數比對同一個。
+  local total_count actual_count
+  total_count=$(jq -r '.result_info.total_count // empty' <<< "$resp")
+  if [[ "$total_count" =~ ^[0-9]+$ ]]; then
+    actual_count=$(jq -r '.result | length' <<< "$resp")
+    if [[ "$total_count" != "$actual_count" ]]; then
+      warn "列舉 Gateway 清單失敗：Cloudflare 回報共 $total_count 份，本次只拿到 $actual_count 份（疑似分頁截斷）"
+      return 1
+    fi
+  fi
+
+  jq -r --arg prefix "$LIST_PREFIX" \
+    '.result[] | select(.name | startswith($prefix)) | "\(.id) \(.name)"' <<< "$resp"
 }
 
 # ── 穩定槽位（stable slot）清單模型 ─────────────────────
@@ -1349,15 +1393,32 @@ fetch_slot_membership() {
   mkdir -p "$TMP_DIR/slot"
   : > "$TMP_DIR/slot_ids.txt"
 
+  # 先收進檔案再讀。原本寫的是 `done < <(get_existing_lists)` —— 行程替換會把列舉的
+  # 離開狀態整個丟掉，於是「讀取失敗」與「真的沒有清單」變得完全無法分辨。
+  local lists_file="$TMP_DIR/existing_lists.txt"
+  if ! get_existing_lists > "$lists_file"; then
+    return 1
+  fi
+
   local id name idx
   while read -r id name; do
     idx=$(echo "$name" | grep -oE '[0-9]+$' | sed 's/^0*//')
     [[ -n "$idx" ]] && printf '%s\t%s\n' "$idx" "$id" >> "$TMP_DIR/slot_ids.txt"
-  done < <(get_existing_lists)
+  done < "$lists_file"
 
   local total
   total=$(wc -l < "$TMP_DIR/slot_ids.txt" | xargs)
   if [[ $total -eq 0 ]]; then
+    # 零份只有在第一次安裝時才說得通。如果上一次同步留下了狀態、這次卻讀到零份，
+    # 那是矛盾：可能是回應的形狀變了（success 仍是 true，於是通過了上面的檢查），
+    # 也可能是清單真的被刪光了。兩種都不該用「當成全新安裝」來收場 ——
+    # 那會在既有清單還在的情況下另建一整批，正是這個切片要防的事。
+    #
+    # 真的想從零重建（例如你手動刪光了清單）就帶 REBUILD_SLOTS=1 執行一次。
+    if [[ "${STATE_AVAILABLE:-0}" -eq 1 && -s "${PREV_STATE_FILE:-/dev/null}" && "${REBUILD_SLOTS:-0}" != "1" ]]; then
+      warn "Gateway 上讀到零份清單，但上一次同步留有狀態，兩者矛盾"
+      return 1
+    fi
     log "Gateway 上還沒有任何清單，全部視為新建"
     return 0
   fi
@@ -1573,9 +1634,32 @@ ensure_policy() {
     traffic="${traffic}any(dns.domains[*] in \$$lid)"
   done < "$list_ids_file"
 
+  # 查詢現有規則。這裡跟 get_existing_lists 是同一個形狀的坑：原本沒有任何檢查，
+  # 查詢失敗會讓 existing_id 變成空的，於是走下面的 POST **再建一條同名 policy**。
+  # 帳戶上就有兩條封鎖規則，之後每次同步只更新其中一條（head -1 挑到哪條不一定），
+  # 另一條繼續用舊內容生效，而且沒有任何地方會提醒你。
+  local rules_resp
+  rules_resp=$(cf_curl GET "/accounts/$CF_ACCOUNT_ID/gateway/rules")
+  if ! is_valid_json <<< "$rules_resp"; then
+    echo "❌ 查詢現有 Gateway 規則失敗：回應不是合法的 JSON，中止（不新建 policy）" >&2
+    return 1
+  fi
+  if [[ "$(jq -r '.success' <<< "$rules_resp")" != "true" ]]; then
+    local rules_err
+    rules_err=$(jq -r '.errors[0].code // empty' <<< "$rules_resp" 2>/dev/null)
+    [[ "$rules_err" =~ ^[0-9]+$ ]] || rules_err=""
+    echo "❌ 查詢現有 Gateway 規則失敗：success 不是 true${rules_err:+（錯誤碼 $rules_err）}，中止（不新建 policy）" >&2
+    return 1
+  fi
+  if ! jq -e '.result | type == "array"' <<< "$rules_resp" >/dev/null 2>&1; then
+    echo "❌ 查詢現有 Gateway 規則失敗：success 是 true 但 result 不是陣列，中止（不新建 policy）" >&2
+    return 1
+  fi
+
+  # 到這裡「查得到但沒有同名規則」是合法的第一次安裝，existing_id 空就走 POST。
   local existing_id
-  existing_id=$(cf_curl GET "/accounts/$CF_ACCOUNT_ID/gateway/rules" \
-    | jq -r --arg name "$POLICY_NAME" '.result[] | select(.name == $name) | .id' | head -1)
+  existing_id=$(jq -r --arg name "$POLICY_NAME" \
+    '.result[] | select(.name == $name) | .id' <<< "$rules_resp" | head -1)
 
   local body
   body=$(jq -n --arg name "$POLICY_NAME" --arg traffic "$traffic" \
@@ -1589,7 +1673,13 @@ ensure_policy() {
   fi
 
   if ! is_valid_json <<< "$resp" || [[ "$(jq -r '.success' <<< "$resp")" != "true" ]]; then
-    echo "❌ Policy 更新失敗：$resp" >&2
+    # 這裡原本印的是整個 $resp。失敗時回應可能是上游代理的 HTML 錯誤頁、可能帶請求
+    # 中繼資料，而這個 repo 的 Actions 日誌是公開可讀的 —— 本檔別處早就寫過這條規則
+    # （「訊息刻意不帶回應內容」），只有這裡沒遵守。改成只印數字錯誤碼。
+    local policy_err
+    policy_err=$(jq -r '.errors[0].code // empty' <<< "$resp" 2>/dev/null)
+    [[ "$policy_err" =~ ^[0-9]+$ ]] || policy_err=""
+    echo "❌ Policy 更新失敗${policy_err:+（錯誤碼 $policy_err）}" >&2
     return 1
   fi
   local list_count
@@ -1906,7 +1996,19 @@ main() {
   # 穩定槽位：先讀回 Gateway 上每份清單目前的成員，算出「哪幾份真的要改」，
   # 只重傳那幾份。移除一個網域只會動到它所在的那一份。
   group_begin "同步 Gateway 清單"
-  fetch_slot_membership
+  if ! fetch_slot_membership; then
+    group_end
+    echo "❌ 讀不到 Gateway 上現有的清單，中止本次同步" >&2
+    echo "   這不等於「Gateway 上沒有清單」。真的沒有清單是合法狀態，會走全新建立；" >&2
+    echo "   讀不到則無從得知現況，硬做下去會在既有清單還在的情況下另外建立一整批，" >&2
+    echo "   並把 Policy 改成只指向新的那批。" >&2
+    echo "   Gateway 上現有的清單與 Policy 都沒有被動到，仍然生效。" >&2
+    echo "   從 API token 的 Zero Trust Gateway 權限查起：./setup.sh --check" >&2
+    record_sync_history "failed" "gateway list enumeration failed" \
+      "$total_merged" "0" "$excluded_by_native" "$whitelisted_count"
+    write_step_summary "failed" "$total_merged" "0" "讀不到 Gateway 現有清單，已中止，沒有對 Gateway 做任何變更"
+    exit 1
+  fi
   plan_slot_changes "$final_file"
   local list_ids_file="$TMP_DIR/final_list_ids.txt"
   sync_slots > "$list_ids_file"
