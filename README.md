@@ -342,7 +342,7 @@ Actions → **Variables** 新增 `KEEPALIVE_ENABLED`，值設為 `true`。
 
 啟用後它每週檢查一次：預設分支最新 commit 的 committer 時間若已超過 35 天，就用 `GITHUB_TOKEN`
 推一個**不改任何檔案的空 commit**；35 天內有 commit 就什麼都不做。它不帶任何 secret、不用任何
-第三方 action，權限只有 `contents: write`，而且在上游這個 template repo 本身永遠不會執行。
+第三方 action，權限只有 `contents: write`。唯一的開關就是 `KEEPALIVE_ENABLED`。
 
 啟用前請先知道：
 
