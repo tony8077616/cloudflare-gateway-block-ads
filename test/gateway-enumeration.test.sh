@@ -52,8 +52,13 @@ done
 
 # 確認抽到的真的是我們要驗的那段邏輯。守衛被拿掉時，這裡要先大聲失敗，
 # 而不是讓下面每個「應該中止」的斷言默默通過。
+# 注意這兩個標記為什麼要分開寫成「帶變數名」的形式：`.result | type == "array"`
+# 在 sync.sh 裡有**兩個副本**（get_existing_lists 用 $resp、ensure_policy 用 $rules_resp）。
+# 只檢查沒帶變數名的字串時，拿掉其中一個副本另一個仍然匹配，這道自我驗證就形同虛設 ——
+# 實際發生過：獨立驗證示範了拿掉 ensure_policy 那個副本，整組測試照樣全綠。
 for marker in \
-  'result | type == "array"' \
+  'type == "array".* <<< "\$resp"' \
+  'type == "array".* <<< "\$rules_resp"' \
   'result_info.total_count' \
   'REBUILD_SLOTS' \
   '不新建 policy'
@@ -221,6 +226,20 @@ else
   echo "  ❌ 規則查詢失敗時竟然送出了 POST —— 這正是會建出重複 policy 的那條路"; FAIL=$((FAIL + 1))
 fi
 
+# 規則查詢的 success 是 true、但結構壞掉（result 是物件）。
+# 這是三種失敗裡最陰的一種：jq 迭代空物件不報錯、回傳 0，existing_id 會是空的，
+# 於是照樣走 POST 新建第二條同名 policy —— 而且沒有任何錯誤訊息。
+# 少了這一組，拿掉 ensure_policy 裡那道結構斷言整組測試照樣全綠（獨立驗證實測過）。
+D=$(scenario pol_shape); printf 'id1\n' > "$D/ids.txt"
+printf '{"success":true,"result":{}}' > "$D/rules.json"
+OUT="$(run "$D" "" ensure_policy "$D/ids.txt")"
+check "規則查詢 success=true 但結構壞掉 → 中止" "1/-" "$OUT"
+if [[ "$(posted "$D")" == "0" ]]; then
+  echo "  ✅ 結構壞掉時也沒有送出 POST"; PASS=$((PASS + 1))
+else
+  echo "  ❌ 結構壞掉時送出了 POST —— 會靜默建出第二條 policy"; FAIL=$((FAIL + 1))
+fi
+
 # 查得到、但還沒有同名規則 → 合法的第一次安裝，要走 POST。
 D=$(scenario pol_first); printf 'id1\n' > "$D/ids.txt"
 printf '{"success":true,"result":[]}' > "$D/rules.json"
@@ -273,6 +292,16 @@ D=$(scenario cf_c); printf 'src:foo\tabc\n' > "$D/prev_state.txt"
 counterfactual "零份矛盾檢查" \
   's/^    if \[\[ "\${STATE_AVAILABLE:-0}" -eq 1 .*$/    if false; then/' \
   "$D" 1 fetch_slot_membership
+
+# B2：拿掉 **ensure_policy 裡那一道**結構斷言（不是 get_existing_lists 裡那道）。
+# 這是獨立驗證找出來的第三個變異：原本它能讓整組測試維持全綠，
+# 卻讓「success 是 true 但結構壞掉」的規則查詢照樣走 POST，靜默建出第二條 policy。
+# sed 樣式刻意用 $rules_resp 定位，避免又打到另一個副本。
+D=$(scenario cf_b2); printf 'id1\n' > "$D/ids.txt"
+printf '{"success":true,"result":{}}' > "$D/rules.json"
+counterfactual "ensure_policy 的結構斷言（獨立驗證找到的第三個變異）" \
+  's/^  if ! jq -e .\.result | type == "array". <<< "\$rules_resp" >\/dev\/null 2>&1; then$/  if false; then/' \
+  "$D" 1 ensure_policy "$D/ids.txt"
 
 # D：天真實作 ——「列舉到零份就一律當失敗」。
 # 它會通過上面每一個失敗案例，但會讓**全新安裝**裝不起來。這是這支測試真正要守的東西。
