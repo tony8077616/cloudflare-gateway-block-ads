@@ -12,6 +12,11 @@
 #   7. 更新 Policy、寫入同步紀錄到 D1
 #
 # 設計原則：單一來源/單一批次操作失敗不中斷整個流程（best effort）。
+#
+# 這條原則有一個例外，界線是「衍生資料 vs 權威輸入」：
+#   衍生資料（checksum、ETag、額度計數、分類快取）讀不到就重算，代價是慢，結果仍然正確；
+#   權威輸入（D1 的白名單、自訂封鎖清單）讀不到就沒有安全的預設值 —— 當成空的會把
+#   使用者明確放行的網域封回去。後者一律中止，讓 Gateway 上前一次的清單繼續生效。
 # ============================================================
 
 set -uo pipefail
@@ -868,24 +873,87 @@ decide_should_sync() {
 
 # ── 4. D1：白名單 / 自訂封鎖清單 ──────────────────────────
 
+# 這兩份清單是**使用者的權威輸入**，不是可以重算的衍生資料。讀不到的時候沒有任何
+# 安全的預設值：當成空的，就會把使用者明確放行的網域全部封回去，而且只留一行警告。
+# 所以它們是本檔 best-effort 原則的例外 —— 讀取失敗回傳非 0，由呼叫端中止整趟同步。
+# 什麼都不做時，Gateway 上前一次那份正確的清單仍然生效，那才是真正的 last-known-good；
+# D1 裡沒有任何可以拿來頂替的備份（sync_state 在同一個資料庫、同一組憑證，
+# KV 快照只存分類結果不存白名單，TMP_DIR 每次執行都是全新的）。
+#
+# 這段曾經是 best effort。2026-09-04/05 的兩次線上失敗就是走這條路：token 沒有 D1
+# 權限、白名單讀不到被當成空的。當時是另一個 bug（空白名單把整份清單扣光）意外擋下了
+# 上傳；那個 bug 修掉之後，這裡就直接變成「照常上傳一份沒有套用白名單的清單」。
+_load_domain_column() {
+  # $1 = 給人看的名稱（只用於訊息）, $2 = SQL
+  # 成功：把 domain 逐行印到 stdout 並回傳 0。**零筆也算成功** —— 全新安裝的
+  #       custom_whitelist 本來就是零筆，那是第一次同步的必經路徑，不能當成失敗。
+  # 失敗：不印任何東西到 stdout，回傳 1。
+  local label="$1" sql="$2"
+  local resp attempt expected actual out err_code
+
+  # cf_curl 沒有 --retry（curl_source 才有）。既然這個讀取變成致命的，就必須自己重試，
+  # 否則單一次暫時性 5xx 或一次 stall timeout 就會殺掉整個小時的執行。
+  # 重試節奏沿用 sync_slots 既有的寫法。
+  for attempt in 1 2 3; do
+    resp=$(d1_query "$sql")
+
+    if ! is_valid_json <<< "$resp"; then
+      # curl 掛掉（空輸出）、HTML 錯誤頁、被截斷的 JSON 都會落在這裡。
+      warn "讀取${label}失敗（第 $attempt 次）：回應不是合法的 JSON"
+    elif [[ "$(jq -r '.success' <<< "$resp")" != "true" ]]; then
+      # 只取數字錯誤碼。訊息本身不取 —— 失敗時回應可能是錯誤頁，而這是公開 repo 的日誌。
+      err_code=$(jq -r '.errors[0].code // empty' <<< "$resp" 2>/dev/null)
+      [[ "$err_code" =~ ^[0-9]+$ ]] || err_code=""
+      warn "讀取${label}失敗（第 $attempt 次）：D1 回報 success 不是 true${err_code:+（錯誤碼 $err_code）}"
+    elif ! jq -e '.result[0].results | type == "array"' <<< "$resp" >/dev/null 2>&1; then
+      # 只檢查 .success 不夠。回應是 {"success":true,"result":[]} 時，
+      # .result[0].results[]?.domain 會安靜地吐出空的，跟「零筆」完全無法分辨 ——
+      # 而零筆是要放行全部的。所以先要求結果集結構上真的是一個陣列。
+      warn "讀取${label}失敗（第 $attempt 次）：回應裡沒有結構完整的結果集"
+    else
+      expected=$(jq -r '.result[0].results | length' <<< "$resp")
+      out=$(jq -r '.result[0].results[].domain // empty' <<< "$resp")
+      if [[ -z "$out" ]]; then actual=0; else actual=$(printf '%s\n' "$out" | wc -l | xargs); fi
+
+      # 筆數比對。// empty 會把 .domain 是 null（或鍵名改掉）的那幾列靜默丟掉，
+      # 47 筆進、5 行出照樣回傳 0 —— 那是「白名單只套用了一部分」，
+      # 比整份讀不到更難察覺，所以同樣視為失敗。
+      if [[ "$expected" == "$actual" ]]; then
+        [[ -n "$out" ]] && printf '%s\n' "$out"
+        return 0
+      fi
+      warn "讀取${label}失敗（第 $attempt 次）：D1 回報 $expected 筆，實際只取到 $actual 筆"
+    fi
+
+    if [[ $attempt -lt 3 ]]; then sleep $((attempt * 2)); fi
+  done
+  return 1
+}
+
 load_whitelist() {
-  local resp
-  resp=$(d1_query "SELECT domain FROM custom_whitelist")
-  if ! is_valid_json <<< "$resp" || [[ "$(jq -r '.success' <<< "$resp")" != "true" ]]; then
-    warn "讀取白名單失敗，本次視為空白名單（best effort，不中斷流程）"
-    return
-  fi
-  jq -r '.result[0].results[]?.domain // empty' <<< "$resp"
+  _load_domain_column "白名單" "SELECT domain FROM custom_whitelist"
 }
 
 load_custom_blocklist() {
-  local resp
-  resp=$(d1_query "SELECT domain FROM custom_blocklist")
-  if ! is_valid_json <<< "$resp" || [[ "$(jq -r '.success' <<< "$resp")" != "true" ]]; then
-    warn "讀取自訂封鎖清單失敗，本次視為空清單（best effort，不中斷流程）"
-    return
-  fi
-  jq -r '.result[0].results[]?.domain // empty' <<< "$resp"
+  _load_domain_column "自訂封鎖清單" "SELECT domain FROM custom_blocklist"
+}
+
+abort_on_authoritative_read_failure() {
+  # $1 = 給人看的名稱, $2 = D1 資料表名稱
+  # 訊息刻意不帶回應內容：失敗時回應可能是 HTML 錯誤頁，而這是公開 repo 的日誌。
+  # 也刻意不提 token 的任何資訊 —— 這跟 token 長度無關，加上去只會多一個洩漏面。
+  local label="$1" table="$2"
+  echo "❌ 讀取${label}（D1 資料表 $table）失敗，中止本次同步" >&2
+  echo "   這不等於「${label}是空的」。空的${label}是合法狀態，會照常放行全部網域；" >&2
+  echo "   讀不到則無從判斷該放行什麼，硬做下去會把你明確放行的網域一起封鎖。" >&2
+  echo "   Gateway 上前一次的清單沒有被動到，仍然生效。" >&2
+  echo "   從 D1 連線與 API token 的權限查起：./setup.sh --check" >&2
+  # 這一筆同樣寫在 D1，D1 故障時它也會失敗 —— 所以它是附加資訊，不是失敗訊號。
+  # 真正耐久的訊號是 exit 1：Actions 紅燈，加上 GitHub 的排程失敗通知。
+  # note 必須是固定字面字串，不可內插回應內容（record_sync_history 不做截斷與控制字元處理）。
+  record_sync_history "failed" "authoritative read failed: $table" "0" "0" "0" "0"
+  write_step_summary "failed" "0" "0" "讀取${label}失敗，已中止，沒有對 Gateway 做任何變更"
+  exit 1
 }
 
 # ── 5. D1：分類快取 ───────────────────────────────────────
@@ -1619,6 +1687,15 @@ write_step_summary() {
       echo "|---|---|"
       echo "| 來源合併後網域數 | $merged |"
       echo "| 對 Cloudflare 的變更 | 無 |"
+    elif [[ "$status" == "failed" ]]; then
+      # 沒有這一段的話，中止路徑會落到下面的 else，在 Actions 頁面印出
+      # 「✅ 同步完成」—— 一個失敗的執行配上一面綠旗，比沒有摘要更糟。
+      echo "❌ **本次中止** — $reason"
+      echo
+      echo "| 項目 | 數值 |"
+      echo "|---|---|"
+      echo "| 對 Cloudflare 的變更 | 無 |"
+      echo "| Gateway 現有清單 | 未受影響，仍然生效 |"
     else
       echo "✅ **同步完成** — $reason"
       echo
@@ -1673,10 +1750,17 @@ main() {
   collect_source_checksums
   group_end
 
+  # 這裡是中止的正確位置：到目前為止只跟 Cloudflare 做過 ensure_schema、
+  # load_daily_budget、load_sync_state，還沒有任何 Intel 分類查詢、也還沒有任何
+  # Gateway 寫入。在這裡收手，線上狀態完全沒有被動到。
   local whitelist_file="$TMP_DIR/whitelist.txt"
-  load_whitelist > "$whitelist_file"
+  if ! load_whitelist > "$whitelist_file"; then
+    abort_on_authoritative_read_failure "白名單" "custom_whitelist"
+  fi
   local custom_block_file="$TMP_DIR/custom_block.txt"
-  load_custom_blocklist > "$custom_block_file"
+  if ! load_custom_blocklist > "$custom_block_file"; then
+    abort_on_authoritative_read_failure "自訂封鎖清單" "custom_blocklist"
+  fi
 
   # 白名單/自訂封鎖清單也納入閘門判斷。否則會出現這種狀況：使用者把某個誤擋的網域
   # 加進白名單，但上游來源剛好沒變動，同步就永遠不會觸發，白名單形同沒生效。
@@ -1729,7 +1813,9 @@ main() {
   #
   # 這不是邊緣情況：custom_whitelist 沒有任何預設資料（本檔只 CREATE TABLE，唯一的
   # 寫入端是 manage.sh whitelist add），所以**全新安裝的第一次同步**白名單就是空的。
-  # load_whitelist 在 D1 讀取失敗而降級時同樣輸出空，兩條路徑都會走到這裡。
+  # 走到這裡的空白名單只剩**一種**來源：D1 讀取成功、而且真的是零筆。
+  # 讀取失敗已經在上游被 load_whitelist 擋掉並中止了，不會再流到這裡假扮成零筆 ——
+  # 那兩種情況長得一模一樣，但語意相反，這正是它們必須在上游就分開的原因。
   #
   # 用 -s 而不是把 NR==FNR 換成 FILENAME == ARGV[1]：後者依賴 awk 實作在跳過空檔案時
   # 對 FILENAME 的處理（runner 上是 mawk，使用者本機可能是 gawk），-s 與實作無關。
