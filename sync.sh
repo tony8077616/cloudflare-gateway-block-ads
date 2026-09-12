@@ -1531,6 +1531,38 @@ plan_slot_changes() {
 
   local to_remove="$TMP_DIR/to_remove.txt" to_add="$TMP_DIR/to_add.txt"
   comm -23 "$current_all" "$desired" > "$to_remove"
+
+  # 有來源抓取失敗時，「Gateway 上有、但這次的目標清單裡沒有」有兩種成因完全不同的情況：
+  #
+  #   (a) 這個網域真的該解除封鎖 —— 白名單刷掉了、被 Cloudflare 原生分類涵蓋了，
+  #       或是來源自己把它拿掉了
+  #   (b) 它只出現在這次沒抓到的那個來源裡 —— build_merged 是 `cat parsed_*.txt`，
+  #       抓失敗的來源沒有 parsed_ 檔，它的網域就整個從合併結果裡消失
+  #
+  # 兩者在這一行 comm 的輸出裡長得一模一樣。分辨的依據是「本次的合併結果裡有沒有它」：
+  # 有，代表來源這次還看得到它，是我們自己主動刷掉的，屬於有把握的移除；
+  # 沒有，就可能只是那個來源沒抓到，這一次先不要動它。
+  #
+  # 為什麼要押後而不是照做：失敗來源的 checksum 會沿用前次值（見 main 的狀態回寫，
+  # 那是為了避免下次把它誤判成「內容變動」）。於是下一次它抓成功、內容又沒變時，
+  # 閘門會判定無變動而**略過整次同步** —— 被拿掉的那些網域要等到有別的來源變動
+  # 才會被補回來。一次暫時性的抓取失敗，換來一段沒有上限的解除封鎖。
+  #
+  # 押後的代價是多封鎖一個週期，那是安全的那一邊。
+  #
+  # 已知的取捨：使用者這次剛好把某個網域從自訂封鎖清單移除，而它又不在任何來源裡時，
+  # 這次的移除也會一起被押後，要等到所有來源都抓成功的那一次才生效。
+  # 抓取失敗的來源每一次都會出現在 Job Summary 裡，所以這個狀態不會是無聲的。
+  if [[ -s "$TMP_DIR/failed_sources.txt" && -s "$TMP_DIR/merged_domains.txt" ]]; then
+    local to_remove_all="$TMP_DIR/to_remove_all.txt" held
+    mv "$to_remove" "$to_remove_all"
+    comm -12 "$to_remove_all" "$TMP_DIR/merged_domains.txt" > "$to_remove"
+    held=$(( $(wc -l < "$to_remove_all" | xargs) - $(wc -l < "$to_remove" | xargs) ))
+    if [[ $held -gt 0 ]]; then
+      warn "有來源抓取失敗，暫緩移除 $held 筆沒有出現在本次合併結果裡的網域（等所有來源都抓成功的那一次再處理）"
+    fi
+  fi
+
   comm -13 "$current_all" "$desired" > "$to_add"
   log "與 Gateway 現況比對：需移除 $(wc -l < "$to_remove" | xargs) 筆、需新增 $(wc -l < "$to_add" | xargs) 筆"
 

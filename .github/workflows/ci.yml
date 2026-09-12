@@ -71,6 +71,13 @@ jobs:
       - name: 單一槽位成員讀取失敗與空清單的分辨
         run: bash test/slot-member-read.test.sh
 
+      # 同一個形狀的最後一處，入口在來源端：抓取失敗的來源沒有 parsed_ 檔，
+      # build_merged 是 cat parsed_*.txt，它的網域就整個從合併結果消失，接著被
+      # 算成「該從 Gateway 移除」。而失敗來源的 checksum 會沿用前次值，下次它抓
+      # 成功且內容沒變時閘門會略過整次同步 —— 那些網域要等到別的來源變動才會回來。
+      - name: 來源抓取失敗與該來源網域真的消失的分辨
+        run: bash test/source-failure-removal.test.sh
+
       # 上面那些驗的是「偵測得到」。這一項驗的是「偵測到之後真的有人中止」——
       # 兩者是不同的事：PR #14 的單元測試全綠時，仍然存在兩個能讓中止形同虛設
       # 的改法（拆掉呼叫端的 if !、把 exit 改成 return），而且都通過 bash -n。
