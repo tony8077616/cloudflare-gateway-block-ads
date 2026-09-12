@@ -50,6 +50,13 @@ jobs:
       - name: 白名單扣除的回歸測試
         run: bash test/whitelist-empty.test.sh
 
+      # 上面那一項驗的是「白名單是空的時候要放行全部」。
+      # 這一項驗的是另一半：「空的」與「讀不到」必須被分開 ——
+      # 兩者在程式裡都是零行輸出，但語意相反，混為一談會把使用者
+      # 明確放行的網域封回去。2026-09-04/05 線上實際走過這條路。
+      - name: 白名單讀取失敗與零筆的分辨
+        run: bash test/whitelist-load-failure.test.sh
+
       # 這兩項驗的是「token 有沒有真的送到」與「格式不對時有沒有擋下來」。
       # 前者會起一個只綁 127.0.0.1 的小伺服器實際收請求 —— 不連外、不需要憑證。
       - name: Cloudflare 呼叫的 Authorization 標頭
