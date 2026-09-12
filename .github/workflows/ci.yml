@@ -57,6 +57,18 @@ jobs:
       - name: 白名單讀取失敗與零筆的分辨
         run: bash test/whitelist-load-failure.test.sh
 
+      # 同一個形狀的另一處，而且後果更大：列舉 Gateway 現有清單失敗如果被當成
+      # 「上面還沒有任何清單」，就會在既有 225 份還在的情況下另建一整批、
+      # 再把 Policy 改成只指向新的那批。下游兩道空清單守衛都攔不住。
+      - name: Gateway 列舉失敗與零份的分辨
+        run: bash test/gateway-enumeration.test.sh
+
+      # 上面那些驗的是「偵測得到」。這一項驗的是「偵測到之後真的有人中止」——
+      # 兩者是不同的事：PR #14 的單元測試全綠時，仍然存在兩個能讓中止形同虛設
+      # 的改法（拆掉呼叫端的 if !、把 exit 改成 return），而且都通過 bash -n。
+      - name: 中止接線
+        run: bash test/abort-wiring.test.sh
+
       # 這兩項驗的是「token 有沒有真的送到」與「格式不對時有沒有擋下來」。
       # 前者會起一個只綁 127.0.0.1 的小伺服器實際收請求 —— 不連外、不需要憑證。
       - name: Cloudflare 呼叫的 Authorization 標頭
