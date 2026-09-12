@@ -1387,6 +1387,62 @@ get_existing_lists() {
 # 這裡讀到的就是未完成的實況，這次自然會把差額補上。
 # 代價是清單內容會逐漸失去字母序，對封鎖行為沒有影響。
 
+_fetch_one_slot() {
+  # $1 = 槽位編號, $2 = 清單 id, $3 = 失敗時要寫入原因的檔案
+  #
+  # 成功：把成員（已排序去重）寫進 $TMP_DIR/slot/<idx>.txt，回傳 0。
+  # 失敗：不留下 slot/<idx>.txt，把固定字面的原因寫進 $3，回傳非 0。
+  #
+  # 「不留下檔案」是這個函式的重點。原本那版是
+  #     cf_curl GET ... | jq -r '.result[]?.value // empty' | sort -u > "$TMP_DIR/slot/$idx.txt"
+  # 重導向會先把檔案建出來，jq 的 `?` 又把壞回應吞成「沒有輸出」，於是一次暫時性
+  # 失敗就變成一份**內容為零筆的槽位檔**，跟「這份清單真的空了」完全無法分辨。
+  # 下游會把那 1000 筆當成不存在而重新分配到別的槽位，並把讀錯的那一份刪掉。
+  #
+  # 合法的零筆仍然回傳 0：剛好刪除失敗的空清單就是這個形狀，把它當成失敗會讓整次
+  # 同步卡在一份無關緊要的空清單上。分辨兩者的依據是回應的結構，不是輸出的行數。
+  local idx="$1" id="$2" reason_file="$3"
+  local out="$TMP_DIR/slot/$idx.txt" raw="$TMP_DIR/slot/$idx.raw"
+  local resp attempt expected actual total_count reason=""
+  for attempt in 1 2 3; do
+    # 每份清單上限就是 LIST_CHUNK_SIZE 筆，一頁取完，不需要分頁
+    resp=$(cf_curl GET "/accounts/$CF_ACCOUNT_ID/gateway/lists/$id/items?per_page=$LIST_CHUNK_SIZE")
+    if ! is_valid_json <<< "$resp"; then
+      reason="回應不是合法的 JSON"
+    elif [[ "$(jq -r '.success' <<< "$resp")" != "true" ]]; then
+      reason="Cloudflare 回報 success 不是 true"
+    elif ! jq -e '.result | type == "array"' <<< "$resp" >/dev/null 2>&1; then
+      # 這一道不是多餘的：.result 是 {} 的時候，jq 迭代空物件會回傳 0 且不輸出任何
+      # 東西，安安靜靜地變成「這份清單是空的」。null 至少還會讓 jq 以 5 結束。
+      reason="回應裡沒有結構完整的成員陣列"
+    else
+      expected=$(jq -r '.result | length' <<< "$resp")
+      # 筆數比對要在 sort -u 之前做：`// empty` 會把 value 是 null 的元素整個丟掉，
+      # 那種回應的行數會少於 length，而 jq 仍然以 0 結束。
+      jq -r '.result[].value // empty' <<< "$resp" > "$raw"
+      actual=$(wc -l < "$raw" | xargs)
+      total_count=$(jq -r '.result_info.total_count // empty' <<< "$resp")
+      if [[ "$expected" != "$actual" ]]; then
+        reason="Cloudflare 回報 $expected 筆，實際只取到 $actual 筆"
+      elif [[ "$total_count" =~ ^[0-9]+$ ]] && [[ "$total_count" != "$expected" ]]; then
+        # 截斷守衛。這個端點今天一頁取得完，所以這一段目前不會觸發；寫上去是因為
+        # 日後若 per_page 被 API 端壓低，只讀到第一頁會被當成這份清單的全貌，
+        # 那正是本切片要防的同一場災難，只是換一個入口。
+        reason="這一頁只有 $expected 筆，但 Cloudflare 說這份清單共有 $total_count 筆"
+      else
+        sort -u "$raw" > "$out"
+        rm -f "$raw"
+        return 0
+      fi
+    fi
+    if [[ $attempt -lt 3 ]]; then sleep $((attempt * 2)); fi
+  done
+  # 半成品與舊檔案都要清掉：留著就會被 plan_slot_changes 當成這份清單的現況。
+  rm -f "$raw" "$out"
+  printf '%s\n' "$reason" > "$reason_file"
+  return 1
+}
+
 fetch_slot_membership() {
   # 讀回每份既有清單目前的成員 → $TMP_DIR/slot/<idx>.txt（已排序）
   # 同時輸出 $TMP_DIR/slot_ids.txt（idx<TAB>list_id）
@@ -1424,13 +1480,15 @@ fetch_slot_membership() {
   fi
 
   log "讀取現有清單成員：共 $total 份"
+  # 背景子行程的離開狀態沒有任何辦法傳回來 —— 這正是原本那版把讀取失敗變成
+  # 「這份清單是空的」的原因。所以失敗改走檔案回報：每一份讀不到的清單在
+  # $fail_dir 底下留一個以槽位編號命名的檔案，內容是固定字面的原因。
+  local fail_dir="$TMP_DIR/slot_fail"
+  rm -rf "$fail_dir"
+  mkdir -p "$fail_dir"
   local running=0 done_n=0
   while IFS=$'\t' read -r idx id; do
-    {
-      # 每份清單上限就是 LIST_CHUNK_SIZE 筆，一頁取完，不需要分頁
-      cf_curl GET "/accounts/$CF_ACCOUNT_ID/gateway/lists/$id/items?per_page=$LIST_CHUNK_SIZE" \
-        | jq -r '.result[]?.value // empty' | sort -u > "$TMP_DIR/slot/$idx.txt"
-    } &
+    _fetch_one_slot "$idx" "$id" "$fail_dir/$idx" &
     running=$((running + 1))
     if [[ $running -ge $SLOT_FETCH_PARALLEL ]]; then
       wait -n 2>/dev/null || wait
@@ -1440,6 +1498,20 @@ fetch_slot_membership() {
     fi
   done < "$TMP_DIR/slot_ids.txt"
   wait
+
+  # 只要有一份讀不到，就無從得知 Gateway 的現況：那一份的網域會被當成不存在而
+  # 重新分配到別的槽位，而讀錯的那一份會因為「變成空的」被刪掉。沒有安全的預設值，
+  # 所以中止。呼叫端（main）已經備好中止收尾。
+  local failed_n rf
+  failed_n=$(find "$fail_dir" -type f 2>/dev/null | wc -l | xargs)
+  if [[ "${failed_n:-0}" -gt 0 ]]; then
+    warn "有 $failed_n 份清單的成員讀不到（每一份都已經重試 3 次）"
+    while read -r rf; do
+      [[ -n "$rf" ]] || continue
+      warn "  清單編號 $(basename "$rf")：$(head -1 "$rf")"
+    done < <(find "$fail_dir" -type f 2>/dev/null | sort | head -3)
+    return 1
+  fi
   log "  讀取進度 $total/$total（完成）"
 }
 
