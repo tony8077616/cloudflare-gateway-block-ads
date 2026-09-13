@@ -84,6 +84,13 @@ jobs:
       - name: CRLF 行尾的來源與 LF 解析結果相同
         run: bash test/crlf-source-parsing.test.sh
 
+      # 來源取得的成功定義與連線預案。curl 的離開狀態以前被忽略：--max-time 在傳輸途中
+      # 觸發時 curl 以 28 結束「但仍印出 200」，截斷的內容被當成新內容，之後的 304 讓它一直延續。
+      # 這項同時釘住：失敗的嘗試不會出現在 build_merged 讀的最上層、上游的 ETag 不能
+      # 帶著 TAB／控制字元進 D1 或 curl -H、回應本體與標頭不會進這個公開 repo 的日誌。
+      - name: 來源取得的連線預案、TXT 限制與注入防護
+        run: bash test/source-fetch-fallback.test.sh
+
       # 上面那些驗的是「偵測得到」。這一項驗的是「偵測到之後真的有人中止」——
       # 兩者是不同的事：PR #14 的單元測試全綠時，仍然存在兩個能讓中止形同虛設
       # 的改法（拆掉呼叫端的 if !、把 exit 改成 return），而且都通過 bash -n。

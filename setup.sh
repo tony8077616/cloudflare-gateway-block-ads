@@ -807,6 +807,25 @@ setup_parse() {
   esac | tr 'A-Z' 'a-z' | grep -E "$SETUP_DOMAIN_REGEX" | grep -vE "$SETUP_IPV4_REGEX"
 }
 
+SETUP_SOURCE_MAX_BYTES=$((50 * 1024 * 1024))
+
+setup_validate_text_content() {
+  # $1 = 下載到的檔案。是合格的純文字清單就回傳 0。跟 sync.sh 的 validate_text_content 同一套規則：
+  # 非空、不超過上限、不含 NUL、不是 gzip／zip、去掉 BOM 後第一個非空白行不是 HTML／XML 開頭。
+  # 絕不把檔案讀進 bash 變數；第一行只從 head -c 4096 的有界前綴取。
+  local f="$1" size nul first bom=$'\xEF\xBB\xBF'
+  [[ -f "$f" ]] || return 1
+  size="$(wc -c < "$f" | tr -d ' ')"
+  [[ "$size" -gt 0 && "$size" -le "$SETUP_SOURCE_MAX_BYTES" ]] || return 1
+  nul="$(LC_ALL=C tr -cd '\000' < "$f" | wc -c | tr -d ' ')"
+  [[ "$nul" == "0" ]] || return 1
+  if cmp -s <(head -c 2 "$f") <(printf '\037\213'); then return 1; fi
+  if cmp -s <(head -c 4 "$f") <(printf 'PK\003\004'); then return 1; fi
+  first="$(head -c 4096 "$f" | tr -d '\r' | LC_ALL=C sed "1s/^$bom//" | awk 'NF && !seen { print; seen = 1 }')"
+  if printf '%s\n' "$first" | LC_ALL=C grep -qiE '^[[:space:]]*<(!doctype|html|head|body|\?xml)'; then return 1; fi
+  return 0
+}
+
 check_one_source() {
   section "6. 抓一個來源、解析、印筆數"
   if [[ ! -f "$SOURCES_FILE" ]]; then
@@ -827,16 +846,44 @@ check_one_source() {
   info "取 sources.conf 的第一個來源：$name（$format）"
   info "$url"
 
-  local out="$TMP_DIR/one_source.txt" code=""
-  # 跟 sync.sh 的 curl_source 同一套硬化旗標：-q 不讀 ~/.curlrc、只准 https、
-  # -- 結束旗標解析（所以像 -o/tmp/pwned 這種值會被當成網址而不是旗標）。
-  code="$(curl -q -sSL --retry 2 --retry-all-errors --max-time 60 \
-    --proto '=https' --proto-redir '=https' \
-    -A "cloudflare-gateway-block-ads-sync/1.0 (setup check)" \
-    -o "$out" -w '%{http_code}' -- "$url" 2>/dev/null)" || code="000"
+  local out="$TMP_DIR/one_source.txt" code="" rc=0 m label fetched=0
+  local -a method_args=()
+  # 跟 sync.sh 的 fetch_source_with_fallback 同一套成功定義與取檔方式（獨立複製，不 source sync.sh）：
+  # curl 離開狀態必須是 0（--max-time 在傳輸途中觸發時 curl 以 28 結束「但仍印出 200」）、
+  # HTTP 200、內容通過純文字檢查。① 失敗且原因可能是連線本身時，才換 ② 重試。
+  # 硬化旗標也相同：-q 固定是第一個參數（curl 只有這樣才不讀 ~/.curlrc）、只准 https、
+  # 轉址與檔案大小有上限、-- 結束旗標解析（所以像 -o/tmp/pwned 這種值會被當成網址而不是旗標）。
+  for m in 1 2; do
+    case $m in
+      1) label="①原網址直連"
+         method_args=(-sSL --retry 2 --retry-all-errors --max-time 60) ;;
+      2) label="②換連線參數重試"
+         method_args=(-sSL --retry 1 --retry-all-errors --connect-timeout 10 --max-time 45 --http1.1 -4) ;;
+    esac
+    rm -f "$out"
+    rc=0
+    code="$(curl -q "${method_args[@]}" \
+      --proto '=https' --proto-redir '=https' \
+      --max-redirs 5 --max-filesize "$SETUP_SOURCE_MAX_BYTES" \
+      -A "cloudflare-gateway-block-ads-sync/1.0 (setup check)" \
+      -o "$out" -w '%{http_code}' -- "$url" 2>/dev/null)" || rc=$?
+    [[ "$code" =~ ^[0-9]{3}$ ]] || code="000"
+    if [[ $rc -eq 0 && "$code" == "200" ]] && setup_validate_text_content "$out"; then
+      fetched=1
+      break
+    fi
+    info "方式$label 沒有取得可用的內容（curl 離開狀態 $rc、HTTP $code）"
+    # 換下一種的條件跟 sync.sh 相同：傳輸沒完成（47 轉址過多、63 檔案過大除外）、
+    # 伺服器沒回應或忙碌（000、403、408、425、429、5xx）、200 但內容不是純文字清單。
+    if [[ $rc -ne 0 ]]; then
+      case "$rc" in 47|63) break ;; esac
+    else
+      case "$code" in 200|000|403|408|425|429|5??) : ;; *) break ;; esac
+    fi
+  done
 
-  if [[ "$code" != "200" ]]; then
-    soft "抓取失敗（HTTP $code）。單一來源抓不到不會擋住同步（sync.sh 是 best effort，會略過並記警告），但這代表你的網路或這個來源現在有問題。"
+  if [[ $fetched -ne 1 ]]; then
+    soft "抓取失敗（curl 離開狀態 $rc、HTTP $code）。單一來源抓不到不會擋住同步（sync.sh 是 best effort，會略過並記警告），但這代表你的網路或這個來源現在有問題。"
     return 0
   fi
 
