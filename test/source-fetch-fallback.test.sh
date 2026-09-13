@@ -51,7 +51,7 @@ n_vars=$(grep -cE "^($VARS)=" "$HARNESS") || n_vars=0
 for fn in byte_len has_control_chars sanitize_for_log trim validate_source_name validate_source_url \
           state_get last_header_block header_value sanitize_validator_header validate_text_content \
           parse_domains parse_adblock parse_hosts curl_source parse_source_into fetch_source_with_fallback \
-          fetch_and_merge_sources materialize_sources collect_source_checksums emit_meta_state write_step_summary; do
+          fetch_and_merge_sources materialize_sources collect_source_checksums emit_meta_state md_escape render_change_reasons write_step_summary; do
   extract_fn "$fn" > "$WORK/fn.tmp"
   [[ -s "$WORK/fn.tmp" ]] || { echo "❌ 抽取失敗：找不到函式 $fn" >&2; exit 2; }
   [[ "$(tail -n 1 "$WORK/fn.tmp")" == "}" ]] || { echo "❌ 抽取失敗：$fn 的最後一行不是收尾大括號" >&2; exit 2; }
@@ -179,7 +179,7 @@ case "$ENTRY" in
     fetch_and_merge_sources ;;
   gate_summary)
     fetch_and_merge_sources
-    write_step_summary "success" 1 1 "測試" ;;
+    write_step_summary "success" 1 1 "$(printf '來源內容變動\t%s' c21ok)" ;;
   materialize)
     materialize_sources
     collect_source_checksums

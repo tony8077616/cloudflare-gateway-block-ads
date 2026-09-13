@@ -624,6 +624,7 @@ bash test/source-failure-removal.test.sh  # 來源「這次沒抓到」不可以
 bash test/crlf-source-parsing.test.sh     # CRLF 行尾的來源必須跟 LF 解析出相同的網域
 bash test/source-fetch-fallback.test.sh   # 截斷的下載不算成功、失敗的嘗試不外洩、上游標頭不污染狀態與日誌
 bash test/source-format-detect.test.sh    # 格式自動偵測：明確格式不被糾正、打錯的格式照舊拒絕、候選不外洩
+bash test/change-reasons.test.sh          # 「偵測到變動」的原因是合法 UTF-8、依類型分組，Job Summary 有跳脫
 ```
 
 它會直接從 `sync.sh` 抽出**正在跑的那一段**來執行，而不是另外抄一份平行實作 ——

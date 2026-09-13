@@ -1096,19 +1096,23 @@ decide_should_sync() {
   # 比對本次算出的 checksum 與 sync_state 中的前次值，決定要不要繼續完整同步。
   # 回傳 0 = 要同步；1 = 可以略過。
   # $1 = 前次狀態檔（key<TAB>value）, $2 = 白名單 checksum, $3 = 自訂封鎖清單 checksum
-  # 輸出（stdout）：一行變動原因摘要，供記錄用
+  # 輸出（stdout）：每個變動原因一行「類型<TAB>項目」（項目可空），交給 render_change_reasons 呈現。
+  #
+  # 以前是在這裡用 `paste -sd'；'` 把原因接成一行。全形分號是 3 個位元組，而 paste -d 把參數當成
+  # 「逐位元組輪流使用」的分隔符清單，每個接縫只吐一個位元組 —— 不是合法的 UTF-8，
+  # 日誌上顯示成「來源內容變動 AdGuard-DNS-filter�來源內容變動 easylist�…」。
   local prev_file="$1" wl_sum="$2" bl_sum="$3"
 
   if [[ "$FORCE_SYNC" == "1" ]]; then
-    echo "FORCE_SYNC=1，略過閘門強制同步"
+    printf '%s\t%s\n' "強制同步" "FORCE_SYNC=1，略過閘門"
     return 0
   fi
   if [[ $STATE_AVAILABLE -ne 1 ]]; then
-    echo "狀態表不可用，退回完整同步"
+    printf '%s\t%s\n' "狀態表不可用" "退回完整同步"
     return 0
   fi
   if [[ ! -s "$prev_file" ]]; then
-    echo "沒有先前的 checksum 紀錄（首次啟用閘門）"
+    printf '%s\t%s\n' "首次啟用閘門" "沒有先前的 checksum 紀錄"
     return 0
   fi
 
@@ -1123,26 +1127,69 @@ decide_should_sync() {
     {
       if ($1 in failed) next
       key = "src:" $1
-      if (!(key in prev))  { print "新增來源 " $1; next }
-      if (prev[key] != $2) { print "來源內容變動 " $1 }
+      if (!(key in prev))  { print "新增來源\t" $1; next }
+      if (prev[key] != $2) { print "來源內容變動\t" $1 }
     }
   ' "$prev_file" "$TMP_DIR/failed_sources.txt" "$TMP_DIR/source_checksums.txt")
 
   local prev_wl prev_bl
   prev_wl=$(awk -F'\t' '$1=="whitelist"{print $2}' "$prev_file")
   prev_bl=$(awk -F'\t' '$1=="blocklist"{print $2}' "$prev_file")
-  [[ "$prev_wl" != "$wl_sum" ]] && changed="${changed}${changed:+$'\n'}白名單有變動"
-  [[ "$prev_bl" != "$bl_sum" ]] && changed="${changed}${changed:+$'\n'}自訂封鎖清單有變動"
+  [[ "$prev_wl" != "$wl_sum" ]] && changed="${changed}${changed:+$'\n'}白名單有變動"$'\t'
+  [[ "$prev_bl" != "$bl_sum" ]] && changed="${changed}${changed:+$'\n'}自訂封鎖清單有變動"$'\t'
 
   if [[ $DEFERRED_BACKLOG -gt 0 && $(d1_budget_left) -gt 0 ]]; then
-    changed="${changed}${changed:+$'\n'}有 $DEFERRED_BACKLOG 筆積欠的分類快取待補寫"
+    changed="${changed}${changed:+$'\n'}積欠的分類快取待補寫"$'\t'"$DEFERRED_BACKLOG 筆"
   fi
 
   if [[ -n "$changed" ]]; then
-    echo "$changed" | paste -sd'；' -
+    printf '%s\n' "$changed"
     return 0
   fi
   return 1
+}
+
+md_escape() {
+  # stdin → stdout。把文字變成放進 Markdown 表格或清單也不會被當成語法的形式。
+  # & < > 轉成實體；\ ` | [ ] ( ) ! * _ ~ 前面加反斜線。
+  # 以 LC_ALL=C 逐位元組處理：UTF-8 的多位元組序列不含這些 ASCII 字元，原樣通過。
+  # 反斜線必須先處理，否則會把後面加上的反斜線再跳脫一次。
+  LC_ALL=C sed \
+    -e 's/&/\&amp;/g' \
+    -e 's/</\&lt;/g' \
+    -e 's/>/\&gt;/g' \
+    -e 's/\\/\\\\/g' \
+    -e 's/[]`|[()!*_~]/\\&/g'
+}
+
+render_change_reasons() {
+  # $1 = log | md；stdin 是 decide_should_sync 的輸出（每行「類型<TAB>項目」，項目可空）。
+  # 依類型分組、保留第一次出現的順序，項目以「、」相接。
+  #   log：  - 來源內容變動（3）：a、b、c      沒有項目的類型只印「  - 白名單有變動」
+  #   md ：| 變動類型 | 項目 | 表格，項目經 md_escape，空的印 —
+  # 用 LC_ALL=C 的 awk 拼接：逐位元組照抄，不會像 paste -d 那樣把多位元組字元拆開。
+  local mode="$1"
+  case "$mode" in
+    md) md_escape ;;
+    *)  cat ;;
+  esac | LC_ALL=C awk -F'\t' -v mode="$mode" '
+    $1 == "" { next }
+    {
+      t = $1
+      item = substr($0, length($1) + 2)
+      if (!(t in seen)) { seen[t] = 1; order[++n] = t; cnt[t] = 0; items[t] = "" }
+      if (item != "") { cnt[t]++; items[t] = (items[t] == "" ? item : items[t] "、" item) }
+    }
+    END {
+      if (n == 0) exit
+      if (mode == "md") { print "| 變動類型 | 項目 |"; print "|---|---|" }
+      for (i = 1; i <= n; i++) {
+        t = order[i]
+        if (mode == "md") print "| " t " | " (cnt[t] ? items[t] : "—") " |"
+        else if (cnt[t]) print "  - " t "（" cnt[t] "）：" items[t]
+        else print "  - " t
+      }
+    }'
 }
 
 # ── 4. D1：白名單 / 自訂封鎖清單 ──────────────────────────
@@ -2142,7 +2189,8 @@ record_sync_history() {
 write_step_summary() {
   # 把結果寫成 GitHub Actions 的 Job Summary（Actions 頁面上直接看得到的表格），
   # 不在 Actions 環境下執行時（例如本機手動跑）就靜靜跳過。
-  # $1 status, $2 total_merged, $3 total_uploaded, $4 原因說明
+  # $1 status, $2 total_merged, $3 total_uploaded,
+  # $4 原因：success 時是 decide_should_sync 的結構化輸出（渲染成表格），其他狀態是固定字串
   [[ -n "${GITHUB_STEP_SUMMARY:-}" ]] || return 0
   local status="$1" merged="$2" uploaded="$3" reason="$4"
   {
@@ -2165,8 +2213,12 @@ write_step_summary() {
       echo "| 對 Cloudflare 的變更 | 無 |"
       echo "| Gateway 現有清單 | 未受影響，仍然生效 |"
     else
-      echo "✅ **同步完成** — $reason"
+      echo "✅ **同步完成**"
       echo
+      if [[ -n "$reason" ]]; then
+        render_change_reasons md <<< "$reason"
+        echo
+      fi
       echo "| 項目 | 數值 |"
       echo "|---|---|"
       echo "| 來源合併後網域數 | $merged |"
@@ -2188,7 +2240,8 @@ write_step_summary() {
     if [[ -s "$TMP_DIR/failed_sources.txt" ]]; then
       echo
       echo "⚠️ 這些訂閱來源本次抓取失敗，已沿用前次狀態："
-      sed 's/^/- /' "$TMP_DIR/failed_sources.txt"
+      # 來源名經 md_escape：否則名稱裡的 [x](y)、<、* 之類會被 Job Summary 當成 Markdown／HTML 語法
+      md_escape < "$TMP_DIR/failed_sources.txt" | sed 's/^/- /'
     fi
   } >> "$GITHUB_STEP_SUMMARY"
 }
@@ -2238,7 +2291,8 @@ main() {
 
   local sync_reason=""
   if sync_reason=$(decide_should_sync "$PREV_STATE_FILE" "$wl_sum" "$bl_sum"); then
-    log "偵測到變動，執行完整同步 → $sync_reason"
+    log "偵測到變動，執行完整同步："
+    render_change_reasons log <<< "$sync_reason" | while IFS= read -r reason_line; do log "$reason_line"; done
   else
     log "所有訂閱來源、白名單與自訂封鎖清單的 checksum 都與上次相同，略過本次同步（完全沒有對 Cloudflare 做任何變更）"
     # 刻意不寫 sync_history：每小時塞一筆 skipped 會讓歷史表被雜訊淹沒
