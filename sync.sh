@@ -376,9 +376,25 @@ DOMAIN_REGEX='^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z
 IPV4_REGEX='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
 
 # ── 2. 各格式解析函式（吃 stdin，吐出網域清單到 stdout）───
+#
+# 每個解析器的第一道一律是 `tr -d '\r'`。
+#
+# 這些解析器全部以 `$` 錨定行尾（parse_adblock 的第一道 grep、DOMAIN_REGEX），而 Linux 上
+# 的 GNU grep 逐行比對時會保留行尾的 \r —— CRLF 行尾的清單因此一筆都比對不到，而且不會報錯，
+# 只會安安靜靜地「解析出 0 筆網域」。實際發生過：filters.adtidy.org 提供的
+# AdGuard-Mobile-Ads-filter 與 AdGuard-WO-Easylist 是 CRLF，在 Actions 上長期解析出 0 筆，
+# 兩者合計約 1.3 萬個網域從來沒有生效，D1 裡記下的 checksum 也一直是空內容的 sha256。
+#
+# 在 Windows 的 Git Bash 上完全看不出來：那裡的 grep、gawk、sed 預設會自己把 CR 剝掉，
+# 同一份檔案在本機解析得好好的。test/crlf-source-parsing.test.sh 用 grep -U、
+# awk -v BINMODE=3、sed -b 讓兩個平台都呈現 Linux 的行為，才驗得到這件事。
+#
+# 放在每個解析器裡、而不是呼叫端：任何直接呼叫解析器的地方都自動正確。
+# LF 行尾的清單不含任何 \r，對它們這是恆等轉換，輸出位元組不變。
 
 parse_domains() {
-  grep -vE '^[[:space:]]*(#|!|$)' \
+  tr -d '\r' \
+    | grep -vE '^[[:space:]]*(#|!|$)' \
     | sed -E 's/^\*\.//' \
     | tr 'A-Z' 'a-z' \
     | grep -E "$DOMAIN_REGEX" \
@@ -402,7 +418,8 @@ parse_adblock() {
   #    因此改成「修飾詞裡只要出現 = 就整條丟棄」。$badfilter 是「停用另一條規則」，
   #    語意跟封鎖相反，一併排除。$popup / $third-party / $all / $doc 這類真正的
   #    封鎖修飾詞不含 =，不受影響。
-  grep -E '^\|\|[a-zA-Z0-9.*_-]+\^(\$[a-zA-Z0-9_,.=~|-]*)?$' \
+  tr -d '\r' \
+    | grep -E '^\|\|[a-zA-Z0-9.*_-]+\^(\$[a-zA-Z0-9_,.=~|-]*)?$' \
     | grep -v '^@@' \
     | grep -v '##\|#@#\|#?#' \
     | grep -vE '\$[a-zA-Z0-9_,.=~|-]*=' \
@@ -415,7 +432,8 @@ parse_adblock() {
 }
 
 parse_hosts() {
-  grep -E '^(0\.0\.0\.0|127\.0\.0\.1|::1|::)[[:space:]]+' \
+  tr -d '\r' \
+    | grep -E '^(0\.0\.0\.0|127\.0\.0\.1|::1|::)[[:space:]]+' \
     | awk '{print $2}' \
     | tr 'A-Z' 'a-z' \
     | grep -E "$DOMAIN_REGEX" \
