@@ -623,7 +623,7 @@ case_25() {
 
 case_26() {
   local h="$1" d; d=$(mat_sc c26 s26)
-  spec "$d" s26 m1 force304=1          # 逐案例覆寫：對無條件請求也回 304（只有這個案例使用）
+  spec "$d" s26 m1 force304=1          # 逐案例覆寫：對無條件請求也回 304（只有案例 26、30 使用）
   spec "$d" s26 m2 force304=1
   run_entry "$h" "$d" materialize
   in_failed "$d" s26 || return 1
@@ -668,6 +668,29 @@ case_29() {
   [[ ! -e "$d/tmp/fetch_s29" ]]
 }
 
+# ══════════════════════════════════════════════════════════
+# 閘門階段：304 卻沒有前次 checksum
+# ══════════════════════════════════════════════════════════
+case_30() {
+  # 狀態裡有 ETag 但沒有 src:（理論上不會發生，保險路徑）→ 閘門改用無條件請求重抓。
+  # 伺服器對無條件請求仍回 304 就是沒有內容可用，必須視為失敗。
+  # 這條路若被當成成功：最上層沒有 sum_／parsed_、名字也不進失敗清單，
+  # #18 的暫緩移除不會生效，該來源的網域會被從 Gateway 移除。
+  local h="$1" d; d=$(new_sc c30)
+  add_source "$d" s30
+  state "$d" 'etag:s30' '"v30"'
+  spec "$d" s30 m1 force304=1          # 逐案例覆寫：對無條件請求也回 304（只有案例 26、30 使用）
+  spec "$d" s30 m2 force304=1
+  run_entry "$h" "$d" gate
+  [[ "$(calls "$d" s30)" == "2" ]] || return 1
+  # 這個情境只有一個來源：第一次帶條件式標頭、第二次是無條件請求
+  grep -qx 'If-None-Match: "v30"' "$d/argv.1" || return 1
+  ! grep -qE '^If-(None-Match|Modified-Since):' "$d/argv.2" || return 1
+  in_failed "$d" s30 || return 1
+  [[ ! -e "$d/tmp/sum_s30.txt" && ! -e "$d/tmp/parsed_s30.txt" ]] || return 1
+  [[ ! -s "$d/tmp/notmodified.txt" ]]
+}
+
 run_all_cases() {
   local h="$1"
   echo "閘門階段"
@@ -702,6 +725,8 @@ run_all_cases() {
   check "28. 狀態回寫檔裡 src:<name> 只出現一次（23 為新值、24 為前次值）" case_28 "$h"
   echo "失敗嘗試不留下殘骸"
   check "29. ① 半截、② 傳輸前失敗：最上層沒有 raw_／hdr_／parsed_／sum_，fetch_ 已刪" case_29 "$h"
+  echo "閘門階段：304 卻沒有前次 checksum"
+  check "30. 無條件重抓仍回 304：視為失敗，進 failed_sources.txt，最上層沒有 sum_／parsed_" case_30 "$h"
 }
 
 run_all_cases "$HARNESS"
@@ -874,6 +899,13 @@ M=$(mutate mat_304_ok materialize_sources <<'EOF'
 EOF
 ) || exit 2
 expect_red "materialize_sources 把 304 當成成功" "$M" 26
+
+M=$(mutate gate_refetch_304_ok fetch_and_merge_sources <<'EOF'
+      if ! fetch_source_with_fallback "$name" "$url" "$format" 0 || [[ "$FETCH_STATUS" != "200" ]]; then
+      if ! fetch_source_with_fallback "$name" "$url" "$format" 0; then
+EOF
+) || exit 2
+expect_red "閘門階段的無條件重抓把 304 當成成功" "$M" 30
 
 echo
 echo "通過 $PASS / 失敗 $FAIL"

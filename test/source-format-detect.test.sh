@@ -115,6 +115,10 @@ printf '! nothing here\n# nor here\n\n' > "$FX/zero"
 } > "$FX/trap"
 # 候選不外洩：adblock 為主，但 parse_domains 也撈得到 1 筆（次高 1 < 20 的 10%，不會觸發警告）
 { echo '[Adblock Plus 2.0]'; for i in $(seq 1 20); do echo "||leakkeep$i.example^"; done; echo 'leak-only-domains.example'; } > "$FX/leak"
+# 平手：兩種格式各解析出 1 筆、而且是不同的網域，才看得出是哪一個勝出
+printf '||tie-adblock.example^\ntie-domains.example\n' > "$FX/tie_ad_dom"
+printf '||tie-adblock.example^\n0.0.0.0 tie-hosts.example\n' > "$FX/tie_ad_hosts"
+printf '0.0.0.0 tie-hosts.example\ntie-domains.example\n' > "$FX/tie_hosts_dom"
 
 # fixture 自我驗證：各解析器對各 fixture 的筆數要符合設計
 count_of() { run "$HARNESS" "$WORK" "parse_$1" < "$2" | wc -l | tr -d ' '; }
@@ -132,6 +136,9 @@ expect_counts zero    0 0 0
 expect_counts mixed   10 0 2
 expect_counts trap    8 0 0
 expect_counts leak    20 0 1
+expect_counts tie_ad_dom    1 0 1
+expect_counts tie_ad_hosts  1 1 0
+expect_counts tie_hosts_dom 0 1 1
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
@@ -251,6 +258,19 @@ case_15() {
   [[ "$(cd "$d/tmp" && ls parsed_*.txt 2>/dev/null)" == "parsed_s15.txt" ]]
 }
 
+case_16() {
+  # 平手優先序 adblock → hosts → domains：三種兩兩平手都要檢查，
+  # 並比對輸出內容（不只 fmt.txt），確認用的是勝出者的解析結果
+  local h="$1" d pair want
+  for pair in tie_ad_dom:adblock tie_ad_hosts:adblock tie_hosts_dom:hosts; do
+    want="${pair#*:}"
+    d=$(new_sc "tie_${pair%%:*}")
+    parse_into "$h" "$d" s auto "$FX/${pair%%:*}" || return 1
+    fmt_is "$d" s "$want" || return 1
+    same_as_parser "$h" "$d" s "$want" "$FX/${pair%%:*}" || return 1
+  done
+}
+
 run_all_cases() {
   local h="$1"
   check "1. 明確 adblock：輸出與 parse_adblock 位元組相同" case_1 "$h"
@@ -268,6 +288,7 @@ run_all_cases() {
   check "13. 誤判陷阱 × auto：判定 adblock，不含 youtube.com／x.com／a.com／b.com" case_13 "$h"
   check "14. 候選不外洩：detect/ 已刪，最上層只有 parsed_<name>.txt，build_merged 與 parse_adblock 相同" case_14 "$h"
   check "15. 候選不外洩 × unknown：無殘留 detect/、無多出的 parsed_*.txt" case_15 "$h"
+  check "16. 平手：adblock＝domains → adblock、adblock＝hosts → adblock、hosts＝domains → hosts" case_16 "$h"
 }
 
 run_all_cases "$HARNESS"
@@ -339,6 +360,13 @@ M=$(mutate pick_fewest _detect_and_parse <<'EOF'
 EOF
 ) || exit 2
 expect_red "取最少" "$M" 4 5 6
+
+M=$(mutate tie_last_wins _detect_and_parse <<'EOF'
+    if [[ -z "$best" || $n -gt $best_n ]]; then
+    if [[ -z "$best" || $n -ge $best_n ]]; then
+EOF
+) || exit 2
+expect_red "平手時後面的格式勝出" "$M" 16
 
 # 拿掉 DOMAIN_REGEX 抽取 → 抽取自我驗證必須失敗（exit 2 的那一道）
 build_harness "$WORK/mut_no_domain_regex.sh" 'IPV4_REGEX'
