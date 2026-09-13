@@ -765,16 +765,60 @@ parse_source_into() {
   # 解析結果寫進 <輸出目錄>/parsed.txt、sum.txt、fmt.txt，**不直接寫 $TMP_DIR 最上層** ——
   # build_merged 是 cat parsed_*.txt，嘗試到一半的結果一旦出現在最上層就會被合併進去。
   # 由 fetch_source_with_fallback 在整次嘗試成功之後才升級成 parsed_<name>.txt 等檔案。
+  #
+  # 格式欄是 adblock／hosts／domains 就原樣使用、完全不偵測（硬性覆寫）；
+  # 空白或 auto 才自動偵測；其他任何值（例如打錯的 adbock）照舊拒絕，不會被默默改成自動偵測。
   local name="$1" format="$2" raw_file="$3" out_dir="$4"
   local parsed_file="$out_dir/parsed.txt"
+  rm -f "$out_dir/fmt.txt"
   case "$format" in
     domains) parse_domains < "$raw_file" > "$parsed_file" ;;
     adblock) parse_adblock < "$raw_file" > "$parsed_file" ;;
     hosts)   parse_hosts   < "$raw_file" > "$parsed_file" ;;
+    ""|auto) _detect_and_parse "$name" "$raw_file" "$out_dir" || return 1 ;;
     *) return 1 ;;
   esac
-  printf '%s\n' "$format" > "$out_dir/fmt.txt"
+  [[ -f "$out_dir/fmt.txt" ]] || printf '%s\n' "$format" > "$out_dir/fmt.txt"
   sha256sum < "$parsed_file" | awk '{print $1}' > "$out_dir/sum.txt"
+}
+
+_detect_and_parse() {
+  # $1 name, $2 raw 檔, $3 輸出目錄 → <輸出目錄>/parsed.txt 與 fmt.txt（adblock／hosts／domains／unknown）
+  #
+  # 用正在跑的三個解析器投票：各解析一次，解析出最多網域的勝出；平手時優先序 adblock → hosts → domains。
+  # 偵測與解析是同一份程式碼，不會漂移，也自動繼承解析器歷次的誤判修正 ——
+  # 這裡刻意不引入任何「看內容猜格式」的新規則（網址也不能用：hosts_abp.txt 的內容其實是 adblock）。
+  #
+  # 候選輸出寫在 <輸出目錄>/detect/，返回前刪掉：build_merged 是 cat parsed_*.txt，
+  # 候選檔一旦出現在 $TMP_DIR 最上層就會被合併進去。
+  #
+  # 三個解析器都是 0 筆 → unknown、warn、回傳成功（0 筆）；之後算不算失敗交給 0 筆防護統一判斷。
+  # 次高 > 0 且 ≥ 勝出者的 10% → warn 建議明確寫格式，行為不變。
+  local name="$1" raw_file="$2" out_dir="$3"
+  local det="$out_dir/detect" fmt n best="" best_n=0 second_n=0
+  rm -rf "$det"; mkdir -p "$det"
+  for fmt in adblock hosts domains; do
+    "parse_$fmt" < "$raw_file" > "$det/$fmt.txt"
+    n=$(wc -l < "$det/$fmt.txt" | tr -d ' ')
+    if [[ -z "$best" || $n -gt $best_n ]]; then
+      [[ -n "$best" ]] && second_n=$best_n
+      best="$fmt"; best_n=$n
+    elif [[ $n -gt $second_n ]]; then
+      second_n=$n
+    fi
+  done
+  if [[ $best_n -eq 0 ]]; then
+    best="unknown"
+    : > "$out_dir/parsed.txt"
+    warn "[$name] 自動偵測：三種格式都解析出 0 筆網域，判定為 unknown"
+  else
+    mv -f "$det/$best.txt" "$out_dir/parsed.txt"
+    if [[ $second_n -gt 0 && $((second_n * 10)) -ge $best_n ]]; then
+      warn "[$name] 自動偵測判定為 $best（$best_n 筆），但另一種格式也解析出 $second_n 筆；建議在 sources.conf 明確寫出格式"
+    fi
+  fi
+  printf '%s\n' "$best" > "$out_dir/fmt.txt"
+  rm -rf "$det"
 }
 
 fetch_source_with_fallback() {
@@ -983,7 +1027,11 @@ fetch_and_merge_sources() {
     fi
 
     n_200=$((n_200 + 1))
-    log "[$n/$total_sources] $name 解析出 $(wc -l < "$TMP_DIR/parsed_$name.txt" | xargs) 筆網域（checksum $(cut -c1-12 < "$TMP_DIR/sum_$name.txt")）"
+    local detected=""
+    case "$format" in
+      ""|auto) detected="（自動偵測：$(cat "$TMP_DIR/fmt_$name.txt" 2>/dev/null)）" ;;
+    esac
+    log "[$n/$total_sources] $name 解析出 $(wc -l < "$TMP_DIR/parsed_$name.txt" | xargs) 筆網域${detected}（checksum $(cut -c1-12 < "$TMP_DIR/sum_$name.txt")）"
   done < "$SOURCES_FILE"
 
   log "來源抓取完成：$n_200 個有更新、$n_304 個回應 304 未修改、$(wc -l < "$TMP_DIR/failed_sources.txt" | xargs) 個失敗（其中 $n_rejected 個是設定不合法被拒）"

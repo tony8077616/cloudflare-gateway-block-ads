@@ -422,6 +422,12 @@ Actions → **Sync ad-block lists to Cloudflare Gateway** → **Run workflow**�
 | `domains` | 純網域清單，一行一個 |
 | `adblock` | AdBlock Plus / uBlock Origin 語法 |
 | `hosts` | hosts 檔格式 |
+| 留空或 `auto` | 依下載到的內容自動偵測 |
+
+自動偵測不看網址（`hosts_abp.txt` 的內容其實是 adblock），而是用上面三個解析器各解析一次，
+解析出最多網域的勝出（平手優先 `adblock` → `hosts` → `domains`），日誌會顯示「（自動偵測：adblock）」。
+三個都是 0 筆時判定為 `unknown`；次高的格式也解析出勝出者 10% 以上時會警告，建議明確寫出格式。
+明確寫出的格式一律照用、完全不偵測；寫錯的值（例如 `adbock`）照舊被拒絕，不會被改成自動偵測。
 
 新來源抓取或解析失敗只會留下警告，不會讓整次同步失敗，其他來源照樣合併上傳。
 
@@ -617,6 +623,7 @@ bash test/slot-member-read.test.sh        # 單一清單成員「讀不到」不
 bash test/source-failure-removal.test.sh  # 來源「這次沒抓到」不可以被當成「它的網域該解封」
 bash test/crlf-source-parsing.test.sh     # CRLF 行尾的來源必須跟 LF 解析出相同的網域
 bash test/source-fetch-fallback.test.sh   # 截斷的下載不算成功、失敗的嘗試不外洩、上游標頭不污染狀態與日誌
+bash test/source-format-detect.test.sh    # 格式自動偵測：明確格式不被糾正、打錯的格式照舊拒絕、候選不外洩
 ```
 
 它會直接從 `sync.sh` 抽出**正在跑的那一段**來執行，而不是另外抄一份平行實作 ——

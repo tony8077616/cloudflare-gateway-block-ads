@@ -803,8 +803,25 @@ setup_parse() {
         | sed -E 's/^\|\|([a-zA-Z0-9.*_-]+)\^.*/\1/' | sed -E 's/^\*\.//' ;;
     hosts)
       grep -E '^(0\.0\.0\.0|127\.0\.0\.1|::1|::)[[:space:]]+' | awk '{print $2}' ;;
+    ""|auto)
+      setup_parse_auto ;;
     *) return 1 ;;
   esac | tr 'A-Z' 'a-z' | grep -E "$SETUP_DOMAIN_REGEX" | grep -vE "$SETUP_IPV4_REGEX"
+}
+
+setup_parse_auto() {
+  # 格式欄空白或 auto：跟 sync.sh 的 _detect_and_parse 同一套規則 —— 三種格式各解析一次，
+  # 印出解析出最多網域的那一份；平手優先序 adblock → hosts → domains。
+  # 輸出已經是合法網域，外層 setup_parse 管線的轉小寫與格式過濾對它是恆等的。
+  local t fmt n best="" best_n=-1
+  t="$(mktemp)" || return 1
+  cat > "$t"
+  for fmt in adblock hosts domains; do
+    n="$(setup_parse "$fmt" < "$t" | wc -l | tr -d ' ')" || n=0
+    if [[ $n -gt $best_n ]]; then best="$fmt"; best_n=$n; fi
+  done
+  setup_parse "$best" < "$t" || true
+  rm -f "$t"
 }
 
 SETUP_SOURCE_MAX_BYTES=$((50 * 1024 * 1024))
@@ -843,7 +860,7 @@ check_one_source() {
   name="$(trim "$name")"
   url="$(trim "$url")"
   format="$(trim "$format")"
-  info "取 sources.conf 的第一個來源：$name（$format）"
+  info "取 sources.conf 的第一個來源：$name（${format:-自動偵測}）"
   info "$url"
 
   local out="$TMP_DIR/one_source.txt" code="" rc=0 m label fetched=0
