@@ -599,6 +599,7 @@ bash test/gateway-enumeration.test.sh     # Gateway「讀不到」不可以被�
 bash test/abort-wiring.test.sh            # 偵測到問題之後，真的有人把它接成中止
 bash test/slot-member-read.test.sh        # 單一清單成員「讀不到」不可以被當成「那份是空的」
 bash test/source-failure-removal.test.sh  # 來源「這次沒抓到」不可以被當成「它的網域該解封」
+bash test/crlf-source-parsing.test.sh     # CRLF 行尾的來源必須跟 LF 解析出相同的網域
 ```
 
 它會直接從 `sync.sh` 抽出**正在跑的那一段**來執行，而不是另外抄一份平行實作 ——

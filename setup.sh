@@ -792,7 +792,9 @@ SETUP_IPV4_REGEX='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
 
 setup_parse() {
   # $1 = format。吃 stdin，吐網域到 stdout。
-  case "$1" in
+  # 第一道先剝掉 CR，理由見 sync.sh 解析函式前的說明：CRLF 行尾的清單在 Linux 上會因為
+  # $ 錨定而解析出 0 筆。跟 sync.sh 保持一致，--check 印出的筆數才會跟線上相同。
+  tr -d '\r' | case "$1" in
     domains)
       grep -vE '^[[:space:]]*(#|!|$)' | sed -E 's/^\*\.//' ;;
     adblock)
