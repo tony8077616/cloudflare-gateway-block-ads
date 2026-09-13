@@ -422,8 +422,30 @@ Actions → **Sync ad-block lists to Cloudflare Gateway** → **Run workflow**�
 | `domains` | 純網域清單，一行一個 |
 | `adblock` | AdBlock Plus / uBlock Origin 語法 |
 | `hosts` | hosts 檔格式 |
+| 留空或 `auto` | 依下載到的內容自動偵測 |
+
+自動偵測不看網址（`hosts_abp.txt` 的內容其實是 adblock），而是用上面三個解析器各解析一次，
+解析出最多網域的勝出（平手優先 `adblock` → `hosts` → `domains`），日誌會顯示「（自動偵測：adblock）」。
+三個都是 0 筆時判定為 `unknown`；次高的格式也解析出勝出者 10% 以上時會警告，建議明確寫出格式。
+明確寫出的格式一律照用、完全不偵測；寫錯的值（例如 `adbock`）照舊被拒絕，不會被改成自動偵測。
 
 新來源抓取或解析失敗只會留下警告，不會讓整次同步失敗，其他來源照樣合併上傳。
+
+`url` 必須是 `https://`，路徑（去掉 `?query` 與 `#fragment`）以 `.txt` 結尾。
+每個來源的取得有兩種方式，前一種失敗才換下一種：
+
+| 順位 | 方式 | 說明 |
+|---|---|---|
+| ① | 原網址直連 | 失敗原因是傳輸沒有完成、伺服器沒回應或忙碌（`000`、`403`、`408`、`425`、`429`、`5xx`）、內容不是純文字清單、上次有網域這次卻解析出 0 筆時，換 ② |
+| ② | 同網址換連線參數（`--http1.1 -4`、較短的逾時） | 整趟執行累計最多用 480 秒，用完之後失敗的來源不再嘗試 ② |
+
+一次取得要**同時**滿足才算成功：curl 正常結束（截斷的下載不算）、HTTP `200` 或 `304`、
+內容是純文字（不是空的、二進位、壓縮檔或 HTML 錯誤頁）、解析結果通過 0 筆防護。
+`404` 這類來源明確的回答、轉址過多、檔案超過 50 MiB 不會換方式重試。
+兩種方式都失敗的來源沿用前次狀態，它的網域這次不會被從 Gateway 移除。
+
+> 0 筆防護的取捨：上游若**刻意**清空一份清單，會被當成失敗而不會生效，每次都會列在
+> Job Summary 的失敗來源裡，需要手動處理（例如從 `sources.conf` 拿掉那一行）。
 
 > ⚠️ **AdBlock 語法不等於 DNS 封鎖。** 解析器會丟棄所有帶 `=` 的修飾詞規則
 > （`$removeparam=`、`$redirect=`、`$domain=`、`$csp=` 等）—— 那些是「限定套用範圍」
@@ -600,6 +622,9 @@ bash test/abort-wiring.test.sh            # 偵測到問題之後，真的有人
 bash test/slot-member-read.test.sh        # 單一清單成員「讀不到」不可以被當成「那份是空的」
 bash test/source-failure-removal.test.sh  # 來源「這次沒抓到」不可以被當成「它的網域該解封」
 bash test/crlf-source-parsing.test.sh     # CRLF 行尾的來源必須跟 LF 解析出相同的網域
+bash test/source-fetch-fallback.test.sh   # 截斷的下載不算成功、失敗的嘗試不外洩、上游標頭不污染狀態與日誌
+bash test/source-format-detect.test.sh    # 格式自動偵測：明確格式不被糾正、打錯的格式照舊拒絕、候選不外洩
+bash test/change-reasons.test.sh          # 「偵測到變動」的原因是合法 UTF-8、依類型分組，Job Summary 有跳脫
 ```
 
 它會直接從 `sync.sh` 抽出**正在跑的那一段**來執行，而不是另外抄一份平行實作 ——

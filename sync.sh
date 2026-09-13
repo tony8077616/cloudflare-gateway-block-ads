@@ -442,15 +442,64 @@ parse_hosts() {
 
 # ── 3. 抓取 + 合併所有來源 ────────────────────────────────
 
+# 單一來源下載內容的大小上限（curl --max-filesize 與 validate_text_content 共用）。
+# 目前最大的來源約 2 MiB，50 MiB 只是擋掉明顯異常的回應。
+SOURCE_MAX_BYTES=$((50 * 1024 * 1024))
+# 取檔方式②（換連線參數重試）在整趟執行裡累計可用的秒數。
+# 方式①本身的最壞耗時是既有行為；這個預算讓「很多來源同時壞掉」時不會再疊上一整輪重試。
+SOURCE_FALLBACK_BUDGET_SECONDS=480
+SOURCE_FALLBACK_SPENT=0
+SOURCE_FALLBACK_BUDGET_NOTED=0
+# fetch_source_with_fallback 的結果（200 / 304 / fail）與給 log 看的簡短原因
+FETCH_STATUS=""
+FETCH_SUMMARY=""
+
 state_get() {
   # $1 = key，從已載入的前次狀態檔取值（檔案不存在時回傳空字串）
+  #
+  # 印出 key 後面的「整段」值，而不是第二個 TAB 分隔欄位。值裡若含 TAB（例如 D1 裡改版前
+  # 存下、或被手動寫入的 ETag），只取第二欄會把它截成一個看起來合法的前綴 —— curl_source
+  # 讀出後的再驗證就看不到原值，照樣把那個前綴塞進 If-None-Match。
+  # 本腳本自己寫進 sync_state 的值不含 TAB（save_sync_state 以 TAB 切欄），對它們這是恆等的。
   [[ -n "${PREV_STATE_FILE:-}" && -s "${PREV_STATE_FILE:-}" ]] || return 0
-  awk -F'\t' -v k="$1" '$1==k{print $2; exit}' "$PREV_STATE_FILE"
+  awk -F'\t' -v k="$1" '$1==k { if (index($0, "\t")) { sub(/^[^\t]*\t/, ""); print }; exit }' "$PREV_STATE_FILE"
+}
+
+last_header_block() {
+  # $1 = curl -D 寫出的標頭檔。跟隨轉址（或 --retry 重試）時，檔案裡有多組以空行分隔的標頭；
+  # 只印最後一組，也就是真正產生這份內容的那個回應。
+  # 以前是「整份檔案裡最後一個符合的標頭」：最終回應沒有 ETag、中間那一跳有的時候，
+  # 會把轉址站的 ETag 當成這份內容的 ETag 存起來。
+  [[ -f "$1" ]] || return 0
+  tr -d '\r' < "$1" | awk '
+    /^$/ { if (n) { last = cur; have = 1 }; cur = ""; n = 0; next }
+         { cur = cur $0 "\n"; n++ }
+    END  { if (n) { last = cur; have = 1 }; if (have) printf "%s", last }
+  '
 }
 
 header_value() {
-  # $1 = 標頭檔, $2 = 標頭名稱。跟隨轉址時會有多組標頭，取最後一組（即最終回應）的值。
-  grep -i "^$2:" "$1" 2>/dev/null | tail -1 | sed -E "s/^[^:]+:[[:space:]]*//" | tr -d '\r'
+  # $1 = 標頭檔, $2 = 標頭名稱。只看最後一組標頭（見 last_header_block）。
+  last_header_block "$1" \
+    | grep -i "^$2:" | tail -1 | sed -E "s/^[^:]+:[[:space:]]*//"
+}
+
+sanitize_validator_header() {
+  # $1 = 上游回應的 ETag／Last-Modified 值。合格就原樣印出並回傳 0；不合格什麼都不印、回傳 1。
+  #
+  # 這個值會以 TAB 分隔寫進 D1 的 sync_state，下次再塞進 curl -H。所以只准可列印 ASCII
+  # （0x20–0x7E，TAB 與其他控制字元自然被擋）、長度 ≤ 256。不合格就丟棄不存，
+  # 下次改成無條件請求 —— 代價只是多下載一次。
+  # 寫入前驗一次，從狀態讀出、塞進 -H 前再驗一次（D1 裡可能有改版前存的舊值）。
+  #
+  # 用 LC_ALL=C 的 tr 做位元組層級的比對，理由同 has_control_chars：不跟 locale 綁在一起。
+  # 結尾補一個 x 再比對，因為 $(...) 會吃掉結尾的換行，換行本身也是不合格的字元。
+  local v="$1" rest
+  [[ -n "$v" ]] || return 1
+  [[ "$(byte_len "$v")" -le 256 ]] || return 1
+  rest="$(printf '%s' "$v" | LC_ALL=C tr -d '\040-\176'; printf x)"
+  [[ "$rest" == "x" ]] || return 1
+  printf '%s' "$v"
 }
 
 trim() {
@@ -633,47 +682,263 @@ validate_source_url() {
   if [[ "${#url}" -le 8 ]]; then
     INVALID_SOURCE_REASON="https:// 後面沒有任何內容"; return 1
   fi
+  # 路徑去掉 #fragment 與 ?query 之後必須以 .txt 結尾（不分大小寫）。
+  # 這是**命名規範，不是注入防護**：它只看設定的網址，不看轉址之後的最終網址。
+  # 真正擋住非純文字內容的是 validate_text_content，它檢查的是下載到的位元組。
+  local path="${url%%#*}"
+  path="${path%%\?*}"
+  if [[ "$path" != *.[tT][xX][tT] ]]; then
+    INVALID_SOURCE_REASON="網址路徑不是以 .txt 結尾（訂閱來源必須是純文字清單）"; return 1
+  fi
+  return 0
+}
+
+validate_text_content() {
+  # $1 = 下載到的檔案。是合格的純文字清單就回傳 0，否則回傳 1。只在 HTTP 200 時呼叫。
+  #
+  # 擋的是「上游回了一個 200，但那不是清單」：空回應、二進位檔、壓縮檔、HTML 錯誤頁或登入頁。
+  # 這些東西餵進解析器通常只會解析出 0 筆或一些雜訊，卻會被當成這個來源的新內容。
+  #
+  # 實作限制：絕不把檔案讀進 bash 變數（bash 字串容不下 NUL）；第一行只從 head -c 4096 的
+  # 有界前綴取；魔數用 cmp 以位元組比對。刻意不要求合法 UTF-8、不以 Content-Type 當關卡。
+  local f="$1" size nul first bom=$'\xEF\xBB\xBF'
+  [[ -f "$f" ]] || return 1
+  size=$(wc -c < "$f" | tr -d ' ')
+  [[ "$size" -gt 0 ]] || return 1
+  [[ "$size" -le "$SOURCE_MAX_BYTES" ]] || return 1
+  nul=$(LC_ALL=C tr -cd '\000' < "$f" | wc -c | tr -d ' ')
+  [[ "$nul" == "0" ]] || return 1
+  cmp -s <(head -c 2 "$f") <(printf '\037\213') && return 1
+  cmp -s <(head -c 4 "$f") <(printf 'PK\003\004') && return 1
+  # 「HTML 開頭」只看第一個非空白行（CR 視為空白），因為過濾清單的註解行可能提到 <html>。
+  first=$(head -c 4096 "$f" | tr -d '\r' | LC_ALL=C sed "1s/^$bom//" | awk 'NF && !seen { print; seen = 1 }')
+  printf '%s\n' "$first" | LC_ALL=C grep -qiE '^[[:space:]]*<(!doctype|html|head|body|\?xml)' && return 1
   return 0
 }
 
 curl_source() {
-  # $1 name, $2 url, $3 是否帶條件式標頭（1/0）
-  # 內容寫入 raw_<name>.txt、標頭寫入 hdr_<name>.txt，HTTP 狀態碼輸出到 stdout
+  # $1 name, $2 url, $3 是否帶條件式標頭（1/0）, $4 這次嘗試的輸出目錄, $5.. 取檔方式的 curl 參數
+  # 內容寫入 <輸出目錄>/body、標頭寫入 <輸出目錄>/headers。
+  # stdout 印一行「curl 離開狀態<空白>HTTP 碼」。
+  #
+  # **只能由 fetch_source_with_fallback 呼叫**（test/source-fetch-fallback.test.sh 以 grep 釘住）。
+  # 以前的呼叫端只取 %{http_code}：--max-time 在傳輸途中觸發時 curl 以 28 結束「但仍印出 200」，
+  # 截斷的檔案被解析、ETag 被存下，之後的 304 讓截斷的 checksum 一直延續下去。
   #
   # 前提：name/url 都已經過 validate_source_name / validate_source_url。
   # 這裡的 curl 旗標是第二道防線，就算驗證被繞過也不至於變成任意檔案寫入：
-  #   -q                  不讀 ~/.curlrc；別人的設定檔不能替我們改輸出位置或加 proxy
+  #   -q                  不讀 ~/.curlrc；別人的設定檔不能替我們改輸出位置或加 proxy。
+  #                       **curl 只有在 -q 是第一個參數時才認它**，所以取檔方式的參數一律插在它後面
   #   --proto '=https'    只准講 https，file:// 之類一律拒絕
   #   --proto-redir '=https'  轉址也只准轉去 https，避免被導到 file:// / http://
+  #   --max-redirs 5      轉址跳數上限
+  #   --max-filesize      檔案大小上限（validate_text_content 還有第二道）
   #   --                  結束旗標解析，後面的 $url 一定被當成網址而不是旗標
-  local name="$1" url="$2" conditional="$3"
+  # 取檔完全不經 cf_curl／cf_config_stdin／-K／--config：這條路徑上沒有任何 Cloudflare 憑證。
+  local name="$1" url="$2" conditional="$3" out_dir="$4"
+  shift 4
   local -a hdrs=()
   if [[ "$conditional" == "1" ]]; then
     local et lm
     et=$(state_get "etag:$name")
     lm=$(state_get "lastmod:$name")
+    sanitize_validator_header "$et" >/dev/null || et=""
+    sanitize_validator_header "$lm" >/dev/null || lm=""
     [[ -n "$et" ]] && hdrs+=(-H "If-None-Match: $et")
     [[ -n "$lm" ]] && hdrs+=(-H "If-Modified-Since: $lm")
   fi
-  curl -q -sSL --retry 3 --retry-all-errors --max-time 60 \
+  local code rc
+  code=$(curl -q "$@" \
     --proto '=https' --proto-redir '=https' \
+    --max-redirs 5 --max-filesize "$SOURCE_MAX_BYTES" \
     -A "cloudflare-gateway-block-ads-sync/1.0" \
     "${hdrs[@]}" \
-    -D "$TMP_DIR/hdr_$name.txt" -o "$TMP_DIR/raw_$name.txt" \
-    -w '%{http_code}' -- "$url" 2>/dev/null
+    -D "$out_dir/headers" -o "$out_dir/body" \
+    -w '%{http_code}' -- "$url" 2>/dev/null)
+  rc=$?
+  [[ "$code" =~ ^[0-9]{3}$ ]] || code="000"
+  printf '%s %s\n' "$rc" "$code"
 }
 
 parse_source_into() {
-  # $1 name, $2 format；解析 raw_<name>.txt → parsed_<name>.txt，並寫出 sum_<name>.txt
-  local name="$1" format="$2"
-  local raw_file="$TMP_DIR/raw_$name.txt" parsed_file="$TMP_DIR/parsed_$name.txt"
+  # $1 name, $2 format, $3 raw 檔, $4 輸出目錄
+  # 解析結果寫進 <輸出目錄>/parsed.txt、sum.txt、fmt.txt，**不直接寫 $TMP_DIR 最上層** ——
+  # build_merged 是 cat parsed_*.txt，嘗試到一半的結果一旦出現在最上層就會被合併進去。
+  # 由 fetch_source_with_fallback 在整次嘗試成功之後才升級成 parsed_<name>.txt 等檔案。
+  #
+  # 格式欄是 adblock／hosts／domains 就原樣使用、完全不偵測（硬性覆寫）；
+  # 空白或 auto 才自動偵測；其他任何值（例如打錯的 adbock）照舊拒絕，不會被默默改成自動偵測。
+  local name="$1" format="$2" raw_file="$3" out_dir="$4"
+  local parsed_file="$out_dir/parsed.txt"
+  rm -f "$out_dir/fmt.txt"
   case "$format" in
     domains) parse_domains < "$raw_file" > "$parsed_file" ;;
     adblock) parse_adblock < "$raw_file" > "$parsed_file" ;;
     hosts)   parse_hosts   < "$raw_file" > "$parsed_file" ;;
+    ""|auto) _detect_and_parse "$name" "$raw_file" "$out_dir" || return 1 ;;
     *) return 1 ;;
   esac
-  sha256sum < "$parsed_file" | awk '{print $1}' > "$TMP_DIR/sum_$name.txt"
+  [[ -f "$out_dir/fmt.txt" ]] || printf '%s\n' "$format" > "$out_dir/fmt.txt"
+  sha256sum < "$parsed_file" | awk '{print $1}' > "$out_dir/sum.txt"
+}
+
+_detect_and_parse() {
+  # $1 name, $2 raw 檔, $3 輸出目錄 → <輸出目錄>/parsed.txt 與 fmt.txt（adblock／hosts／domains／unknown）
+  #
+  # 用正在跑的三個解析器投票：各解析一次，解析出最多網域的勝出；平手時優先序 adblock → hosts → domains。
+  # 偵測與解析是同一份程式碼，不會漂移，也自動繼承解析器歷次的誤判修正 ——
+  # 這裡刻意不引入任何「看內容猜格式」的新規則（網址也不能用：hosts_abp.txt 的內容其實是 adblock）。
+  #
+  # 候選輸出寫在 <輸出目錄>/detect/，返回前刪掉：build_merged 是 cat parsed_*.txt，
+  # 候選檔一旦出現在 $TMP_DIR 最上層就會被合併進去。
+  #
+  # 三個解析器都是 0 筆 → unknown、warn、回傳成功（0 筆）；之後算不算失敗交給 0 筆防護統一判斷。
+  # 次高 > 0 且 ≥ 勝出者的 10% → warn 建議明確寫格式，行為不變。
+  local name="$1" raw_file="$2" out_dir="$3"
+  local det="$out_dir/detect" fmt n best="" best_n=0 second_n=0
+  rm -rf "$det"; mkdir -p "$det"
+  for fmt in adblock hosts domains; do
+    "parse_$fmt" < "$raw_file" > "$det/$fmt.txt"
+    n=$(wc -l < "$det/$fmt.txt" | tr -d ' ')
+    if [[ -z "$best" || $n -gt $best_n ]]; then
+      [[ -n "$best" ]] && second_n=$best_n
+      best="$fmt"; best_n=$n
+    elif [[ $n -gt $second_n ]]; then
+      second_n=$n
+    fi
+  done
+  if [[ $best_n -eq 0 ]]; then
+    best="unknown"
+    : > "$out_dir/parsed.txt"
+    warn "[$name] 自動偵測：三種格式都解析出 0 筆網域，判定為 unknown"
+  else
+    mv -f "$det/$best.txt" "$out_dir/parsed.txt"
+    if [[ $second_n -gt 0 && $((second_n * 10)) -ge $best_n ]]; then
+      warn "[$name] 自動偵測判定為 $best（$best_n 筆），但另一種格式也解析出 $second_n 筆；建議在 sources.conf 明確寫出格式"
+    fi
+  fi
+  printf '%s\n' "$best" > "$out_dir/fmt.txt"
+  rm -rf "$det"
+}
+
+fetch_source_with_fallback() {
+  # $1 name, $2 url, $3 format, $4 是否帶條件式標頭（1/0）
+  #
+  # 依序嘗試兩種取檔方式，一次嘗試**同時**滿足以下條件才算成功：
+  #   1. curl 離開狀態為 0（截斷的下載不算成功）
+  #   2. HTTP 碼為 200 或 304
+  #   3. 200 時通過 validate_text_content
+  #   4. 200 時解析之後通過 0 筆防護：這次 0 筆、前次 src:<name> 有值且不是空內容的 sha256 → 失敗
+  #
+  #   ① 原網址直連          現行參數（仍然只呼叫一次 curl，健康狀態下行為不變）
+  #   ② 同網址換連線參數    --http1.1 -4、較短的連線與總時間上限、只重試一次
+  #
+  # 回傳 0：FETCH_STATUS=200（結果已升級到最上層 raw_/hdr_/parsed_/sum_/fmt_<name>.txt，
+  #         驗證標頭已記進 newmeta.txt）或 FETCH_STATUS=304（沒有內容，什麼都沒寫）。
+  #         304 算不算成功由呼叫端決定：沒帶條件式標頭卻拿到 304 就不是。
+  # 回傳 1：FETCH_STATUS=fail，最上層沒有任何這次嘗試留下的檔案。
+  #         FETCH_SUMMARY 是給 log 看的簡短原因。
+  #
+  # 每一次嘗試寫進 $TMP_DIR/fetch_<name>/m<N>/，成功才升級，返回前整個刪掉。
+  #
+  # log 只印方式、curl 離開狀態、HTTP 碼與判定。這是公開 repo：回應本體、標頭、Location、
+  # 最終網址、curl stderr 一律不印。
+  local name="$1" url="$2" format="$3" conditional="$4"
+  local work="$TMP_DIR/fetch_$name"
+  local empty_sum prev_sum res rc code dir m label started verdict reason et lm
+  local -a method_args=()
+  empty_sum=$(sha256sum < /dev/null | awk '{print $1}')
+  FETCH_STATUS="fail"
+  FETCH_SUMMARY=""
+  rm -rf "$work"
+
+  for m in 1 2; do
+    case $m in
+      1) label="①原網址直連"
+         method_args=(-sSL --retry 3 --retry-all-errors --max-time 60) ;;
+      2) label="②換連線參數重試"
+         method_args=(-sSL --retry 1 --retry-all-errors --connect-timeout 10 --max-time 45 --http1.1 -4) ;;
+    esac
+    if [[ $m -eq 2 ]]; then
+      if [[ $SOURCE_FALLBACK_SPENT -ge $SOURCE_FALLBACK_BUDGET_SECONDS ]]; then
+        if [[ $SOURCE_FALLBACK_BUDGET_NOTED -eq 0 ]]; then
+          warn "備援取檔的時間預算（${SOURCE_FALLBACK_BUDGET_SECONDS} 秒）已用完，之後失敗的來源不再嘗試方式②"
+          SOURCE_FALLBACK_BUDGET_NOTED=1
+        fi
+        break
+      fi
+      started=$(date +%s)
+    fi
+
+    dir="$work/m$m"
+    mkdir -p "$dir"
+    res=$(curl_source "$name" "$url" "$conditional" "$dir" "${method_args[@]}")
+    rc=${res%% *}; code=${res##* }
+    if [[ $m -eq 2 ]]; then
+      SOURCE_FALLBACK_SPENT=$(( SOURCE_FALLBACK_SPENT + $(date +%s) - started ))
+    fi
+
+    verdict="next"
+    reason=""
+    if [[ "$rc" != "0" ]]; then
+      reason="傳輸沒有完成"
+      case "$rc" in
+        # 47 轉址過多、63 檔案過大：換一種連線方式也一樣
+        47|63) verdict="stop" ;;
+      esac
+    else
+      case "$code" in
+        304)
+          FETCH_STATUS="304"
+          FETCH_SUMMARY="方式$label：HTTP 304"
+          rm -rf "$work"
+          return 0
+          ;;
+        200)
+          if ! validate_text_content "$dir/body"; then
+            reason="內容不是純文字清單"
+          elif ! parse_source_into "$name" "$format" "$dir/body" "$dir"; then
+            reason="未知格式 '$(sanitize_for_log "$format")'"
+            verdict="stop"
+          else
+            prev_sum=""
+            [[ -s "$dir/parsed.txt" ]] || prev_sum=$(state_get "src:$name")
+            if [[ -n "$prev_sum" && "$prev_sum" != "$empty_sum" ]]; then
+              reason="解析出 0 筆網域，但前次有內容"
+            else
+              mv -f "$dir/body" "$TMP_DIR/raw_$name.txt"
+              if [[ -f "$dir/headers" ]]; then mv -f "$dir/headers" "$TMP_DIR/hdr_$name.txt"; else : > "$TMP_DIR/hdr_$name.txt"; fi
+              mv -f "$dir/parsed.txt" "$TMP_DIR/parsed_$name.txt"
+              mv -f "$dir/sum.txt" "$TMP_DIR/sum_$name.txt"
+              mv -f "$dir/fmt.txt" "$TMP_DIR/fmt_$name.txt"
+              # 記下這次的驗證標頭，下次就能用條件式請求省下整包下載。不合格的值丟棄不存。
+              et=$(header_value "$TMP_DIR/hdr_$name.txt" 'ETag')
+              lm=$(header_value "$TMP_DIR/hdr_$name.txt" 'Last-Modified')
+              sanitize_validator_header "$et" >/dev/null || et=""
+              sanitize_validator_header "$lm" >/dev/null || lm=""
+              printf '%s\t%s\t%s\n' "$name" "$et" "$lm" >> "$TMP_DIR/newmeta.txt"
+              [[ $m -eq 1 ]] || log "[$name] 方式$label 取得成功"
+              FETCH_STATUS="200"
+              FETCH_SUMMARY="方式$label：HTTP 200"
+              rm -rf "$work"
+              return 0
+            fi
+          fi
+          ;;
+        # 伺服器沒回應、拒絕或忙碌：換一種連線方式可能就過了
+        000|403|408|425|429|5??) reason="伺服器沒有給出內容" ;;
+        # 其他回應（400、401、404、410…）是來源明確的回答，換方式也一樣
+        *) reason="來源明確拒絕"; verdict="stop" ;;
+      esac
+    fi
+
+    FETCH_SUMMARY="方式$label：curl 離開狀態 $rc、HTTP $code，$reason"
+    warn "[$name] $FETCH_SUMMARY"
+    [[ "$verdict" == "next" ]] || break
+  done
+
+  rm -rf "$work"
+  return 1
 }
 
 fetch_and_merge_sources() {
@@ -732,51 +997,41 @@ fetch_and_merge_sources() {
     printf '%s\t%s\t%s\n' "$name" "$url" "$format" >> "$TMP_DIR/source_list.txt"
     n=$((n + 1))
 
-    local code
-    code=$(curl_source "$name" "$url" 1)
-
-    case "$code" in
-      304)
-        # 內容未變，伺服器沒回傳 body。沿用前次 checksum，內容等到確定要完整同步才補抓。
-        local prev_sum
-        prev_sum=$(state_get "src:$name")
-        if [[ -z "$prev_sum" ]]; then
-          # 理論上不會發生（有 ETag 就該有 checksum）；保險起見改成無條件重抓
-          warn "[$n/$total_sources] $name 回應 304 但沒有前次 checksum，改用無條件請求重抓"
-          code=$(curl_source "$name" "$url" 0)
-        else
-          echo "$prev_sum" > "$TMP_DIR/sum_$name.txt"
-          printf '%s\t%s\n' "$name" "$format" >> "$TMP_DIR/notmodified.txt"
-          n_304=$((n_304 + 1))
-          log "[$n/$total_sources] $name 304 未修改，沿用前次 checksum（未下載內容）"
-          continue
-        fi
-        ;;
-    esac
-
-    # 上面的 304 分支可能已經改寫過 code（重抓），所以這裡重新判斷一次
-    case "$code" in
-      200) : ;;
-      *)
-        warn "[$n/$total_sources] $name 抓取失敗（HTTP $code），略過此來源"
-        echo "$name" >> "$TMP_DIR/failed_sources.txt"
-        continue
-        ;;
-    esac
-
-    if ! parse_source_into "$name" "$format"; then
-      warn "[$n/$total_sources] $name 未知格式 '$format'，略過"
+    # 取檔、內容檢查、解析、0 筆防護、驗證標頭的記錄都在 fetch_source_with_fallback 裡。
+    # 成功時（200）結果已經升級到最上層；失敗時最上層沒有任何這個來源的檔案。
+    if ! fetch_source_with_fallback "$name" "$url" "$format" 1; then
+      warn "[$n/$total_sources] $name 抓取失敗（$FETCH_SUMMARY），略過此來源"
       echo "$name" >> "$TMP_DIR/failed_sources.txt"
       continue
     fi
 
-    # 記下這次的驗證標頭，下次就能用條件式請求省下整包下載
-    printf '%s\t%s\t%s\n' "$name" \
-      "$(header_value "$TMP_DIR/hdr_$name.txt" 'ETag')" \
-      "$(header_value "$TMP_DIR/hdr_$name.txt" 'Last-Modified')" >> "$TMP_DIR/newmeta.txt"
+    if [[ "$FETCH_STATUS" == "304" ]]; then
+      # 內容未變，伺服器沒回傳 body。沿用前次 checksum，內容等到確定要完整同步才補抓。
+      local prev_sum
+      prev_sum=$(state_get "src:$name")
+      if [[ -n "$prev_sum" ]]; then
+        echo "$prev_sum" > "$TMP_DIR/sum_$name.txt"
+        printf '%s\t%s\n' "$name" "$format" >> "$TMP_DIR/notmodified.txt"
+        n_304=$((n_304 + 1))
+        log "[$n/$total_sources] $name 304 未修改，沿用前次 checksum（未下載內容）"
+        continue
+      fi
+      # 理論上不會發生（有 ETag 就該有 checksum）；保險起見改成無條件重抓。
+      # 沒帶條件式標頭卻仍然拿到 304，就是沒有內容可用，視為失敗。
+      warn "[$n/$total_sources] $name 回應 304 但沒有前次 checksum，改用無條件請求重抓"
+      if ! fetch_source_with_fallback "$name" "$url" "$format" 0 || [[ "$FETCH_STATUS" != "200" ]]; then
+        warn "[$n/$total_sources] $name 抓取失敗（$FETCH_SUMMARY），略過此來源"
+        echo "$name" >> "$TMP_DIR/failed_sources.txt"
+        continue
+      fi
+    fi
 
     n_200=$((n_200 + 1))
-    log "[$n/$total_sources] $name 解析出 $(wc -l < "$TMP_DIR/parsed_$name.txt" | xargs) 筆網域（checksum $(cut -c1-12 < "$TMP_DIR/sum_$name.txt")）"
+    local detected=""
+    case "$format" in
+      ""|auto) detected="（自動偵測：$(cat "$TMP_DIR/fmt_$name.txt" 2>/dev/null)）" ;;
+    esac
+    log "[$n/$total_sources] $name 解析出 $(wc -l < "$TMP_DIR/parsed_$name.txt" | xargs) 筆網域${detected}（checksum $(cut -c1-12 < "$TMP_DIR/sum_$name.txt")）"
   done < "$SOURCES_FILE"
 
   log "來源抓取完成：$n_200 個有更新、$n_304 個回應 304 未修改、$(wc -l < "$TMP_DIR/failed_sources.txt" | xargs) 個失敗（其中 $n_rejected 個是設定不合法被拒）"
@@ -786,21 +1041,22 @@ materialize_sources() {
   # 確定要完整同步時才呼叫：把先前回應 304、因此沒有下載內容的來源改用無條件請求補抓。
   # 閘門階段之所以不抓，是因為大多數執行最後都會略過，那些下載就是純浪費。
   [[ -s "$TMP_DIR/notmodified.txt" ]] || return 0
-  local name format url code
+  local name format url
   while IFS=$'\t' read -r name format; do
     [[ -n "$name" ]] || continue
     url=$(awk -F'\t' -v n="$name" '$1==n{print $2; exit}' "$TMP_DIR/source_list.txt")
     log "補抓 304 來源的內容：$name"
-    code=$(curl_source "$name" "$url" 0)
-    if [[ "$code" != "200" ]] || ! parse_source_into "$name" "$format"; then
-      warn "[$name] 補抓失敗（HTTP $code），本次合併會缺少這個來源的網域"
+    # 這次沒帶條件式標頭，只有 200 才算補抓到內容。伺服器若仍回 304 就是沒有內容可用：
+    # 當成成功的話，閘門階段寫的 sum_<name>.txt 會留下而 parsed_<name>.txt 不存在，
+    # 名字也不進 failed_sources.txt，於是暫緩移除不會生效，這個來源的網域會被從 Gateway 移除。
+    if ! fetch_source_with_fallback "$name" "$url" "$format" 0 || [[ "$FETCH_STATUS" != "200" ]]; then
+      warn "[$name] 補抓失敗（$FETCH_SUMMARY），本次合併會缺少這個來源的網域"
       echo "$name" >> "$TMP_DIR/failed_sources.txt"
+      # 閘門階段 304 分支依前次狀態寫的 checksum 要拿掉：第二次 collect_source_checksums
+      # 不收它，狀態回寫由 failed_sources.txt 補上前次值，src:<name> 才只會出現一次。
       rm -f "$TMP_DIR/sum_$name.txt"
       continue
     fi
-    printf '%s\t%s\t%s\n' "$name" \
-      "$(header_value "$TMP_DIR/hdr_$name.txt" 'ETag')" \
-      "$(header_value "$TMP_DIR/hdr_$name.txt" 'Last-Modified')" >> "$TMP_DIR/newmeta.txt"
   done < "$TMP_DIR/notmodified.txt"
 }
 
@@ -840,19 +1096,23 @@ decide_should_sync() {
   # 比對本次算出的 checksum 與 sync_state 中的前次值，決定要不要繼續完整同步。
   # 回傳 0 = 要同步；1 = 可以略過。
   # $1 = 前次狀態檔（key<TAB>value）, $2 = 白名單 checksum, $3 = 自訂封鎖清單 checksum
-  # 輸出（stdout）：一行變動原因摘要，供記錄用
+  # 輸出（stdout）：每個變動原因一行「類型<TAB>項目」（項目可空），交給 render_change_reasons 呈現。
+  #
+  # 以前是在這裡用 `paste -sd'；'` 把原因接成一行。全形分號是 3 個位元組，而 paste -d 把參數當成
+  # 「逐位元組輪流使用」的分隔符清單，每個接縫只吐一個位元組 —— 不是合法的 UTF-8，
+  # 日誌上顯示成「來源內容變動 AdGuard-DNS-filter�來源內容變動 easylist�…」。
   local prev_file="$1" wl_sum="$2" bl_sum="$3"
 
   if [[ "$FORCE_SYNC" == "1" ]]; then
-    echo "FORCE_SYNC=1，略過閘門強制同步"
+    printf '%s\t%s\n' "強制同步" "FORCE_SYNC=1，略過閘門"
     return 0
   fi
   if [[ $STATE_AVAILABLE -ne 1 ]]; then
-    echo "狀態表不可用，退回完整同步"
+    printf '%s\t%s\n' "狀態表不可用" "退回完整同步"
     return 0
   fi
   if [[ ! -s "$prev_file" ]]; then
-    echo "沒有先前的 checksum 紀錄（首次啟用閘門）"
+    printf '%s\t%s\n' "首次啟用閘門" "沒有先前的 checksum 紀錄"
     return 0
   fi
 
@@ -867,26 +1127,69 @@ decide_should_sync() {
     {
       if ($1 in failed) next
       key = "src:" $1
-      if (!(key in prev))  { print "新增來源 " $1; next }
-      if (prev[key] != $2) { print "來源內容變動 " $1 }
+      if (!(key in prev))  { print "新增來源\t" $1; next }
+      if (prev[key] != $2) { print "來源內容變動\t" $1 }
     }
   ' "$prev_file" "$TMP_DIR/failed_sources.txt" "$TMP_DIR/source_checksums.txt")
 
   local prev_wl prev_bl
   prev_wl=$(awk -F'\t' '$1=="whitelist"{print $2}' "$prev_file")
   prev_bl=$(awk -F'\t' '$1=="blocklist"{print $2}' "$prev_file")
-  [[ "$prev_wl" != "$wl_sum" ]] && changed="${changed}${changed:+$'\n'}白名單有變動"
-  [[ "$prev_bl" != "$bl_sum" ]] && changed="${changed}${changed:+$'\n'}自訂封鎖清單有變動"
+  [[ "$prev_wl" != "$wl_sum" ]] && changed="${changed}${changed:+$'\n'}白名單有變動"$'\t'
+  [[ "$prev_bl" != "$bl_sum" ]] && changed="${changed}${changed:+$'\n'}自訂封鎖清單有變動"$'\t'
 
   if [[ $DEFERRED_BACKLOG -gt 0 && $(d1_budget_left) -gt 0 ]]; then
-    changed="${changed}${changed:+$'\n'}有 $DEFERRED_BACKLOG 筆積欠的分類快取待補寫"
+    changed="${changed}${changed:+$'\n'}積欠的分類快取待補寫"$'\t'"$DEFERRED_BACKLOG 筆"
   fi
 
   if [[ -n "$changed" ]]; then
-    echo "$changed" | paste -sd'；' -
+    printf '%s\n' "$changed"
     return 0
   fi
   return 1
+}
+
+md_escape() {
+  # stdin → stdout。把文字變成放進 Markdown 表格或清單也不會被當成語法的形式。
+  # & < > 轉成實體；\ ` | [ ] ( ) ! * _ ~ 前面加反斜線。
+  # 以 LC_ALL=C 逐位元組處理：UTF-8 的多位元組序列不含這些 ASCII 字元，原樣通過。
+  # 反斜線必須先處理，否則會把後面加上的反斜線再跳脫一次。
+  LC_ALL=C sed \
+    -e 's/&/\&amp;/g' \
+    -e 's/</\&lt;/g' \
+    -e 's/>/\&gt;/g' \
+    -e 's/\\/\\\\/g' \
+    -e 's/[]`|[()!*_~]/\\&/g'
+}
+
+render_change_reasons() {
+  # $1 = log | md；stdin 是 decide_should_sync 的輸出（每行「類型<TAB>項目」，項目可空）。
+  # 依類型分組、保留第一次出現的順序，項目以「、」相接。
+  #   log：  - 來源內容變動（3）：a、b、c      沒有項目的類型只印「  - 白名單有變動」
+  #   md ：| 變動類型 | 項目 | 表格，項目經 md_escape，空的印 —
+  # 用 LC_ALL=C 的 awk 拼接：逐位元組照抄，不會像 paste -d 那樣把多位元組字元拆開。
+  local mode="$1"
+  case "$mode" in
+    md) md_escape ;;
+    *)  cat ;;
+  esac | LC_ALL=C awk -F'\t' -v mode="$mode" '
+    $1 == "" { next }
+    {
+      t = $1
+      item = substr($0, length($1) + 2)
+      if (!(t in seen)) { seen[t] = 1; order[++n] = t; cnt[t] = 0; items[t] = "" }
+      if (item != "") { cnt[t]++; items[t] = (items[t] == "" ? item : items[t] "、" item) }
+    }
+    END {
+      if (n == 0) exit
+      if (mode == "md") { print "| 變動類型 | 項目 |"; print "|---|---|" }
+      for (i = 1; i <= n; i++) {
+        t = order[i]
+        if (mode == "md") print "| " t " | " (cnt[t] ? items[t] : "—") " |"
+        else if (cnt[t]) print "  - " t "（" cnt[t] "）：" items[t]
+        else print "  - " t
+      }
+    }'
 }
 
 # ── 4. D1：白名單 / 自訂封鎖清單 ──────────────────────────
@@ -1886,7 +2189,8 @@ record_sync_history() {
 write_step_summary() {
   # 把結果寫成 GitHub Actions 的 Job Summary（Actions 頁面上直接看得到的表格），
   # 不在 Actions 環境下執行時（例如本機手動跑）就靜靜跳過。
-  # $1 status, $2 total_merged, $3 total_uploaded, $4 原因說明
+  # $1 status, $2 total_merged, $3 total_uploaded,
+  # $4 原因：success 時是 decide_should_sync 的結構化輸出（渲染成表格），其他狀態是固定字串
   [[ -n "${GITHUB_STEP_SUMMARY:-}" ]] || return 0
   local status="$1" merged="$2" uploaded="$3" reason="$4"
   {
@@ -1909,8 +2213,12 @@ write_step_summary() {
       echo "| 對 Cloudflare 的變更 | 無 |"
       echo "| Gateway 現有清單 | 未受影響，仍然生效 |"
     else
-      echo "✅ **同步完成** — $reason"
+      echo "✅ **同步完成**"
       echo
+      if [[ -n "$reason" ]]; then
+        render_change_reasons md <<< "$reason"
+        echo
+      fi
       echo "| 項目 | 數值 |"
       echo "|---|---|"
       echo "| 來源合併後網域數 | $merged |"
@@ -1932,7 +2240,8 @@ write_step_summary() {
     if [[ -s "$TMP_DIR/failed_sources.txt" ]]; then
       echo
       echo "⚠️ 這些訂閱來源本次抓取失敗，已沿用前次狀態："
-      sed 's/^/- /' "$TMP_DIR/failed_sources.txt"
+      # 來源名經 md_escape：否則名稱裡的 [x](y)、<、* 之類會被 Job Summary 當成 Markdown／HTML 語法
+      md_escape < "$TMP_DIR/failed_sources.txt" | sed 's/^/- /'
     fi
   } >> "$GITHUB_STEP_SUMMARY"
 }
@@ -1982,7 +2291,8 @@ main() {
 
   local sync_reason=""
   if sync_reason=$(decide_should_sync "$PREV_STATE_FILE" "$wl_sum" "$bl_sum"); then
-    log "偵測到變動，執行完整同步 → $sync_reason"
+    log "偵測到變動，執行完整同步："
+    render_change_reasons log <<< "$sync_reason" | while IFS= read -r reason_line; do log "$reason_line"; done
   else
     log "所有訂閱來源、白名單與自訂封鎖清單的 checksum 都與上次相同，略過本次同步（完全沒有對 Cloudflare 做任何變更）"
     # 刻意不寫 sync_history：每小時塞一筆 skipped 會讓歷史表被雜訊淹沒
