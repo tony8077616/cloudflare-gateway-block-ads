@@ -588,9 +588,13 @@ Workers Builds 的設定必須是：
 | 部署命令 | `npx wrangler deploy -c wrangler.production.toml` |
 | 版本命令 | `npx wrangler versions upload -c wrangler.production.toml` |
 
-> ⚠️ **少了 `-c` 會部署範本**：線上儀表板會變成一律 503，D1／KV 繫結被清掉。
-> 接上 Workers Builds 之後，`wrangler.production.toml` 就是線上設定的唯一真實來源，
-> 只在後台改的變數、繫結、observability 會被下一次建置覆寫。
+> ⚠️ **少了 `-c` 會部署範本**：線上儀表板會變成一律 503，D1／KV 繫結被清掉，
+> 預覽網址也會被關掉。接上 Workers Builds 之後，`wrangler.production.toml` 就是線上設定的
+> 唯一真實來源，只在後台改的變數、繫結、observability、預覽網址、自訂網域都會被下一次建置覆寫。
+
+線上目前開著「非 production 分支的組建」與預覽網址，所以每個 PR 分支 push 都會上傳一個版本
+（`wrangler versions upload`，不影響正式流量）並產生預覽入口；這些入口與自訂網域
+`adblock.salausau.trade` 都必須被同一支 Access 應用涵蓋。
 
 #### 設定 Access（兩種裝法都要做）
 
