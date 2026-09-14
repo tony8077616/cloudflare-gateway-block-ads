@@ -580,6 +580,31 @@ Cloudflare GraphQL Analytics 的 `gatewayResolverQueriesAdaptiveGroups`。
    npx wrangler deploy
    ```
 
+#### 這個 repo 自己的線上部署（維護者用）
+
+本 repo 維護者的儀表板由 **Workers Builds 從 `main` 自動部署**，讀的是
+`worker/wrangler.production.toml`，**不是** `wrangler.toml`。
+
+- `wrangler.toml` 是上面兩種裝法的範本，刻意保持佔位值。一鍵部署只會重新佈建 D1／KV，
+  **不會改 `[vars]`**，所以真實的帳戶 ID 與 `ACCESS_AUD` 不能寫在那裡。
+- `wrangler.production.toml` 寫死的是維護者帳戶的值，**拿去部署只會得到一支一律 403 的 Worker**。
+
+Workers Builds 的設定必須是：
+
+| 欄位 | 值 |
+|---|---|
+| 根目錄 | `/worker` |
+| 部署命令 | `npx wrangler deploy -c wrangler.production.toml` |
+| 版本命令 | `npx wrangler versions upload -c wrangler.production.toml` |
+
+> ⚠️ **少了 `-c` 會部署範本**：線上儀表板會變成一律 503，D1／KV 繫結被清掉，
+> 預覽網址也會被關掉。接上 Workers Builds 之後，`wrangler.production.toml` 就是線上設定的
+> 唯一真實來源，只在後台改的變數、繫結、observability、預覽網址、自訂網域都會被下一次建置覆寫。
+
+線上目前開著「非 production 分支的組建」與預覽網址，所以每個 PR 分支 push 都會上傳一個版本
+（`wrangler versions upload`，不影響正式流量）並產生預覽入口；這些入口與自訂網域
+`adblock.salausau.trade` 都必須被同一支 Access 應用涵蓋。
+
 #### 設定 Access（兩種裝法都要做）
 
 部署完之後打開網址，你會看到 **503**。**這是正常的**，不是壞了。
