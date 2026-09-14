@@ -867,15 +867,19 @@ check_one_source() {
   local -a method_args=()
   # 跟 sync.sh 的 fetch_source_with_fallback 同一套成功定義與取檔方式（獨立複製，不 source sync.sh）：
   # curl 離開狀態必須是 0（--max-time 在傳輸途中觸發時 curl 以 28 結束「但仍印出 200」）、
-  # HTTP 200、內容通過純文字檢查。① 失敗且原因可能是連線本身時，才換 ② 重試。
+  # HTTP 200、內容通過純文字檢查。前一種失敗且原因可能是連線本身時，才換下一種重試。
+  # ② ③ 的參數與 sync.sh 逐字相同（test/source-fetch-fallback.test.sh 以比對釘住）；
+  # ③ 只把 DNS 解析器換成 https://1.1.1.1/dns-query，DoH 伺服器的憑證照常驗證。
   # 硬化旗標也相同：-q 固定是第一個參數（curl 只有這樣才不讀 ~/.curlrc）、只准 https、
   # 轉址與檔案大小有上限、-- 結束旗標解析（所以像 -o/tmp/pwned 這種值會被當成網址而不是旗標）。
-  for m in 1 2; do
+  for m in 1 2 3; do
     case $m in
       1) label="①原網址直連"
          method_args=(-sSL --retry 2 --retry-all-errors --max-time 60) ;;
       2) label="②換連線參數重試"
          method_args=(-sSL --retry 1 --retry-all-errors --connect-timeout 10 --max-time 45 --http1.1 -4) ;;
+      3) label="③改用 DoH 解析"
+         method_args=(-sSL --retry 1 --retry-all-errors --connect-timeout 10 --max-time 45 --doh-url https://1.1.1.1/dns-query) ;;
     esac
     rm -f "$out"
     rc=0

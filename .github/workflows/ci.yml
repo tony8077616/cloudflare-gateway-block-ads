@@ -91,6 +91,20 @@ jobs:
       - name: 來源取得的連線預案、TXT 限制與注入防護
         run: bash test/source-fetch-fallback.test.sh
 
+      # 取檔方式③用 curl --doh-url。這一步只證明 runner 的 curl「接受這個選項、DoH 功能有編進去」：
+      # 離開狀態 2 是不認得選項、4 是功能沒編進去、0 是不可能成功的請求卻成功了。
+      # 它證明不了「確實走 DoH、沒有退回系統 DNS」（.invalid 在系統 DNS 下也是 6），那一點另外在 runner 上實測過。
+      # 離線：DoH 伺服器指向 127.0.0.1:9，網域是保留的 .invalid；不帶任何憑證。
+      # DoH 請求會讀代理環境變數，所以先清掉，免得結果取決於 runner 的代理設定。
+      - name: runner 的 curl 接受 --doh-url
+        run: |
+          rc=0
+          env -u https_proxy -u HTTPS_PROXY -u all_proxy -u ALL_PROXY \
+            curl -q --doh-url https://127.0.0.1:9/dns-query --proto '=https' -sS --max-time 10 \
+            -o /dev/null -- https://doh-capability.invalid/x.txt 2>/dev/null || rc=$?
+          echo "curl 離開狀態：$rc"
+          [[ $rc -ne 2 && $rc -ne 4 && $rc -ne 0 ]]
+
       # 格式欄留空或寫 auto 時，用正在跑的三個解析器投票決定格式。這項釘住：明確寫出的格式
       # 完全不偵測、打錯的格式照舊拒絕、偵測的候選檔不會出現在 build_merged 讀的 parsed_*.txt。
       - name: 來源格式自動偵測

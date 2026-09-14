@@ -91,6 +91,29 @@ if ! self_check_call_sites "$WORK/sync_lf.sh"; then
   exit 2
 fi
 
+# ── 自我驗證：fetch_source_with_fallback 的 case $m 恰好有 1)、2)、3) 三個分支 ─────
+method_branches() {
+  # $1 = 檔案 → fetch_source_with_fallback 裡「case $m in」到第一個 esac 之間的分支標籤，一行一個
+  awk '
+    $0 == "fetch_source_with_fallback() {"          { fn = 1; next }
+    fn && $0 == "}"                                  { exit }
+    fn && !inside && $0 ~ /^[[:space:]]*case \$m in$/ { inside = 1; n_case++; next }
+    inside && $0 ~ /^[[:space:]]*esac$/              { inside = 0; next }
+    inside && match($0, /^[[:space:]]*[^[:space:]()]+\)/) { s = substr($0, RSTART, RLENGTH); gsub(/[[:space:]]/, "", s); print s }
+    END { if (n_case != 1) print "case-$m-count:" n_case }
+  ' "$1"
+}
+if [[ "$(method_branches "$WORK/sync_lf.sh" | tr '\n' ' ')" != "1) 2) 3) " ]]; then
+  echo "❌ 自我驗證失敗：fetch_source_with_fallback 的 case \$m 應該恰好有 1)、2)、3) 三個分支，實得：$(method_branches "$WORK/sync_lf.sh" | tr '\n' ' ')" >&2
+  exit 2
+fi
+
+# setup.sh（案例 38 比對 ② ③ 的參數用）：同樣只對腳本本身剝 CR
+SETUP="$ROOT/setup.sh"
+[[ -f "$SETUP" ]] || { echo "找不到 $SETUP" >&2; exit 2; }
+tr -d '\r' < "$SETUP" > "$WORK/setup_lf.sh"
+SETUP_UNDER_TEST="$WORK/setup_lf.sh"
+
 # ── 執行器 ────────────────────────────────────────────────
 cat > "$WORK/runner.sh" <<'RUNNEREOF'
 #!/usr/bin/env bash
@@ -134,16 +157,19 @@ curl() {
   echo "$n" > "$SC/ncalls"
   printf '%s\n' "$@" > "$SC/argv.$n"
   local -a a=("$@")
-  local i hdr="" out="" url="" inm="" method=m1
+  local i hdr="" out="" url="" inm="" method=m1 seen_http11=0 seen_doh=0
   for ((i = 0; i < ${#a[@]}; i++)); do
     case "${a[i]}" in
       -D) hdr="${a[i+1]}" ;;
       -o) out="${a[i+1]}" ;;
       -H) case "${a[i+1]}" in "If-None-Match: "*) inm="${a[i+1]#If-None-Match: }" ;; esac ;;
-      --http1.1) method=m2 ;;
+      --http1.1) seen_http11=1 ;;
+      --doh-url) seen_doh=1 ;;
       --) url="${a[i+1]}" ;;
     esac
   done
+  # 方式判定：--http1.1 → m2（不論位置，兩者同時出現時也判 m2）；否則 --doh-url → m3；都沒有 → m1
+  if [[ $seen_http11 -eq 1 ]]; then method=m2; elif [[ $seen_doh -eq 1 ]]; then method=m3; fi
   local name="${url##*/}"; name="${name%.txt}"
   printf '%s %s %s\n' "$n" "$name" "$method" >> "$SC/calls.log"
   local rc=0 code=200 body="" headers="" partial=0 nofiles=0 etag304="" force304=0 stderr=""
@@ -219,6 +245,8 @@ printf '[Adblock Plus 2.0]\n! only comments here\n' > "$FX/zero"
 printf '<!DOCTYPE html>\n<html><body>\n||only-in-html.example^\n</body></html>\n' > "$FX/html"
 printf 'HTTP/1.1 200 OK\r\nETag: "m1"\r\nLast-Modified: Wed, 01 Jan 2026 00:00:00 GMT\r\n\r\n' > "$FX/hdr_m1"
 printf 'HTTP/2 200\r\netag: "m2"\r\nlast-modified: Thu, 02 Jan 2026 00:00:00 GMT\r\n\r\n' > "$FX/hdr_m2"
+printf '[Adblock Plus 2.0]\n! Title: m3\n||m3-ok.example^\n||m3-second.example^\n' > "$FX/m3_ok"
+printf 'HTTP/2 200\r\netag: "m3"\r\nlast-modified: Fri, 03 Jan 2026 00:00:00 GMT\r\n\r\n' > "$FX/hdr_m3"
 
 # fixture 自我驗證：半截內容必須含完整的 ||only-in-m1.example^ 那一行，② 的內容不可以含它
 half=$(( $(wc -c < "$FX/m1_partial_src") / 2 ))
@@ -227,6 +255,10 @@ head -c "$half" "$FX/m1_partial_src" | grep -qx '||only-in-m1.example^' \
 head -c "$half" "$FX/m1_partial_src" | grep -q 'm1-tail' \
   && { echo "❌ fixture 錯誤：m1 的半截內容不應該含結尾那一行" >&2; exit 2; }
 grep -q 'only-in-m1' "$FX/m2_ok" && { echo "❌ fixture 錯誤：② 的內容含 only-in-m1" >&2; exit 2; }
+grep -qE 'only-in-m1|m2-ok|only-in-html' "$FX/m3_ok" && { echo "❌ fixture 錯誤：③ 的內容含 ①／②／HTML 的網域" >&2; exit 2; }
+grep -q 'm3-ok' "$FX/m2_ok" "$FX/healthy" "$FX/html" "$FX/m1_partial_src" && { echo "❌ fixture 錯誤：其他 fixture 含 m3-ok" >&2; exit 2; }
+bash "$WORK/runner.sh" "$HARNESS" "$WORK" fn parse_adblock < "$FX/m3_ok" | grep -qx 'm3-ok.example' \
+  || { echo "❌ fixture 錯誤：③ 的內容解析不出 m3-ok.example" >&2; exit 2; }
 bash "$WORK/runner.sh" "$HARNESS" "$WORK" fn parse_adblock < "$FX/html" | grep -qx 'only-in-html.example' \
   || { echo "❌ fixture 錯誤：HTML fixture 裡沒有能解析成網域的標記行，驗不到「沒被採用」" >&2; exit 2; }
 [[ -z "$(bash "$WORK/runner.sh" "$HARNESS" "$WORK" fn parse_adblock < "$FX/zero")" ]] \
@@ -311,8 +343,9 @@ case_6() {
   add_source "$d" s6
   spec "$d" s6 m1 rc=7 code=000 nofiles=1
   spec "$d" s6 m2 code=503 "body='$FX/html'"
+  spec "$d" s6 m3 rc=7 code=000 nofiles=1
   run_entry "$h" "$d" gate
-  [[ "$(calls "$d" s6)" == "2" ]] && in_failed "$d" s6 \
+  [[ "$(calls "$d" s6)" == "3" ]] && in_failed "$d" s6 \
     && [[ ! -e "$d/tmp/parsed_s6.txt" && ! -e "$d/tmp/sum_s6.txt" ]]
 }
 
@@ -491,26 +524,44 @@ case_19() {
   [[ "$(cd "$d/tmp" && ls parsed_*.txt 2>/dev/null)" == "parsed_s19.txt" ]]
 }
 
-case_20() {
-  local h="$1" d name n; d=$(new_sc c20)
+run_budget_20() {
+  # $1 = 函式檔, $2 = 情境標籤, $3 = 預算 → 情境目錄。四個來源的 ① ② ③ 全部傳輸前失敗；
+  # 時鐘替身讓每一次 date +%s 前進 100 秒，所以 ② 或 ③ 的每一次嘗試都計 100 秒。
+  local h="$1" d name; d=$(new_sc "$2")
   echo 0 > "$d/clock"
   for name in b1 b2 b3 b4; do
     add_source "$d" "$name"
     spec "$d" "$name" m1 rc=7 code=000 nofiles=1
     spec "$d" "$name" m2 rc=7 code=000 nofiles=1
+    spec "$d" "$name" m3 rc=7 code=000 nofiles=1
   done
-  OVERRIDE_BUDGET=150 run_entry "$h" "$d" gate
-  [[ "$(calls "$d" b1)" == "2" && "$(calls "$d" b2)" == "2" && "$(calls "$d" b3)" == "1" && "$(calls "$d" b4)" == "1" ]] || return 1
+  OVERRIDE_BUDGET="$3" run_entry "$h" "$d" gate
+  echo "$d"
+}
+
+case_20a() {
+  # 預算 150：b1 的 ② 累計 100 < 150 → 試 ③，累計 200；b2 以後只走 ①
+  local h="$1" d n; d=$(run_budget_20 "$h" c20a 150)
+  [[ "$(calls "$d" b1)" == "3" && "$(calls "$d" b2)" == "1" && "$(calls "$d" b3)" == "1" && "$(calls "$d" b4)" == "1" ]] || return 1
   n=$(grep -c '時間預算' "$d/log") || n=0
   [[ "$n" == "1" ]]
 }
 
-CANARIES=(CANARY_BODY_OK CANARY_BODY_HTML CANARY_HOP_ETAG CANARY_LOCATION CANARY_FINAL_ETAG CANARY_LASTMOD CANARY_FINALURL CANARY_STDERR_1 CANARY_STDERR_2 CANARY_CODE)
+case_20b() {
+  # 預算 100：b1 的 ② 累計 100 ≥ 100 → 不試 ③；b2 以後只走 ①
+  local h="$1" d n; d=$(run_budget_20 "$h" c20b 100)
+  [[ "$(calls "$d" b1)" == "2" && "$(calls "$d" b2)" == "1" && "$(calls "$d" b3)" == "1" && "$(calls "$d" b4)" == "1" ]] || return 1
+  n=$(grep -c '時間預算' "$d/log") || n=0
+  [[ "$n" == "1" ]]
+}
+
+CANARIES=(CANARY_BODY_OK CANARY_BODY_HTML CANARY_HOP_ETAG CANARY_LOCATION CANARY_FINAL_ETAG CANARY_LASTMOD CANARY_FINALURL CANARY_STDERR_1 CANARY_STDERR_2 CANARY_STDERR_3 CANARY_CODE)
 
 case_21() {
   local h="$1" d c; d=$(new_sc c21)
   add_source "$d" c21ok
   add_source "$d" c21fail
+  add_source "$d" c21m3
   printf '[Adblock Plus 2.0]\n! ##[error]CANARY_BODY_OK\n::warning::CANARY_BODY_OK\n||canary-ok.example^\n' > "$d/files/body_ok"
   printf '<!DOCTYPE html>\n::error::CANARY_BODY_HTML\n##[warning]CANARY_BODY_HTML\n||canary-html.example^\n' > "$d/files/body_html"
   printf 'HTTP/1.1 302 Found\r\nLocation: https://x.example/::error::CANARY_LOCATION.txt\r\nETag: "CANARY_HOP_ETAG"\r\n\r\nHTTP/2 200\r\netag: "##[error]CANARY_FINAL_ETAG"\r\nlast-modified: ::warning::CANARY_LASTMOD\r\ncontent-location: https://final.example/CANARY_FINALURL.txt\r\n\r\n' > "$d/files/h_ok"
@@ -518,10 +569,15 @@ case_21() {
   spec "$d" c21ok m2 "body='$d/files/body_ok'" "headers='$d/files/h_ok'"
   spec "$d" c21fail m1 "code='200::error::CANARY_CODE'" "body='$d/files/body_html'" "stderr='##[error]CANARY_STDERR_2'"
   spec "$d" c21fail m2 "body='$d/files/body_html'" "headers='$d/files/h_ok'"
+  spec "$d" c21fail m3 "body='$d/files/body_html'" "headers='$d/files/h_ok'" "stderr='::error::CANARY_STDERR_3'"
+  spec "$d" c21m3 m1 rc=7 code=000 nofiles=1
+  spec "$d" c21m3 m2 rc=7 code=000 nofiles=1
+  spec "$d" c21m3 m3 "body='$d/files/body_ok'" "headers='$d/files/h_ok'"
   run_entry "$h" "$d" gate_summary
-  # 前提：真的走過兩個來源、兩種方式，而且成功的那個有被採用
-  [[ "$(calls "$d" c21ok)" == "2" && "$(calls "$d" c21fail)" == "2" ]] || return 1
+  # 前提：真的走過三個來源、三種方式，而且成功的那兩個有被採用（c21m3 走「方式③取得成功」的 log 路徑）
+  [[ "$(calls "$d" c21ok)" == "2" && "$(calls "$d" c21fail)" == "3" && "$(calls "$d" c21m3)" == "3" ]] || return 1
   has_domain "$d/tmp/parsed_c21ok.txt" canary-ok.example || return 1
+  has_domain "$d/tmp/parsed_c21m3.txt" canary-ok.example || return 1
   in_failed "$d" c21fail || return 1
   [[ -s "$d/summary.md" ]] || return 1
   cat "$d/stdout" "$d/log" "$d/summary.md" > "$d/all_output"
@@ -604,6 +660,7 @@ run_mat_24() {
   local h="$1" d; d=$(mat_sc c24 s24)
   spec "$d" s24 m1 rc=7 code=000 nofiles=1
   spec "$d" s24 m2 rc=7 code=000 nofiles=1
+  spec "$d" s24 m3 rc=7 code=000 nofiles=1
   run_entry "$h" "$d" materialize
   echo "$d"
 }
@@ -659,8 +716,9 @@ case_29() {
   add_source "$d" s29
   spec "$d" s29 m1 rc=28 code=200 partial=1 "body='$FX/m1_partial_src'" "headers='$FX/hdr_m1'"
   spec "$d" s29 m2 rc=7 code=000 nofiles=1
+  spec "$d" s29 m3 rc=7 code=000 nofiles=1
   run_entry "$h" "$d" gate
-  [[ "$(calls "$d" s29)" == "2" ]] || return 1
+  [[ "$(calls "$d" s29)" == "3" ]] || return 1
   in_failed "$d" s29 || return 1
   for f in raw hdr parsed sum fmt; do
     [[ ! -e "$d/tmp/${f}_s29.txt" ]] || return 1
@@ -691,6 +749,144 @@ case_30() {
   [[ ! -s "$d/tmp/notmodified.txt" ]]
 }
 
+# ══════════════════════════════════════════════════════════
+# 方式③：同網址改用 DoH 解析
+# ══════════════════════════════════════════════════════════
+M3_ARGS=(-sSL --retry 1 --retry-all-errors --connect-timeout 10 --max-time 45 --doh-url https://1.1.1.1/dns-query)
+
+run_gate_31() {
+  # $1 = 函式檔 → 情境目錄。① ② 傳輸前失敗、③ 200 合格內容＋ETag "m3"（案例 31、37 共用）
+  local h="$1" d; d=$(new_sc c31)
+  add_source "$d" s31
+  spec "$d" s31 m1 rc=7 code=000 nofiles=1
+  spec "$d" s31 m2 rc=7 code=000 nofiles=1
+  spec "$d" s31 m3 "body='$FX/m3_ok'" "headers='$FX/hdr_m3'"
+  run_entry "$h" "$d" gate
+  echo "$d"
+}
+
+case_31() {
+  local h="$1" d; d=$(run_gate_31 "$h")
+  [[ "$(calls "$d" s31)" == "3" ]] || return 1
+  [[ "$(awk '$2 == "s31" { printf "%s ", $3 }' "$d/calls.log")" == "m1 m2 m3 " ]] || return 1
+  has_domain "$d/tmp/parsed_s31.txt" m3-ok.example || return 1
+  [[ "$(meta_field "$d" s31 2)" == '"m3"' ]] || return 1
+  ! in_failed "$d" s31 || return 1
+  grep -qF '[s31] 方式③改用 DoH 解析 取得成功' "$d/log"
+}
+
+case_32() {
+  local h="$1" d; d=$(new_sc c32)
+  add_source "$d" s32
+  spec "$d" s32 m1 rc=7 code=000 nofiles=1
+  spec "$d" s32 m2 code=404 "body='$FX/html'"
+  spec "$d" s32 m3 "body='$FX/m3_ok'" "headers='$FX/hdr_m3'"     # 被試到的話會成功：證明「不試 ③」是被擋下的
+  run_entry "$h" "$d" gate
+  [[ "$(calls "$d" s32)" == "2" ]] && in_failed "$d" s32 && [[ ! -e "$d/tmp/parsed_s32.txt" ]]
+}
+
+case_33() {
+  local h="$1" d; d=$(new_sc c33)
+  add_source "$d" s33
+  spec "$d" s33 m1 rc=7 code=000 nofiles=1
+  spec "$d" s33 m2 rc=63 code=200 partial=1 "body='$FX/m1_partial_src'"
+  spec "$d" s33 m3 "body='$FX/m3_ok'" "headers='$FX/hdr_m3'"     # 同上
+  run_entry "$h" "$d" gate
+  [[ "$(calls "$d" s33)" == "2" ]] && in_failed "$d" s33 && [[ ! -e "$d/tmp/parsed_s33.txt" ]]
+}
+
+case_34() {
+  local h="$1" d; d=$(new_sc c34)
+  add_source "$d" s34
+  spec "$d" s34 m1 rc=7 code=000 nofiles=1
+  spec "$d" s34 m2 "body='$FX/html'"
+  spec "$d" s34 m3 "body='$FX/m3_ok'" "headers='$FX/hdr_m3'"
+  run_entry "$h" "$d" gate
+  [[ "$(calls "$d" s34)" == "3" ]] || return 1
+  has_domain "$d/tmp/parsed_s34.txt" only-in-html.example && return 1
+  has_domain "$d/tmp/parsed_s34.txt" m3-ok.example || return 1
+  ! in_failed "$d" s34
+}
+
+case_35() {
+  local h="$1" d f3; d=$(new_sc c35)
+  add_source "$d" s35
+  state "$d" 'etag:s35' '"v35"'
+  state "$d" 'src:s35' 'prevsum35'
+  spec "$d" s35 m1 rc=7 code=000 nofiles=1
+  spec "$d" s35 m2 rc=7 code=000 nofiles=1
+  spec "$d" s35 m3 "etag304='\"v35\"'" "body='$FX/html'"
+  run_entry "$h" "$d" gate
+  [[ "$(calls "$d" s35)" == "3" ]] || return 1
+  f3=$(call_argv "$d" s35 m3)
+  [[ -f "$f3" ]] && grep -qx 'If-None-Match: "v35"' "$f3" || return 1
+  grep -qxF "$(printf 's35\tadblock')" "$d/tmp/notmodified.txt" || return 1
+  [[ "$(cat "$d/tmp/sum_s35.txt")" == "prevsum35" ]] || return 1
+  ! in_failed "$d" s35
+}
+
+case_36() {
+  local h="$1" d; d=$(mat_sc c36 s36)
+  spec "$d" s36 m1 rc=28 code=200 partial=1 "body='$FX/m1_partial_src'" "headers='$FX/hdr_m1'"
+  spec "$d" s36 m2 rc=7 code=000 nofiles=1
+  spec "$d" s36 m3 "body='$FX/m3_ok'" "headers='$FX/hdr_m3'"
+  run_entry "$h" "$d" materialize
+  [[ "$(calls "$d" s36)" == "3" ]] || return 1
+  has_domain "$d/tmp/parsed_s36.txt" only-in-m1.example && return 1
+  has_domain "$d/tmp/parsed_s36.txt" m3-ok.example || return 1
+  [[ "$(cat "$d/tmp/sum_s36.txt")" == "$(sha_of "$d/tmp/parsed_s36.txt")" && "$(cat "$d/tmp/sum_s36.txt")" != "$PREVSUM" ]] || return 1
+  grep -q "^s36	" "$d/tmp/newmeta.txt" && ! in_failed "$d" s36 || return 1
+  [[ "$(src_lines "$d" s36)" == "1" ]]
+}
+
+case_37() {
+  local h="$1" d f f1 f2 f3 m; d=$(run_gate_31 "$h")
+  [[ "$(calls "$d" s31)" == "3" ]] || return 1
+  f1=$(call_argv "$d" s31 m1); f2=$(call_argv "$d" s31 m2); f3=$(call_argv "$d" s31 m3)
+  [[ -f "$f1" && -f "$f2" && -f "$f3" ]] || return 1
+  # 第一道：③ 的 argv 與釘住的預期值完全相同（寫法同案例 1；這個情境沒有前次狀態，所以沒有條件式標頭）
+  m="$d/tmp/fetch_s31/m3"
+  printf '%s\n' -q "${M3_ARGS[@]}" --proto =https --proto-redir =https --max-redirs 5 --max-filesize 52428800 \
+    -A cloudflare-gateway-block-ads-sync/1.0 \
+    -D "$m/headers" -o "$m/body" -w '%{http_code}' -- "$(url_of s31)" > "$d/expected_argv_m3"
+  cmp -s "$d/expected_argv_m3" "$f3" || return 1
+  # 第二道：黑名單
+  for f in "$f1" "$f2" "$f3"; do
+    argv_rules "$f" || return 1
+    grep -qxE -- '--doh-insecure|--insecure|--proxy-insecure|--resolve|--connect-to|-x|--proxy|--cacert|--capath' "$f" && return 1
+    grep -qE -- '^(--doh-insecure|--insecure|--proxy-insecure|--resolve|--connect-to|--proxy|--cacert|--capath)=' "$f" && return 1
+    grep -qE -- '^-[^-]*[kx]' "$f" && return 1
+  done
+  grep -qx -- '--doh-url' "$f1" && return 1
+  grep -qx -- '--doh-url' "$f2" && return 1
+  grep -qxE -- '--http1.1|-4' "$f3" && return 1
+  return 0
+}
+
+method_args_line() {
+  # $1 = 檔案（已剝 CR）, $2 = 方式編號 → 「N) label=」那一行的下一行，去掉行首空白
+  awk -v n="$2" 'hit { sub(/^[[:space:]]+/, ""); print; hit = 0 } $0 ~ "^[[:space:]]*" n "\\) label=" { hit = 1 }' "$1"
+}
+
+case_38() {
+  # $1 = 函式檔（sync.sh 那一側從它抽）；setup.sh 那一側從 $SETUP_UNDER_TEST 抽
+  local h="$1" src k n line
+  for src in "$h" "$SETUP_UNDER_TEST"; do
+    for k in 2 3; do
+      n=$(method_args_line "$src" "$k" | wc -l | tr -d ' ')
+      line=$(method_args_line "$src" "$k")
+      if [[ "$n" != "1" || -z "$line" || "$line" != method_args=\(*\)* ]]; then
+        echo "❌ 自我驗證失敗：$src 裡方式 $k 的 method_args=(...) 行應該恰好一行且非空，實得 $n 行" >&2
+        exit 2
+      fi
+    done
+  done
+  [[ "$(method_args_line "$h" 3)" == *"--doh-url https://1.1.1.1/dns-query"* ]] || return 1
+  [[ "$(method_args_line "$SETUP_UNDER_TEST" 3)" == *"--doh-url https://1.1.1.1/dns-query"* ]] || return 1
+  [[ "$(method_args_line "$h" 2)" == "$(method_args_line "$SETUP_UNDER_TEST" 2)" ]] || return 1
+  [[ "$(method_args_line "$h" 3)" == "$(method_args_line "$SETUP_UNDER_TEST" 3)" ]]
+}
+
 run_all_cases() {
   local h="$1"
   echo "閘門階段"
@@ -699,7 +895,7 @@ run_all_cases() {
   check "3. ① exit 28 ＋ 200 ＋ 半截內容：視為失敗，採用 ②，ETag 是 ② 的" case_3 "$h"
   check "4. ① exit 63：視為失敗，不嘗試 ②" case_4 "$h"
   check "5. ① 回 000：採用 ② 的內容，ETag 有記錄" case_5 "$h"
-  check "6. ① ② 都失敗：進 failed_sources.txt，最上層沒有 parsed_／sum_" case_6 "$h"
+  check "6. ① ② ③ 都失敗：進 failed_sources.txt，最上層沒有 parsed_／sum_" case_6 "$h"
   check "7. ① 回 404：不嘗試 ②" case_7 "$h"
   check "8. ① 回 429／503／403：嘗試 ②" case_8 "$h"
   check "9. ① 回 200 但內容是 HTML：嘗試 ②，最上層 parsed_ 是 ② 的" case_9 "$h"
@@ -713,20 +909,30 @@ run_all_cases() {
   check "17. 狀態裡的舊驗證標頭含 TAB、控制字元、過長：不塞進 -H，改成無條件請求" case_17 "$h"
   check "18. 多組轉址標頭：第一跳有 ETag、最終回應沒有 → 不記錄" case_18 "$h"
   check "19. ① 半截後失敗、② 成功：最上層 raw_／parsed_／sum_ 都是 ② 的，fetch_ 已刪" case_19 "$h"
-  check "20. 預算耗盡：後續來源不再嘗試 ②，log 只印一次" case_20 "$h"
-  check "21. 金絲雀：本體、標頭、Location、最終網址、stderr、HTTP 碼都不出現在 log／Job Summary" case_21 "$h"
+  check "20a. 預算 150：b1 走 ① ② ③，② ③ 合計耗盡後後續來源不再嘗試 ② ③，log 只印一次" case_20a "$h"
+  check "20b. 預算 100：b1 的 ② 用完預算就不試 ③，後續來源只走 ①，log 只印一次" case_20b "$h"
+  check "21. 金絲雀（含 ③）：本體、標頭、Location、最終網址、stderr、HTTP 碼都不出現在 log／Job Summary" case_21 "$h"
   check "22. ①、② 的 argv：-q 第一、--proto／--proto-redir／--max-redirs／--max-filesize、-- 在網址前、無 -K／--config" case_22 "$h"
   echo "補抓階段"
   check "23. ① exit 28 半截、② 成功：採用 ②，sum_ 被覆寫，newmeta 有記錄" case_23 "$h"
-  check "24. ① ② 都失敗：進 failed_sources.txt，最上層 sum_ 已刪除" case_24 "$h"
+  check "24. ① ② ③ 都失敗：進 failed_sources.txt，最上層 sum_ 已刪除" case_24 "$h"
   check "25. ① 200 但 0 筆、前次 src: 非空：嘗試 ②" case_25 "$h"
   check "26. 無條件請求仍回 304：視為失敗，最上層沒有 sum_／parsed_，src: 只出現一次" case_26 "$h"
   check "27. 補抓的 ①、② argv 符合同一組規則，且不帶條件式標頭" case_27 "$h"
   check "28. 狀態回寫檔裡 src:<name> 只出現一次（23 為新值、24 為前次值）" case_28 "$h"
   echo "失敗嘗試不留下殘骸"
-  check "29. ① 半截、② 傳輸前失敗：最上層沒有 raw_／hdr_／parsed_／sum_，fetch_ 已刪" case_29 "$h"
+  check "29. ① 半截、② ③ 傳輸前失敗：最上層沒有 raw_／hdr_／parsed_／sum_，fetch_ 已刪" case_29 "$h"
   echo "閘門階段：304 卻沒有前次 checksum"
   check "30. 無條件重抓仍回 304：視為失敗，進 failed_sources.txt，最上層沒有 sum_／parsed_" case_30 "$h"
+  echo "方式③：同網址改用 DoH 解析"
+  check "31. ① ② 000、③ 200 合格：3 次呼叫，採用 ③，ETag 是 ③ 的，log 有方式③成功行" case_31 "$h"
+  check "32. ① 000、② 404：不試 ③，進失敗清單" case_32 "$h"
+  check "33. ① 000、② exit 63：不試 ③，進失敗清單" case_33 "$h"
+  check "34. ① 000、② 200 但 HTML、③ 200 合格：採用 ③" case_34 "$h"
+  check "35. ① ② 000、③ 對條件式請求回 304：③ 帶 If-None-Match，結果同 ① 回 304" case_35 "$h"
+  check "36. 補抓：① 半截、② 000、③ 成功：採用 ③，sum_ 被覆寫，newmeta 有記錄，src: 只出現一次" case_36 "$h"
+  check "37. ③ 的 argv 與釘住值完全相同；三種方式都不含停用驗證、覆寫解析、代理的旗標" case_37 "$h"
+  check "38. setup.sh 與 sync.sh 的 ② ③ 參數逐字相同，③ 含 DoH 網址" case_38 "$h"
 }
 
 run_all_cases "$HARNESS"
@@ -740,9 +946,21 @@ fi
 echo "反事實"
 
 mutate() {
-  # $1 = 變異代號, $2 = 函式名；stdin 兩行：第一行 = 要改寫的那一行（完全比對），第二行 = 改成什麼（@@DELETE@@ = 刪除）
-  local id="$1" fn="$2" from to out="$WORK/mut_$1.sh"
+  # $1 = 變異代號, $2 = 函式名, $3 = 要變異的檔案（省略 = $HARNESS）
+  # stdin 兩行：第一行 = 要改寫的那一行（完全比對），第二行 = 改成什麼（@@DELETE@@ = 刪除）
+  local id="$1" fn="$2" src="${3:-$HARNESS}" from to out="$WORK/mut_$1.sh" n_anchor
   IFS= read -r from; IFS= read -r to
+  # 錨點在函式內必須恰好出現一次：下面只改第一個相符的行，同一行文字出現兩次時會悄悄改到別處。
+  n_anchor=$(MUT_FN="$fn" MUT_FROM="$from" command awk '
+    $0 == ENVIRON["MUT_FN"] "() {" { inside = 1 }
+    inside && $0 == ENVIRON["MUT_FROM"] { n++ }
+    inside && $0 == "}" { inside = 0 }
+    END { print n + 0 }
+  ' "$src")
+  if [[ "$n_anchor" != "1" ]]; then
+    echo "❌ 反事實 $id 的錨點在 $fn 裡出現 $n_anchor 次，應該恰好 1 次：「$from」" >&2
+    exit 2
+  fi
   # 字串一律經 ENVIRON 傳進 awk，不用 -v：awk -v 會處理跳脫序列。
   MUT_FN="$fn" MUT_FROM="$from" MUT_TO="$to" command awk '
     $0 == ENVIRON["MUT_FN"] "() {" { inside = 1 }
@@ -753,14 +971,14 @@ mutate() {
     }
     { print }
     inside && $0 == "}" { inside = 0 }
-  ' "$HARNESS" > "$out"
-  if cmp -s "$HARNESS" "$out"; then
+  ' "$src" > "$out"
+  if cmp -s "$src" "$out"; then
     echo "❌ 反事實 $id 沒有改到任何東西：$fn 裡找不到「$from」（錨點失效，這個反事實是假的）" >&2
     exit 2
   fi
   local changed
   # diff 有差異時回傳 1，在 pipefail 下會讓整條管線失敗，所以先吞掉它的離開狀態
-  changed=$({ diff "$HARNESS" "$out" || :; } | grep -c '^[<>]') || changed=0
+  changed=$({ diff "$src" "$out" || :; } | grep -c '^[<>]') || changed=0
   if [[ "$to" == "@@DELETE@@" ]]; then [[ "$changed" == "1" ]]; else [[ "$changed" == "2" ]]; fi \
     || { echo "❌ 反事實 $id 改到的不只一行（$changed）" >&2; exit 2; }
   printf '%s\n' "$out"
@@ -906,6 +1124,72 @@ M=$(mutate gate_refetch_304_ok fetch_and_merge_sources <<'EOF'
 EOF
 ) || exit 2
 expect_red "閘門階段的無條件重抓把 304 當成成功" "$M" 30
+
+# ── 方式③ ──
+M=$(mutate m3_loop_two fetch_source_with_fallback <<'EOF'
+  for m in 1 2 3; do
+  for m in 1 2; do
+EOF
+) || exit 2
+expect_red "迴圈改回 for m in 1 2" "$M" 31 34 36
+
+M=$(mutate m3_doh_hostname fetch_source_with_fallback <<'EOF'
+         method_args=(-sSL --retry 1 --retry-all-errors --connect-timeout 10 --max-time 45 --doh-url https://1.1.1.1/dns-query) ;;
+         method_args=(-sSL --retry 1 --retry-all-errors --connect-timeout 10 --max-time 45 --doh-url https://cloudflare-dns.com/dns-query) ;;
+EOF
+) || exit 2
+expect_red "③ 的 DoH 改成主機名" "$M" 37
+
+M=$(mutate m3_doh_insecure fetch_source_with_fallback <<'EOF'
+         method_args=(-sSL --retry 1 --retry-all-errors --connect-timeout 10 --max-time 45 --doh-url https://1.1.1.1/dns-query) ;;
+         method_args=(-sSL --retry 1 --retry-all-errors --connect-timeout 10 --max-time 45 --doh-url https://1.1.1.1/dns-query --doh-insecure) ;;
+EOF
+) || exit 2
+expect_red "③ 的參數加 --doh-insecure" "$M" 37
+
+M=$(mutate m3_skip_budget_check fetch_source_with_fallback <<'EOF'
+      if [[ $SOURCE_FALLBACK_SPENT -ge $SOURCE_FALLBACK_BUDGET_SECONDS ]]; then
+      if [[ $m -eq 2 && $SOURCE_FALLBACK_SPENT -ge $SOURCE_FALLBACK_BUDGET_SECONDS ]]; then
+EOF
+) || exit 2
+expect_red "③ 跳過嘗試前的預算檢查" "$M" 20b
+
+M=$(mutate m3_spent_not_counted fetch_source_with_fallback <<'EOF'
+      SOURCE_FALLBACK_SPENT=$(( SOURCE_FALLBACK_SPENT + $(date +%s) - started ))
+      [[ $m -eq 2 ]] && SOURCE_FALLBACK_SPENT=$(( SOURCE_FALLBACK_SPENT + $(date +%s) - started ))
+EOF
+) || exit 2
+expect_red "③ 的耗時不計入預算" "$M" 20a
+
+M=$(mutate m3_no_conditional fetch_source_with_fallback <<'EOF'
+    res=$(curl_source "$name" "$url" "$conditional" "$dir" "${method_args[@]}")
+    res=$(curl_source "$name" "$url" "$(( m == 3 ? 0 : conditional ))" "$dir" "${method_args[@]}")
+EOF
+) || exit 2
+expect_red "③ 不帶條件式標頭" "$M" 35
+
+M=$(mutate m3_http11 fetch_source_with_fallback <<'EOF'
+         method_args=(-sSL --retry 1 --retry-all-errors --connect-timeout 10 --max-time 45 --doh-url https://1.1.1.1/dns-query) ;;
+         method_args=(-sSL --retry 1 --retry-all-errors --connect-timeout 10 --max-time 45 --doh-url https://1.1.1.1/dns-query --http1.1 -4) ;;
+EOF
+) || exit 2
+expect_red "③ 誤加 --http1.1 -4" "$M" 31 37
+
+M=$(mutate doh_before_q curl_source <<'EOF'
+  code=$(curl -q "$@" \
+  code=$(curl --doh-url https://1.1.1.1/dns-query -q "$@" \
+EOF
+) || exit 2
+expect_red "把 --doh-url 插在 -q 前面" "$M" 37
+
+M=$(mutate setup_m3_no_doh check_one_source "$WORK/setup_lf.sh" <<'EOF'
+         method_args=(-sSL --retry 1 --retry-all-errors --connect-timeout 10 --max-time 45 --doh-url https://1.1.1.1/dns-query) ;;
+         method_args=(-sSL --retry 1 --retry-all-errors --connect-timeout 10 --max-time 45) ;;
+EOF
+) || exit 2
+SETUP_UNDER_TEST="$M"
+expect_red "setup.sh 的 ③ 參數少了 --doh-url" "$HARNESS" 38
+SETUP_UNDER_TEST="$WORK/setup_lf.sh"
 
 echo
 echo "通過 $PASS / 失敗 $FAIL"
