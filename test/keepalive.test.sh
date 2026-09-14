@@ -410,10 +410,14 @@ const server = createServer((req, res) => {
     appendFileSync(logPath, JSON.stringify({
       method: req.method, url: req.url, auth: req.headers["authorization"] || "", body,
     }) + "\n");
+    // 狀態一定要在送出回應「之前」寫好。反過來的話，腳本收到最後一個回應就結束，
+    // run_case 緊接著 kill 這個伺服器，可能剛好砍在 writeFileSync 寫到一半 ——
+    // state.json 變成空的或殘缺的，jq 讀不出來，斷言拿到空字串而誤判（CI 上實際出現過
+    // 「反事實：分支讀兩次沒有被抓到（違規= rc=0）」，同一份程式碼重跑就通過）。
     const send = (code, obj) => {
+      save();
       res.writeHead(code, { "Content-Type": "application/json" });
       res.end(JSON.stringify(obj));
-      save();
     };
     const url = req.url;
     const base = "/repos/o/r";
