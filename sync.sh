@@ -445,7 +445,7 @@ parse_hosts() {
 # 單一來源下載內容的大小上限（curl --max-filesize 與 validate_text_content 共用）。
 # 目前最大的來源約 2 MiB，50 MiB 只是擋掉明顯異常的回應。
 SOURCE_MAX_BYTES=$((50 * 1024 * 1024))
-# 取檔方式②（換連線參數重試）在整趟執行裡累計可用的秒數。
+# 取檔方式②（換連線參數重試）與③（改用 DoH 解析）在整趟執行裡合計可用的秒數。
 # 方式①本身的最壞耗時是既有行為；這個預算讓「很多來源同時壞掉」時不會再疊上一整輪重試。
 SOURCE_FALLBACK_BUDGET_SECONDS=480
 SOURCE_FALLBACK_SPENT=0
@@ -824,7 +824,7 @@ _detect_and_parse() {
 fetch_source_with_fallback() {
   # $1 name, $2 url, $3 format, $4 是否帶條件式標頭（1/0）
   #
-  # 依序嘗試兩種取檔方式，一次嘗試**同時**滿足以下條件才算成功：
+  # 依序嘗試三種取檔方式，一次嘗試**同時**滿足以下條件才算成功：
   #   1. curl 離開狀態為 0（截斷的下載不算成功）
   #   2. HTTP 碼為 200 或 304
   #   3. 200 時通過 validate_text_content
@@ -832,6 +832,13 @@ fetch_source_with_fallback() {
   #
   #   ① 原網址直連          現行參數（仍然只呼叫一次 curl，健康狀態下行為不變）
   #   ② 同網址換連線參數    --http1.1 -4、較短的連線與總時間上限、只重試一次
+  #   ③ 同網址改用 DoH 解析 與 ② 相同的逾時與重試，只把 DNS 解析器換成 https://1.1.1.1/dns-query
+  #                         （IP 字面值：runner 的 DNS 壞掉時，主機名形式的 DoH 伺服器本身就解析不到）。
+  #                         內容仍來自原站、同一個網址，地位與 ① 相同，不需要任何降級處理。
+  #                         DoH 伺服器的憑證照常驗證：不得加 --doh-insecure／-k／--insecure。
+  #
+  # 換下一種的規則在 ①→② 與 ②→③ 完全相同（verdict="next" 才繼續）。
+  # ② ③ 共用 SOURCE_FALLBACK_BUDGET_SECONDS：嘗試前檢查、嘗試後累計，兩處都涵蓋 m >= 2。
   #
   # 回傳 0：FETCH_STATUS=200（結果已升級到最上層 raw_/hdr_/parsed_/sum_/fmt_<name>.txt，
   #         驗證標頭已記進 newmeta.txt）或 FETCH_STATUS=304（沒有內容，什麼都沒寫）。
@@ -852,17 +859,19 @@ fetch_source_with_fallback() {
   FETCH_SUMMARY=""
   rm -rf "$work"
 
-  for m in 1 2; do
+  for m in 1 2 3; do
     case $m in
       1) label="①原網址直連"
          method_args=(-sSL --retry 3 --retry-all-errors --max-time 60) ;;
       2) label="②換連線參數重試"
          method_args=(-sSL --retry 1 --retry-all-errors --connect-timeout 10 --max-time 45 --http1.1 -4) ;;
+      3) label="③改用 DoH 解析"
+         method_args=(-sSL --retry 1 --retry-all-errors --connect-timeout 10 --max-time 45 --doh-url https://1.1.1.1/dns-query) ;;
     esac
-    if [[ $m -eq 2 ]]; then
+    if [[ $m -ge 2 ]]; then
       if [[ $SOURCE_FALLBACK_SPENT -ge $SOURCE_FALLBACK_BUDGET_SECONDS ]]; then
         if [[ $SOURCE_FALLBACK_BUDGET_NOTED -eq 0 ]]; then
-          warn "備援取檔的時間預算（${SOURCE_FALLBACK_BUDGET_SECONDS} 秒）已用完，之後失敗的來源不再嘗試方式②"
+          warn "備援取檔的時間預算（${SOURCE_FALLBACK_BUDGET_SECONDS} 秒）已用完，之後失敗的來源不再嘗試方式②③"
           SOURCE_FALLBACK_BUDGET_NOTED=1
         fi
         break
@@ -874,7 +883,7 @@ fetch_source_with_fallback() {
     mkdir -p "$dir"
     res=$(curl_source "$name" "$url" "$conditional" "$dir" "${method_args[@]}")
     rc=${res%% *}; code=${res##* }
-    if [[ $m -eq 2 ]]; then
+    if [[ $m -ge 2 ]]; then
       SOURCE_FALLBACK_SPENT=$(( SOURCE_FALLBACK_SPENT + $(date +%s) - started ))
     fi
 
