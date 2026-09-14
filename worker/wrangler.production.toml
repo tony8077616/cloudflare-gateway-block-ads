@@ -1,0 +1,57 @@
+# 這個 repo 自己的線上儀表板（tony8077616 帳戶上的 adblock-dashboard）的正式設定檔。
+#
+# ⚠️ 這不是給你用的。要自己裝儀表板，請用同目錄的 wrangler.toml（一鍵部署按鈕讀的也是那一份）。
+#    這裡寫死的帳戶 ID、Access aud、D1／KV ID 全都是本 repo 維護者的帳戶，
+#    拿去部署只會得到一支一律 403、而且拿你的 token 去查別人帳戶的 Worker。
+#
+# 為什麼要另開一份，而不是直接改 wrangler.toml：
+#   wrangler.toml 同時是 README「一鍵部署」按鈕的範本。一鍵部署只會重新佈建 D1／KV 並改寫它們的 ID，
+#   **不會改 [vars]**。把真實的 CF_ACCOUNT_ID 與 ACCESS_AUD 寫進去，按鈕就會把它們帶給每一個人。
+#
+# 這份設定怎麼生效：Workers Builds 的指令明確指定它（在 Cloudflare 後台 Worker → 設定 → 組建）：
+#   根目錄     /worker
+#   部署命令   npx wrangler deploy -c wrangler.production.toml
+#   版本命令   npx wrangler versions upload -c wrangler.production.toml
+# 少了 -c，Workers Builds 會讀 wrangler.toml（範本），把線上儀表板覆寫成一律 503、繫結全部被清掉。
+#
+# 接上 Workers Builds 之後，**這個檔案就是線上設定的唯一真實來源**：只在後台改的變數、繫結、
+# observability 會被下一次建置覆寫或清掉。要改線上設定就改這裡。secret（CF_API_TOKEN）不受影響。
+#
+# 下面這些值都不是機密：帳戶 ID 出現在每一個 Cloudflare API 路徑裡；aud 出現在每一個 Access
+# 重導向 URL 的 query string 裡；D1／KV 的 ID 沒有對應的 token 就無法存取。
+# 除了這些值，其餘設定與 wrangler.toml 相同，理由見那一份的註解。
+
+name = "adblock-dashboard"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+workers_dev = true
+preview_urls = false
+
+[observability]
+enabled = true
+
+  [observability.logs]
+  enabled = true
+  head_sampling_rate = 1
+  invocation_logs = true
+
+  [observability.traces]
+  enabled = true
+  head_sampling_rate = 1
+
+[vars]
+CF_ACCOUNT_ID = "5a2eeee372c212cf4f77b36057cec75f"
+# 換掉 Access 應用（刪掉重建也算）會換一組 aud，要同步改這裡，否則 Worker 會把所有人擋在 403。
+ACCESS_AUD = "1a8d1453c7adae73f42c0d1857369bdf789be64459efc01251f7ce594f4bb8f7"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "dns-blocklist-apac"
+database_id = "0918dd23-b75e-4ab5-a82f-bdaa44650fea"
+
+[[kv_namespaces]]
+binding = "CACHE_KV"
+id = "8b033b48486e45909750175222437f05"
+
+# 必要的機密（不在這個檔案裡）：CF_API_TOKEN（Account Analytics: Read），已設在 Worker 上。
