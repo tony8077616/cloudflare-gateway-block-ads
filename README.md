@@ -616,14 +616,18 @@ Workers Builds 的設定必須是：
 2. 在 Zero Trust 後台建立一個 **Worker 型**的 Access 應用，選這支 Worker。
 
    > ⚠️ 不是把 `workers.dev` 網址加進 self-hosted 應用。那是另一種應用型別，
-   > 它不會讓 `ctx.access` 出現在 Worker 裡，結果是你永遠停在 403 而且查不出原因。
+   > 它不會讓 `ctx.access` 出現在 Worker 裡；這支 Worker 預設只信任 `ctx.access`，
+   > 結果是你停在 403 而且查不出原因。下面「自訂網域拿不到 `ctx.access`」的 JWT 驗證
+   > 只給清單內的自訂網域用，**不要**拿它來遷就 `workers.dev` 或預覽網址。
 
 3. **把 policy 限定成你自己的身分**（你自己的 email，或你信任的那個群組）。
 
    > ⚠️ 這一步不是「加強」，是**唯一**的身分控制。Worker 端只驗「這張通行證屬於
-   > 本應用」，**不驗「你是誰」** —— 它比對的是 Access 應用的 aud，那個值對同一支
-   > 應用的每個人都一樣。所以 policy 如果設成 `Everyone` 或 Bypass，任何人登入後
-   > 都會拿到正確的 aud，Worker 照樣放行，你的完整 DNS 查詢記錄就公開了。
+   > 本應用」，**不驗「你是誰」** —— 不論是看 `ctx.access` 還是自行驗證 JWT，它比對的
+   > 都是 Access 應用的 aud，那個值對同一支應用的每個人都一樣。所以 policy 如果設成
+   > `Everyone`，任何人登入後都會拿到本應用的通行證，Worker 照樣放行，你的完整 DNS
+   > 查詢記錄就公開了。（設成 Bypass 的話，Access 不驗證請求，也就不會有 `ctx.access`
+   > 或本應用的 JWT，Worker 會回 403 —— 那是故障，不是保護，不要用 Bypass。）
 
 4. 複製該應用的 **Application Audience (AUD) Tag**，填進 `wrangler.toml` 的
    `[vars] ACCESS_AUD`，然後**重新部署**一次。
@@ -633,7 +637,30 @@ Workers Builds 的設定必須是：
 
 之後如果你刪掉重建 Access 應用，aud 會換一組，記得同步更新並重新部署，否則 Worker
 會把所有人擋在 403。同理，之後想綁自訂網域（在 `wrangler.toml` 加 `routes`）的話，
-新網址也必須被同一支 Access 應用涵蓋，否則一樣是永遠的 403。
+新網址也必須被同一支 Access 應用涵蓋。沒有被涵蓋、也不在下面 `ACCESS_JWT_HOSTNAMES`
+清單裡的網域會一律 403（fail closed）；但**沒有被涵蓋卻放進了清單**的網域不會
+fail closed —— 偷到的 token 在過期前可以直接打它，完全不經過 Access。
+
+#### 自訂網域拿不到 `ctx.access` 時
+
+實測過自訂網域已被 Access 應用涵蓋、登入也成功，Worker 卻一律 403：Access 有驗證、也在
+`Cf-Access-Jwt-Assertion` 標頭附上本應用的 JWT，執行環境卻沒有給 Worker `ctx.access`。
+遇到這種情況，在 `wrangler.toml` 的 `[vars]` 填兩個變數（都不是機密），重新部署：
+
+| 變數 | 值 |
+|---|---|
+| `ACCESS_TEAM_DOMAIN` | `https://<team 名稱>.cloudflareaccess.com`，小寫、沒有結尾斜線、路徑或埠 |
+| `ACCESS_JWT_HOSTNAMES` | 逗號分隔的主機名，例如 `dash.example.com`；只放拿不到 `ctx.access` 的自訂網域 |
+
+兩個都設定後，請求**沒有** `ctx.access`、而且主機名完全等於清單中的一項時，Worker 會依官方
+[Validate JWTs](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/validating-json/)
+自行驗證那個標頭：用 team domain certs 端點上 `kid` 相符的公鑰驗 RS256 簽章，並要求
+`type` 為 `app`、`aud` 等於 `ACCESS_AUD`、`iss` 等於 team domain、沒有過期。有 `ctx.access`
+的請求（例如 `workers.dev`）照舊只看 `ctx.access`。任一個變數留空，這個功能就是關的。
+
+> ⚠️ 清單中的主機名**必須被同一支 Access 應用涵蓋**。Worker 無法分辨請求有沒有真的經過
+> Access，只看 token 本身；偷到的 token 在過期前（依 Access session 長度）打一個脫離 Access
+> 保護的主機名，就會被放行，也略過 Access 端的撤銷與政策變更。
 
 ### 本機開發
 

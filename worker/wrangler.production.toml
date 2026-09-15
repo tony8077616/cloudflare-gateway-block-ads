@@ -56,6 +56,12 @@ enabled = true
 CF_ACCOUNT_ID = "5a2eeee372c212cf4f77b36057cec75f"
 # 換掉 Access 應用（刪掉重建也算）會換一組 aud，要同步改這裡，否則 Worker 會把所有人擋在 403。
 ACCESS_AUD = "1a8d1453c7adae73f42c0d1857369bdf789be64459efc01251f7ce594f4bb8f7"
+# 自訂網域 adblock.salausau.trade 上 Access 有驗證、執行環境卻沒有給 ctx.access（2026-09-15 診斷紀錄），
+# 所以只在這個主機名上讓 Worker 自行驗證 Access 附上的 JWT。兩個值都不是機密。
+# ⚠️ 新增到 ACCESS_JWT_HOSTNAMES 的主機名**必須被同一支 Access 應用涵蓋**，否則偷到的 token
+#    在 exp 之前可以直接打那個主機名，完全不經過 Access。workers.dev 與預覽網址有 ctx.access，不要加進來。
+ACCESS_TEAM_DOMAIN = "https://mongwu.cloudflareaccess.com"
+ACCESS_JWT_HOSTNAMES = "adblock.salausau.trade"
 
 [[d1_databases]]
 binding = "DB"

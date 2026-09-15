@@ -7,9 +7,11 @@
  *
  * 安全性：這個頁面會攤開你的完整 DNS 查詢記錄 —— 你去過哪些網站、用哪些 App、
  * 什麼時間用。這是高度敏感的資料。進入權限一律由 Worker-level Cloudflare Access
- * 把關；這支 Worker 只負責確認 Access 真的驗過這個請求，而且驗的是這支應用（比對
- * aud）。ACCESS_AUD 沒設定時，這個 Worker 會拒絕提供任何內容（fail closed），
- * 而不是預設公開。詳見 README。
+ * 把關；這支 Worker 負責確認 Access 真的驗過這個請求，而且驗的是這支應用（比對
+ * aud）。執行環境有給 ctx.access 時只看它；沒有給、而且請求的主機名在
+ * ACCESS_JWT_HOSTNAMES 清單內時，才自行用 team domain 的公鑰驗證 Access 附上的
+ * JWT（見下面「認證」）。ACCESS_AUD 沒設定時，這個 Worker 會拒絕提供任何內容
+ *（fail closed），而不是預設公開。詳見 README。
  */
 
 import { PAGE } from "./page.js";
@@ -51,9 +53,20 @@ const RANGES = {
 
 // ── 認證 ─────────────────────────────────────────────────
 //
-// 改用 Worker-level Cloudflare Access 之後，JWT 由執行環境在請求進到 Worker 之前就
-// 驗完了，ctx.access 拿到的是已經驗過的結果 —— 官方文件明載不需要自行驗證 JWT。
-// Access 沒有驗證這個請求時，ctx.access 會是 undefined。
+// 兩條路，由執行環境有沒有給 ctx.access 決定，**不會混用**：
+//
+// 1. 有 ctx.access：Worker-level Cloudflare Access 在請求進到 Worker 之前驗過 JWT，
+//    這裡只比對 aud。只要 ctx.access 存在（不論它的 aud 是什麼、是不是空的），
+//    就只看它，絕不改看 JWT。
+// 2. 沒有 ctx.access：Access 沒有驗證這個請求時就是這樣。但 2026-09-15 的診斷紀錄也看到
+//    自訂網域上 Access 有驗證、附上本應用的 JWT，執行環境卻沒有給 ctx.access（根因未明）。
+//    官方「Validate JWTs」文件寫的是：「When Cloudflare Access is in front of your Worker,
+//    your Worker still needs to validate the JWT that Cloudflare Access adds to the
+//    Cf-Access-Jwt-Assertion header on the incoming request.」
+//    https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/validating-json/
+//    所以只有 ACCESS_TEAM_DOMAIN 與 ACCESS_JWT_HOSTNAMES 都設定、而且請求的主機名在清單內時，
+//    Worker 才用 team domain 的公鑰自行驗證那個標頭（verifyAccessJwt）。其他入口
+//   （workers.dev、預覽網址、清單以外的網域）行為不變：沒有 ctx.access 就 403。
 
 /**
  * 比對 Access 應用的 aud。
@@ -71,81 +84,240 @@ function audMatches(aud, expected) {
   return aud === expected;
 }
 
+// ── Access JWT 自行驗證（只在沒有 ctx.access 時使用）─────────
+//
+// 做法照官方「Validate JWTs」：只驗 Cf-Access-Jwt-Assertion 標頭、不驗 cookie（cookie 不保證會帶）；
+// 用 JWT header 的 kid 對應 team domain certs 端點上的公鑰，不寫死金鑰（Access 約 6 週輪替一次）；
+// iss 必須等於 team domain、aud 必須是本應用。
+//
+// ⚠️ ACCESS_JWT_HOSTNAMES 裡的主機名**必須被同一支 Access 應用涵蓋**。否則偷到的 token 在 exp 之前
+//    可以直接打那個主機名，完全不經過 Access（也就略過了 Access 端的撤銷與政策變更）。
+// ⚠️ 限制：主機名清單擋不住 Service Binding —— 呼叫端可以自己決定請求 URL 的主機名。
+//    本帳戶目前沒有綁定這支 Worker 的 Service Binding；之後要加，先把這一點想清楚。
+
+const ACCESS_TEAM_DOMAIN_RE = /^https:\/\/[a-z0-9-]{1,63}\.cloudflareaccess\.com$/;
+const ACCESS_HOSTNAME_RE = /^[a-z0-9.-]{1,253}$/;
+const JWT_SEGMENT_RE = /^[A-Za-z0-9_-]+$/;
+const JWT_MAX_LENGTH = 8192;
+const JWT_CLOCK_SKEW_SEC = 60;
+const CERTS_TTL_MS = 10 * 60_000;
+const CERTS_RETRY_MS = 60_000;
+const CERTS_TIMEOUT_MS = 5000;
+const CERTS_MAX_KEYS = 10;
+
 /**
- * 暫時性診斷紀錄：自訂網域上 Access 已放行、Worker 卻回 403，用來分辨原因。
+ * 公鑰快取：module scope，依 certs 網址分開。
  *
- * - 只記是非值與固定列舉，**不記** aud 的值、email 等身分欄位、JWT 或其任何片段、
- *   cookie 值、完整 URL、query string、其他標頭值、IP、CF_API_TOKEN、CF_ACCOUNT_ID。
- * - **不參與授權**：沒有回傳值，下面的關卡照舊只看 ctx.access。
- * - JWT 是**未驗簽**解碼，結果只能放進這一行 log，絕不可以拿去做任何放行判斷，
- *   也不可以匯出或被其他程式碼重用（同一 team domain 的應用共用金鑰，未驗簽等於沒驗）。
- * - 同步、唯讀、不呼叫 ctx.access.getIdentity()；任何例外整個吞掉，寧可不記也不輸出殘缺的 log。
- * - 確認原因之後，最遲合併後 14 天內由正式修法 PR（或獨立的移除 PR）拿掉。
+ * 值只放**已經完成的純資料**：{ keys: Map<kid, CryptoKey> | null, fetchedAt, lastAttemptAt, lastAttemptFailed }。
+ * 刻意不存 Promise、Response 或任何 I/O 物件：Workers 的 I/O 物件不能跨請求使用，共用一個進行中的
+ * 抓取也可能讓某個請求被別的請求卡住。需要抓的請求各自發 fetch、各自逾時。
+ *
+ * - 有效期 10 分鐘，過期的金鑰**一律不用**（刷新失敗或被限流時也不用）→ fail closed。
+ * - 快取有效但沒有這個 kid，或上次抓取失敗：距上次嘗試滿 60 秒才再抓。
+ * - 抓取成功就整組取代，不與舊金鑰合併 —— 被 Access 撤下的金鑰不會因為合併而留下來。
  */
-function logAccessDiag(request, url, env, ctx) {
+const accessKeyCache = new Map();
+
+/**
+ * 沒有 ctx.access 時，自行驗證 Cf-Access-Jwt-Assertion。回傳 Promise<boolean>，**絕不拋例外**。
+ *
+ * 失敗時寫一行 {"accessJwt":"<原因>"}，原因只會是 checkAccessJwt 回傳的固定列舉或 "error"。
+ * 不記 token、任何片段、claim 值、kid、email、aud、iss、URL、IP、錯誤訊息文字。
+ * 主機名不在清單、ACCESS_TEAM_DOMAIN 未設定（範本預設、workers.dev 等其他入口）不記，避免噪音。
+ */
+async function verifyAccessJwt(request, url, env) {
+  let result;
   try {
-    const access = ctx.access;
-    const passed = !!access && audMatches(access.aud, env.ACCESS_AUD);
-    let ctxAudType = "none";
-    if (access) {
-      const aud = access.aud;
-      if (aud === undefined || aud === null) ctxAudType = "missing";
-      else if (typeof aud === "string") ctxAudType = "string";
-      else if (Array.isArray(aud)) ctxAudType = "array";
-      else ctxAudType = "other";
-    }
-
-    const jwt = request.headers.get("Cf-Access-Jwt-Assertion");
-    let jwtAudMatch = "absent";
-    if (jwt !== null) jwtAudMatch = jwtPayloadAudMatch(jwt, env.ACCESS_AUD);
-
-    // cookie 名稱要完全相等，xCF_Authorization、CF_Authorization_old 都不算
-    const cookie = request.headers.get("Cookie") || "";
-    const hasAuthCookie = cookie.split(";").some((part) => {
-      const s = part.trim();
-      const eq = s.indexOf("=");
-      return (eq < 0 ? s : s.slice(0, eq)) === "CF_Authorization";
-    });
-
-    const path = url.pathname;
-    const accessDiag = {
-      host: url.hostname,
-      route: path.startsWith("/api/") ? "api" : path === "/" ? "root" : "other",
-      method: ["GET", "HEAD", "POST", "OPTIONS"].includes(request.method) ? request.method : "other",
-      passed,
-      hasCtxAccess: !!access,
-      ctxAudType,
-      ctxAudMatch: passed,
-      hasGetIdentity: typeof access?.getIdentity === "function",
-      hasJwtHeader: jwt !== null,
-      jwtAudMatch,
-      hasAuthEmailHeader: request.headers.has("Cf-Access-Authenticated-User-Email"),
-      hasAuthCookie,
-    };
-    console.log(JSON.stringify({ accessDiag }));
-  } catch {}
+    result = await checkAccessJwt(request, url, env);
+  } catch {
+    result = "error";
+  }
+  if (result === true) return true;
+  if (result) {
+    try {
+      console.log(JSON.stringify({ accessJwt: result }));
+    } catch {}
+  }
+  return false;
 }
 
 /**
- * 只給 logAccessDiag 用：未驗簽解開 JWT 的 payload，回報 aud 是否等於本應用。
- * 回傳 true／false／"unparsable"。解不開屬於正常的診斷結果，所以這裡自己接住解碼例外；
- * 標頭讀取不在這裡，讀不到標頭時整行 log 仍由 logAccessDiag 的 catch 放棄。
+ * verifyAccessJwt 的本體。通過回 true；不通過回失敗原因（列舉字串）；回退未啟用回 null（不記錄）。
+ * **簽章通過之前，不依任何 claim 做判斷。**
  */
-function jwtPayloadAudMatch(jwt, expected) {
-  if (jwt.length > 16384) return "unparsable";
-  const parts = jwt.split(".");
-  if (parts.length !== 3) return "unparsable";
+async function checkAccessJwt(request, url, env) {
+  // 1. 啟用條件：主機名在清單內，而且 team domain 格式正確。
+  //    清單比對是整個主機名相等，不可以用子字串（example.com 不能放行 dash.example.com）。
+  if (!accessJwtHostnames(env.ACCESS_JWT_HOSTNAMES).some((h) => h === url.hostname)) return null;
+  const teamDomain = env.ACCESS_TEAM_DOMAIN;
+  if (teamDomain === undefined || teamDomain === null || teamDomain === "") return null;
+  if (typeof teamDomain !== "string" || !ACCESS_TEAM_DOMAIN_RE.test(teamDomain)) return "bad_team_domain";
+
+  // 2. 只讀標頭，不讀 CF_Authorization cookie
+  const token = request.headers.get("Cf-Access-Jwt-Assertion");
+  if (token === null) return "missing";
+  if (token.length > JWT_MAX_LENGTH) return "too_long";
+
+  // 3. 格式：恰好 3 段、base64url 字元、header 與 payload 是合法 UTF-8 的 JSON 物件
+  const parts = token.split(".");
+  if (parts.length !== 3 || !parts.every((p) => JWT_SEGMENT_RE.test(p) && p.length % 4 !== 1)) return "malformed";
+  let header, payload, signature;
   try {
-    let b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
-    b64 += "=".repeat((4 - (b64.length % 4)) % 4);
-    const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-    const payload = JSON.parse(new TextDecoder().decode(bytes));
-    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return "unparsable";
-    // 只讀 payload 自己的 aud，不理會原型鏈
-    const aud = Object.prototype.hasOwnProperty.call(payload, "aud") ? payload.aud : undefined;
-    return audMatches(aud, expected);
+    header = decodeJwtObject(parts[0]);
+    payload = decodeJwtObject(parts[1]);
+    signature = base64urlBytes(parts[2]);
   } catch {
-    return "unparsable";
+    return "malformed";
+  }
+  if (header === null || payload === null) return "malformed";
+
+  // 4. header：只接受 RS256。jku、x5u、jwk、x5c 一律不看、不抓 —— 金鑰只從設定組成的 certs 網址來
+  if (!Object.hasOwn(header, "alg") || header.alg !== "RS256") return "bad_header";
+  const kid = Object.hasOwn(header, "kid") ? header.kid : undefined;
+  if (typeof kid !== "string" || kid.length < 1 || kid.length > 256) return "bad_header";
+  if (Object.hasOwn(header, "crit")) return "bad_header";
+
+  // 5. 金鑰（certs 網址只由 ACCESS_TEAM_DOMAIN 組成，絕不取自 token 的 iss）
+  const key = await accessKeyFor(teamDomain, kid);
+  if (typeof key === "string") return key;
+
+  // 6. 簽章
+  const valid = await crypto.subtle.verify(
+    { name: "RSASSA-PKCS1-v1_5" },
+    key,
+    signature,
+    byteStringBytes(parts[0] + "." + parts[1]),
+  );
+  if (!valid) return "bad_signature";
+
+  // 7. claims：只讀 payload 自己的屬性，不理會原型鏈
+  const claim = (name) => (Object.hasOwn(payload, name) ? payload[name] : undefined);
+  // "app" 是應用 token；"org" 是全域 session token，不屬於任何一支應用
+  if (claim("type") !== "app") return "bad_type";
+  if (!audMatches(claim("aud"), env.ACCESS_AUD)) return "bad_aud";
+  if (claim("iss") !== teamDomain) return "bad_iss";
+  const now = Math.floor(Date.now() / 1000);
+  const exp = claim("exp");
+  if (!Number.isFinite(exp) || !(now < exp + JWT_CLOCK_SKEW_SEC)) return "expired";
+  // service token 沒有 nbf，所以 nbf 與 iat 只在存在時檢查
+  if (Object.hasOwn(payload, "nbf")) {
+    const nbf = payload.nbf;
+    if (!Number.isFinite(nbf) || !(now >= nbf - JWT_CLOCK_SKEW_SEC)) return "not_yet_valid";
+  }
+  if (Object.hasOwn(payload, "iat")) {
+    const iat = payload.iat;
+    if (!Number.isFinite(iat) || !(iat <= now + JWT_CLOCK_SKEW_SEC)) return "bad_iat";
+  }
+  return true;
+}
+
+/** ACCESS_JWT_HOSTNAMES → 主機名陣列（逗號分隔、去空白、轉小寫；格式不符的項目不算數） */
+function accessJwtHostnames(value) {
+  if (typeof value !== "string") return [];
+  return value
+    .split(",")
+    .map((h) => h.trim().toLowerCase())
+    .filter((h) => ACCESS_HOSTNAME_RE.test(h));
+}
+
+/** 每個字元的 char code 當成一個位元組（呼叫端保證字元都在 0–255） */
+function byteStringBytes(s) {
+  const bytes = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i);
+  return bytes;
+}
+
+/** base64url 片段 → 位元組。呼叫端已檢查過字元集與長度，atob 仍可能拋例外，由呼叫端接住。 */
+function base64urlBytes(segment) {
+  const b64 = segment.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (segment.length % 4)) % 4);
+  return byteStringBytes(atob(b64));
+}
+
+/** base64url 片段 → UTF-8（fatal：非法位元組直接拋）→ JSON。不是非 null、非陣列的物件就回 null。 */
+function decodeJwtObject(segment) {
+  const value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(base64urlBytes(segment)));
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+
+/**
+ * 依 kid 取得公鑰。回傳 CryptoKey，或失敗原因 "no_key"／"certs_unavailable"。
+ * 規則見 accessKeyCache 的說明。
+ */
+async function accessKeyFor(teamDomain, kid) {
+  const certsUrl = `${teamDomain}/cdn-cgi/access/certs`;
+  const now = Date.now();
+  const cached = accessKeyCache.get(certsUrl);
+  const fresh = cached !== undefined && cached.keys !== null && now - cached.fetchedAt < CERTS_TTL_MS;
+  if (fresh && cached.keys.has(kid)) return cached.keys.get(kid);
+
+  const triedRecently = cached !== undefined && now - cached.lastAttemptAt < CERTS_RETRY_MS;
+  if (triedRecently && cached.lastAttemptFailed) return "certs_unavailable";
+  if (fresh && triedRecently) return "no_key";
+  // 其餘情況（沒有快取、已過期、或快取有效但未知 kid 且距上次嘗試已滿 60 秒）→ 這個請求自己抓
+
+  const keys = await fetchAccessKeys(certsUrl);
+  if (keys === null) {
+    // 失敗：保留原本的金鑰與 fetchedAt（過期與否照舊由 fetchedAt 判斷），只記下這次失敗的時間
+    const latest = accessKeyCache.get(certsUrl);
+    accessKeyCache.set(certsUrl, {
+      keys: latest ? latest.keys : null,
+      fetchedAt: latest ? latest.fetchedAt : 0,
+      lastAttemptAt: now,
+      lastAttemptFailed: true,
+    });
+    return "certs_unavailable";
+  }
+  // 成功：整組取代。fetchedAt 用開始抓的時間，有效期寧短勿長
+  accessKeyCache.set(certsUrl, { keys, fetchedAt: now, lastAttemptAt: now, lastAttemptFailed: false });
+  return keys.has(kid) ? keys.get(kid) : "no_key";
+}
+
+/**
+ * 抓 certs 端點並匯入公鑰。成功回 Map<kid, CryptoKey>（至少一把），任何失敗回 null，不拋例外。
+ *
+ * - 逾時用 AbortController + setTimeout（5 秒），不用 AbortSignal 的靜態 timeout 方法 —— Workers 文件沒有列出它。
+ * - redirect 用 manual 模式：3xx 原樣回來，然後因為不是 200 而失敗；絕不跟著 Location 去別的地方抓金鑰。
+ *   不用 error 模式：Workers 文件列出它，但執行環境是否接受有相互矛盾的證據；也不用預設的 follow 模式。
+ * - 非 200、非 JSON、沒有 keys 陣列、網路例外、逾時中止、匯入後 0 把可用金鑰 → 失敗。
+ */
+async function fetchAccessKeys(certsUrl) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), CERTS_TIMEOUT_MS);
+  try {
+    const resp = await fetch(certsUrl, {
+      signal: ac.signal,
+      redirect: "manual",
+      headers: { Accept: "application/json" },
+    });
+    if (resp.status !== 200) return null;
+    const body = await resp.json();
+    if (body === null || typeof body !== "object" || !Object.hasOwn(body, "keys") || !Array.isArray(body.keys)) {
+      return null;
+    }
+    const keys = new Map();
+    for (const jwk of body.keys.slice(0, CERTS_MAX_KEYS)) {
+      if (jwk === null || typeof jwk !== "object" || Array.isArray(jwk)) continue;
+      const field = (name) => (Object.hasOwn(jwk, name) ? jwk[name] : undefined);
+      const kid = field("kid"), alg = field("alg"), use = field("use"), n = field("n"), e = field("e");
+      if (typeof kid !== "string" || keys.has(kid)) continue;
+      if (field("kty") !== "RSA" || (alg !== undefined && alg !== "RS256") || (use !== undefined && use !== "sig")) continue;
+      if (typeof n !== "string" || typeof e !== "string") continue;
+      try {
+        const key = await crypto.subtle.importKey(
+          "jwk",
+          { kty: "RSA", n, e },
+          { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+          false,
+          ["verify"],
+        );
+        keys.set(kid, key);
+      } catch {}
+    }
+    return keys.size > 0 ? keys : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -362,13 +534,16 @@ export default {
       );
     }
 
-    // 暫時性診斷（見 logAccessDiag）：只寫一行 log，沒有回傳值，不影響下面關卡的判斷
-    logAccessDiag(request, url, env, ctx);
-
     // Cloudflare Access 沒有驗證這個請求，或驗證的是別的應用 → 拒絕。
     // 這道關卡刻意放在所有路由之前、也刻意放在 try 之外：它涵蓋每一個路徑與方法
     //（含 /api/*、404 分支、OPTIONS、HEAD），而且不留任何能繞過它的例外分支。
-    if (!ctx.access || !audMatches(ctx.access.aud, env.ACCESS_AUD)) {
+    //
+    // 有 ctx.access 就只看它的 aud，絕不回退到 JWT；沒有 ctx.access 才考慮自行驗證 JWT
+    //（verifyAccessJwt 絕不拋例外，回退未啟用時一律 false）。見上面「認證」。
+    const authed = ctx.access
+      ? audMatches(ctx.access.aud, env.ACCESS_AUD)
+      : await verifyAccessJwt(request, url, env);
+    if (!authed) {
       if (url.pathname.startsWith("/api/")) return json({ error: "未通過驗證" }, 403);
       return html(
         `<h1>需要透過 Cloudflare Access 進入</h1><p>這個請求沒有經過 Cloudflare Access 驗證，或者驗證的是另一支 Access 應用。</p>
