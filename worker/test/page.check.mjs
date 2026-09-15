@@ -14,7 +14,7 @@ let pass = 0, fail = 0;
 const ok = (d) => { console.log("    ✓ " + d); pass++; };
 const no = (d) => { console.log("    ✗ " + d); fail++; };
 
-const script = (PAGE.match(/<script>([\s\S]*?)<\/script>/) || [])[1];
+const script = (PAGE.match(/<script\b[^>]*>([\s\S]*?)<\/script>/) || [])[1];
 
 console.log("情境 A：內嵌腳本的語法");
 if (!script) {
@@ -76,8 +76,17 @@ console.log("\n情境 D：頁面不可以依賴任何外部資源");
   else ok("沒有引用任何外部資源，符合 default-src 'none'");
 
   const hasInlineStyle = /<style>/.test(PAGE);
-  const hasInlineScript = /<script>/.test(PAGE);
+  const hasInlineScript = /<script\b[^>]*>/.test(PAGE);
   ok("樣式與腳本都內嵌（style:" + hasInlineStyle + " script:" + hasInlineScript + "）");
+
+  // 自訂網域的 zone 開著 Rocket Loader：它會把腳本改由外部 loader 載入，被上面的 CSP 擋掉，
+  // 頁面 JS 完全不執行、API 一次都不會呼叫（2026-09-15 上線後實際發生）。
+  // 每個 <script> 開頭標籤都必須帶 data-cfasync="false"，Rocket Loader 才會跳過。
+  const tags = [...PAGE.matchAll(/<script\b[^>]*>/g)].map((m) => m[0]);
+  const bare = tags.filter((t) => !/\sdata-cfasync="false"/.test(t));
+  if (!tags.length) no("找不到任何 <script> 開頭標籤");
+  else if (bare.length) no("有 <script> 沒帶 data-cfasync=\"false\"，會被 Rocket Loader 改寫後被 CSP 擋掉：" + bare.join(" "));
+  else ok("全部 " + tags.length + " 個 <script> 都帶 data-cfasync=\"false\"（Rocket Loader 不會改寫）");
 }
 
 console.log("\n情境 E：需求對照 —— 這四項在頁面上都要找得到");
