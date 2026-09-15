@@ -71,6 +71,84 @@ function audMatches(aud, expected) {
   return aud === expected;
 }
 
+/**
+ * 暫時性診斷紀錄：自訂網域上 Access 已放行、Worker 卻回 403，用來分辨原因。
+ *
+ * - 只記是非值與固定列舉，**不記** aud 的值、email 等身分欄位、JWT 或其任何片段、
+ *   cookie 值、完整 URL、query string、其他標頭值、IP、CF_API_TOKEN、CF_ACCOUNT_ID。
+ * - **不參與授權**：沒有回傳值，下面的關卡照舊只看 ctx.access。
+ * - JWT 是**未驗簽**解碼，結果只能放進這一行 log，絕不可以拿去做任何放行判斷，
+ *   也不可以匯出或被其他程式碼重用（同一 team domain 的應用共用金鑰，未驗簽等於沒驗）。
+ * - 同步、唯讀、不呼叫 ctx.access.getIdentity()；任何例外整個吞掉，寧可不記也不輸出殘缺的 log。
+ * - 確認原因之後，最遲合併後 14 天內由正式修法 PR（或獨立的移除 PR）拿掉。
+ */
+function logAccessDiag(request, url, env, ctx) {
+  try {
+    const access = ctx.access;
+    const passed = !!access && audMatches(access.aud, env.ACCESS_AUD);
+    let ctxAudType = "none";
+    if (access) {
+      const aud = access.aud;
+      if (aud === undefined || aud === null) ctxAudType = "missing";
+      else if (typeof aud === "string") ctxAudType = "string";
+      else if (Array.isArray(aud)) ctxAudType = "array";
+      else ctxAudType = "other";
+    }
+
+    const jwt = request.headers.get("Cf-Access-Jwt-Assertion");
+    let jwtAudMatch = "absent";
+    if (jwt !== null) jwtAudMatch = jwtPayloadAudMatch(jwt, env.ACCESS_AUD);
+
+    // cookie 名稱要完全相等，xCF_Authorization、CF_Authorization_old 都不算
+    const cookie = request.headers.get("Cookie") || "";
+    const hasAuthCookie = cookie.split(";").some((part) => {
+      const s = part.trim();
+      const eq = s.indexOf("=");
+      return (eq < 0 ? s : s.slice(0, eq)) === "CF_Authorization";
+    });
+
+    const path = url.pathname;
+    const accessDiag = {
+      host: url.hostname,
+      route: path.startsWith("/api/") ? "api" : path === "/" ? "root" : "other",
+      method: ["GET", "HEAD", "POST", "OPTIONS"].includes(request.method) ? request.method : "other",
+      passed,
+      hasCtxAccess: !!access,
+      ctxAudType,
+      ctxAudMatch: passed,
+      hasGetIdentity: typeof access?.getIdentity === "function",
+      hasJwtHeader: jwt !== null,
+      jwtAudMatch,
+      hasAuthEmailHeader: request.headers.has("Cf-Access-Authenticated-User-Email"),
+      hasAuthCookie,
+    };
+    console.log(JSON.stringify({ accessDiag }));
+  } catch {}
+}
+
+/**
+ * 只給 logAccessDiag 用：未驗簽解開 JWT 的 payload，回報 aud 是否等於本應用。
+ * 回傳 true／false／"unparsable"。解不開屬於正常的診斷結果，所以這裡自己接住解碼例外；
+ * 標頭讀取不在這裡，讀不到標頭時整行 log 仍由 logAccessDiag 的 catch 放棄。
+ */
+function jwtPayloadAudMatch(jwt, expected) {
+  if (jwt.length > 16384) return "unparsable";
+  const parts = jwt.split(".");
+  if (parts.length !== 3) return "unparsable";
+  try {
+    let b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    b64 += "=".repeat((4 - (b64.length % 4)) % 4);
+    const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    const payload = JSON.parse(new TextDecoder().decode(bytes));
+    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return "unparsable";
+    // 只讀 payload 自己的 aud，不理會原型鏈
+    const aud = Object.prototype.hasOwnProperty.call(payload, "aud") ? payload.aud : undefined;
+    return audMatches(aud, expected);
+  } catch {
+    return "unparsable";
+  }
+}
+
 // ── Cloudflare GraphQL Analytics ─────────────────────────
 
 async function graphql(env, query, variables) {
@@ -283,6 +361,9 @@ export default {
         503,
       );
     }
+
+    // 暫時性診斷（見 logAccessDiag）：只寫一行 log，沒有回傳值，不影響下面關卡的判斷
+    logAccessDiag(request, url, env, ctx);
 
     // Cloudflare Access 沒有驗證這個請求，或驗證的是別的應用 → 拒絕。
     // 這道關卡刻意放在所有路由之前、也刻意放在 try 之外：它涵蓋每一個路徑與方法
