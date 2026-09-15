@@ -1,6 +1,7 @@
 // Worker 的邏輯測試。把 global fetch 換成樁，不需要真的 Cloudflare 憑證。
 // 重點在兩件事：認證不能有破口，以及判定分類不能把「允許」算成「拒絕」。
 
+import { inspect } from "node:util";
 import worker from "../src/index.js";
 
 let pass = 0, fail = 0;
@@ -245,6 +246,157 @@ console.log("\n情境 I：安全標頭與未知路徑");
   tt("不快取", (r.headers.get("Cache-Control") || "").includes("no-store"));
   const r2 = await ok("/nope");
   t("未知路徑 → 404", r2.status, 404);
+}
+
+console.log("\n情境 J：暫時性診斷紀錄 —— 只記白名單是非值，且不參與授權");
+{
+  // 只在 worker.fetch 執行期間接管所有 console 方法，呼叫結束立即還原，
+  // 這樣擷取到的只有 Worker 自己的輸出，不會和 t/tt 的結果混在一起。
+  const METHODS = ["log", "info", "debug", "warn", "error", "trace"];
+  const show = (a) => (typeof a === "string" ? a : inspect(a, { depth: 10 }));
+  async function capture(request, env, ctx) {
+    const saved = {}, lines = [];
+    for (const m of METHODS) { saved[m] = console[m]; console[m] = (...a) => lines.push({ m, text: a.map(show).join(" ") }); }
+    let resp = null, threw = null;
+    try { resp = await worker.fetch(request, env, ctx); }
+    catch (e) { threw = e; }
+    finally { for (const m of METHODS) console[m] = saved[m]; }
+    return { resp, threw, lines };
+  }
+  const diagOf = (c) => { try { return JSON.parse(c.lines[0].text).accessDiag; } catch { return null; } };
+  const runs = [];           // J9 要逐一檢查的請求（不含 J8）
+  const keep = (name, c) => { runs.push({ name, c }); return c; };
+
+  // 金絲雀：每個都獨一無二，只要出現在任何 console 輸出裡就是洩漏
+  const EMAIL = "canary-email-7f3a@example.org", SUB = "canary-sub-9c1e";
+  const COOKIE_VAL = "canary-cookie-3a9d", SIG = "canary-sig-6b0c";
+  const env = { ACCESS_AUD: AUD, CF_API_TOKEN: "canary-token-5d2b", CF_ACCOUNT_ID: "canary-acct-8e4f" };
+
+  const b64u = (s) => Buffer.from(s, "utf8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const HDR = b64u(JSON.stringify({ alg: "RS256", typ: "JWT" }));
+  const jwtOf = (payloadJson) => HDR + "." + b64u(payloadJson) + "." + SIG;
+  // J4／J5 的 payload：pad 字串是為了讓編碼後同時含 - 與 _，且原始 base64 需要補位
+  const P_OWN = JSON.stringify({ aud: [AUD], email: EMAIL, sub: SUB, pad: "~~~???~~~???~~" });
+  const P_OTHER = [
+    JSON.stringify({ aud: "aud-of-another-app", pad: "~~~???~~~???~" }),
+    JSON.stringify({ aud: AUD + "x", pad: "~~~???~~~???~~" }),
+    JSON.stringify({ aud: ["x", AUD + "y"], pad: "~~~???~~~???~~" }),
+  ];
+  for (const [i, p] of [P_OWN, ...P_OTHER].entries()) {
+    const raw = Buffer.from(p, "utf8").toString("base64");
+    tt(`測試 payload #${i} 編碼後含 - 與 _、且需要補位（不成立請調整 pad 字串）`,
+      b64u(p).includes("-") && b64u(p).includes("_") && raw.endsWith("="));
+  }
+  const JWT = jwtOf(P_OWN);
+  const authHeaders = {
+    "Cf-Access-Jwt-Assertion": JWT,
+    "Cf-Access-Authenticated-User-Email": EMAIL,
+    Cookie: `other=1; CF_Authorization=${COOKIE_VAL}`,
+  };
+
+  // J1
+  stubGraphQL([], []);
+  const c1 = keep("J1", await capture(req("/"), env, ctxNone()));
+  t("J1 無 ctx.access、無標頭 → 403", c1.resp?.status, 403);
+  const d1 = diagOf(c1) || {};
+  t("J1 診斷欄位", [d1.passed, d1.hasCtxAccess, d1.ctxAudType, d1.hasGetIdentity, d1.hasJwtHeader, d1.jwtAudMatch,
+    d1.hasAuthEmailHeader, d1.hasAuthCookie, d1.route, d1.method],
+    [false, false, "none", false, false, "absent", false, false, "root", "GET"]);
+
+  // J2
+  let identityCalled = false;
+  const ctx2 = { access: { aud: AUD, email: EMAIL, getIdentity: () => { identityCalled = true; return Promise.resolve({ email: EMAIL, sub: SUB }); } } };
+  const c2 = keep("J2", await capture(req("/api/status?q=canary-query", { headers: authHeaders }), env, ctx2));
+  t("J2 本應用 ctx.access → /api/status 200", c2.resp?.status, 200);
+  const d2 = diagOf(c2) || {};
+  t("J2 診斷欄位", [d2.passed, d2.ctxAudType, d2.ctxAudMatch, d2.hasGetIdentity, d2.route], [true, "string", true, true, "api"]);
+  tt("J2 getIdentity 沒有被呼叫", !identityCalled);
+
+  // J3
+  const c3a = keep("J3 陣列", await capture(req("/"), env, ctxAud([AUD])));
+  t("J3 aud 陣列 → ctxAudType/passed", [c3a.resp?.status, diagOf(c3a)?.ctxAudType, diagOf(c3a)?.passed], [200, "array", true]);
+  const c3b = keep("J3 缺 aud", await capture(req("/"), env, { access: {} }));
+  t("J3 ctx.access 沒有 aud → 403、missing", [c3b.resp?.status, diagOf(c3b)?.ctxAudType], [403, "missing"]);
+
+  // J4／J4b：本應用的未驗簽 JWT 無論有沒有（別的應用的）ctx.access 都不能放行
+  for (const [label, mkCtx] of [["J4", ctxNone], ["J4b", () => ctxAud("aud-of-another-app")]]) {
+    for (const path of ["/?q=canary-query", "/api/data?range=24h&q=canary-query"]) {
+      stubLeakCanary();
+      const c = keep(`${label} ${path}`, await capture(req(path, { headers: authHeaders }), env, mkCtx()));
+      t(`${label} ${path} 帶本應用 JWT 仍然 403`, c.resp?.status, 403);
+      const d = diagOf(c) || {};
+      t(`${label} ${path} 診斷欄位`, [d.hasJwtHeader, d.jwtAudMatch, d.hasAuthCookie, d.hasAuthEmailHeader, d.passed],
+        [true, true, true, true, false]);
+      tt(`${label} ${path} GraphQL 樁沒有被呼叫`, captured.length === 0);
+      tt(`${label} ${path} 本文不含 DNS 資料`, !(c.resp ? await c.resp.text() : "leaked-canary.example").includes("leaked-canary.example"));
+    }
+  }
+
+  // J5：別的應用的 JWT，或只是字串上「包含」本應用 aud 的，一律 false
+  for (const [i, p] of P_OTHER.entries()) {
+    const c = keep(`J5 #${i}`, await capture(req("/", { headers: { "Cf-Access-Jwt-Assertion": jwtOf(p) } }), env, ctxNone()));
+    t(`J5 #${i} 403、jwtAudMatch=false`, [c.resp?.status, diagOf(c)?.jwtAudMatch], [403, false]);
+  }
+
+  // J6：解不開的標頭
+  // 長度 20000 的案例本身是可解、aud 相符的 JWT（第一段前面墊字），所以只有長度上限能讓它變 unparsable
+  const J6 = [
+    ["not-a-jwt", "not-a-jwt"], ["a.%%%.c", "a.%%%.c"], ["長度 20000", "x".repeat(20000 - JWT.length) + JWT],
+    ["payload null", jwtOf("null")], ["payload []", jwtOf("[]")],
+  ];
+  tt("J6 長度 20000 的案例內容正確", J6[2][1].length === 20000 && J6[2][1].split(".").length === 3);
+  for (const [name, h] of J6) {
+    const c = keep(`J6 ${name}`, await capture(req("/", { headers: { "Cf-Access-Jwt-Assertion": h } }), env, ctxNone()));
+    t(`J6 ${name} → 403、unparsable、不拋例外`, [c.threw === null, c.resp?.status, diagOf(c)?.jwtAudMatch], [true, 403, "unparsable"]);
+  }
+  const cProto = keep("J6 __proto__", await capture(
+    req("/", { headers: { "Cf-Access-Jwt-Assertion": jwtOf(`{"__proto__":{"aud":["${AUD}"]}}`) } }), env, ctxNone()));
+  tt("J6 __proto__ 夾帶的 aud 不算數", cProto.threw === null && cProto.resp?.status === 403 && diagOf(cProto)?.jwtAudMatch !== true);
+
+  // J10：cookie 名稱必須完全相等
+  for (const [cookie, want] of [["xCF_Authorization=1", false], ["CF_Authorization_old=1", false], ["a=1; CF_Authorization=2", true]]) {
+    const c = keep(`J10 ${cookie}`, await capture(req("/", { headers: { Cookie: cookie } }), env, ctxNone()));
+    t(`J10 Cookie「${cookie}」→ hasAuthCookie`, diagOf(c)?.hasAuthCookie, want);
+  }
+
+  // J8：讀標頭會拋錯的請求 —— 不能讓 Worker 炸掉，也不能輸出殘缺或填了替代值的 log
+  const badReq = { url: "https://dash.example.com/", method: "GET",
+    headers: { get() { throw new Error("boom"); }, has() { throw new Error("boom"); } } };
+  for (const [name, ctx, want] of [["ctxNone", ctxNone(), 403], ["ctxAud", ctxAud(AUD), 200]]) {
+    const c = await capture(badReq, env, ctx);
+    t(`J8 ${name} 標頭讀取拋錯 → 不拋出、狀態碼`, [c.threw === null, c.resp?.status], [true, want]);
+    t(`J8 ${name} 所有 console 方法合計輸出行數`, c.lines.length, 0);
+    runs.push({ name: `J8 ${name}`, c, noJ9: true });
+  }
+
+  // J7：所有擷取到的輸出都不含任何金絲雀
+  const allOut = runs.flatMap((r) => r.c.lines.map((l) => l.text)).join("\n");
+  const secrets = { AUD, EMAIL, SUB, JWT, COOKIE_VAL, query: "canary-query", token: env.CF_API_TOKEN, acct: env.CF_ACCOUNT_ID };
+  JWT.split(".").forEach((seg, i) => { secrets["JWT 第 " + i + " 段"] = seg; });
+  for (const [k, v] of Object.entries(secrets)) tt(`J7 輸出不含 ${k}`, !allOut.includes(v));
+
+  // J9：每個請求恰好一行 console.log、鍵集合與值都在白名單內
+  const KEYS = ["ctxAudMatch", "ctxAudType", "hasAuthCookie", "hasAuthEmailHeader", "hasCtxAccess", "hasGetIdentity",
+    "hasJwtHeader", "host", "jwtAudMatch", "method", "passed", "route"];
+  const BOOL = ["passed", "hasCtxAccess", "ctxAudMatch", "hasGetIdentity", "hasJwtHeader", "hasAuthEmailHeader", "hasAuthCookie"];
+  const bad = [];
+  for (const { name, c, noJ9 } of runs) {
+    if (noJ9) continue;
+    let o = null;
+    try { o = JSON.parse(c.lines[0].text); } catch {}
+    const d = o?.accessDiag;
+    const okShape = c.lines.length === 1 && c.lines[0].m === "log" && o && Object.keys(o).join() === "accessDiag" && d
+      && JSON.stringify(Object.keys(d).sort()) === JSON.stringify(KEYS)
+      && BOOL.every((k) => typeof d[k] === "boolean")
+      && ["api", "root", "other"].includes(d.route)
+      && ["GET", "HEAD", "POST", "OPTIONS", "other"].includes(d.method)
+      && ["none", "missing", "string", "array", "other"].includes(d.ctxAudType)
+      && [true, false, "absent", "unparsable"].includes(d.jwtAudMatch)
+      && d.host === "dash.example.com";
+    if (!okShape) bad.push(name);
+  }
+  t("J9 每個請求恰一行白名單 log（列出不符的請求）", bad, []);
+  tt("J9 至少檢查了 20 個請求", runs.filter((r) => !r.noJ9).length >= 20);
 }
 
 console.log("\n通過 " + pass + " 項，失敗 " + fail + " 項");
