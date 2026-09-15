@@ -15,6 +15,12 @@
       "ACCESS_AUD": {
         "description": "保護這個儀表板的 Cloudflare Access 應用的 Application Audience (AUD) Tag。第一次部署時留空即可 —— Access 應用要先有已部署的 Worker 才能建立。留空時 Worker 會回 503 拒絕一切，等你建好 Access 應用再把 AUD 填進 wrangler.toml 重新部署。"
       },
+      "ACCESS_TEAM_DOMAIN": {
+        "description": "選用，預設留空。Cloudflare Access 的 team domain，格式必須完全是 https://<team 名稱>.cloudflareaccess.com（小寫、沒有結尾斜線、路徑或埠）。只有自訂網域已被 Access 應用涵蓋、卻仍然一律 403 時才需要，並且要和 ACCESS_JWT_HOSTNAMES 一起設定。"
+      },
+      "ACCESS_JWT_HOSTNAMES": {
+        "description": "選用，預設留空。逗號分隔的主機名清單（例如 dash.example.com，不含 https:// 或路徑）。設定後，請求沒有 ctx.access、而且主機名完全等於清單中的一項時，該主機名上的有效 Access JWT（Cf-Access-Jwt-Assertion 標頭，aud 為 ACCESS_AUD、iss 為 ACCESS_TEAM_DOMAIN）會被信任。清單中的主機名必須被同一支 Access 應用涵蓋，否則偷到的 token 在過期前可以繞過 Access。"
+      },
       "CF_API_TOKEN": {
         "description": "讀取 DNS 查詢記錄用的 API Token，只需要 Account Analytics: Read 權限。建議另外開一顆唯讀的，儀表板不需要任何寫入權限。"
       }

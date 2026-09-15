@@ -8,10 +8,13 @@ compatibility_date = "2026-08-01"
 # 觀察用途，不需要放在自訂網域上。
 #
 # ⚠️ 想綁自訂網域（加 routes）之前先讀這段：進入權限是由 Worker-level Cloudflare
-# Access 控制的，而 Access 應用綁的是特定的入口。新加的自訂網域如果沒有被同一支
-# Access 應用涵蓋，請求進到 Worker 時 ctx.access 不會被填，Worker 一律回 403 ——
-# 安全上沒問題（fail closed），但你會得到一個查不出原因的故障。要加 routes，
-# 就要同步把新網址加進 Access 應用。
+# Access 控制的，而 Access 應用綁的是特定的入口。要加 routes，就要同步把新網址加進
+# 同一支 Access 應用。沒有被涵蓋的網域，Access 不會驗證請求、也沒有 ctx.access，
+# Worker 回 403（fail closed）。
+#
+# 被涵蓋了卻仍然一律 403：實測過自訂網域上 Access 有驗證、執行環境卻沒有給 ctx.access。
+# 這時請設定下面 [vars] 的 ACCESS_TEAM_DOMAIN 與 ACCESS_JWT_HOSTNAMES，讓 Worker 在
+# 那個主機名上自行驗證 Access 附上的 JWT。
 workers_dev = true
 
 # 明寫而不是靠預設值。preview_urls 未指定時會跟著 workers_dev（目前 true），
@@ -63,6 +66,26 @@ CF_ACCOUNT_ID = "請填入你的 Cloudflare Account ID"
 # 換掉 Access 應用（刪掉重建也算）就會換一組 aud，記得同步更新這裡並重新部署，
 # 否則 Worker 會把所有人擋在 403。
 ACCESS_AUD = ""
+
+# ── 選用：自訂網域拿不到 ctx.access 時的 JWT 驗證 ────────────
+#
+# 預設兩個都是空字串，這個功能是關的：Worker 只信任執行環境給的 ctx.access。
+# 只有「自訂網域已被同一支 Access 應用涵蓋，卻仍然一律 403」時才需要填。
+#
+# 兩個都填了之後，請求沒有 ctx.access、而且主機名完全等於清單中的一項時，Worker 會用
+# team domain 的公鑰驗證 Cf-Access-Jwt-Assertion 標頭（RS256 簽章、type 為 app、aud 等於
+# 上面的 ACCESS_AUD、iss 等於 team domain、未過期）。workers.dev 與預覽網址不要放進清單。
+#
+# ⚠️ 風險：清單中的主機名**必須被同一支 Access 應用涵蓋**。如果某個主機名脫離了 Access
+# 的保護，偷到的 token 在過期之前（依 Access session 長度，預設 24 小時）可以直接打那個
+# 主機名，完全不經過 Access，也略過 Access 端的撤銷與政策變更。
+# 這兩個值都不是機密。
+#
+# Access 的 team domain，格式必須完全是 https://<team 名稱>.cloudflareaccess.com
+# （小寫、沒有結尾斜線、沒有路徑或埠），也就是 Access 登入頁網址的那個網域。
+ACCESS_TEAM_DOMAIN = ""
+# 逗號分隔的主機名清單，例如 "dash.example.com"。只放主機名，不要加 https:// 或路徑。
+ACCESS_JWT_HOSTNAMES = ""
 
 # ── 選用的繫結 ──────────────────────────────────────────
 #
