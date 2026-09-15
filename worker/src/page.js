@@ -179,7 +179,10 @@ code{background:var(--panel2);padding:1px 5px;border-radius:4px;font-size:12px}
 </div>
 
 </div>
-<script>
+<!-- data-cfasync="false"：zone 開著 Rocket Loader 時，它會把腳本改成由外部 loader 載入，
+     而 CSP（script-src 'unsafe-inline'）會擋掉那支 loader，整個頁面的 JS 就不會執行。
+     workers.dev 不經過 zone 所以沒事，自訂網域才會發生。這個屬性讓 Rocket Loader 跳過這段腳本。 -->
+<script data-cfasync="false">
 (function(){
   "use strict";
 
