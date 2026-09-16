@@ -497,47 +497,85 @@ async function apiStatus(env) {
 
 // ── 路由 ─────────────────────────────────────────────────
 
-const SECURITY_HEADERS = {
-  "X-Content-Type-Options": "nosniff",
-  "X-Frame-Options": "DENY",
-  "Referrer-Policy": "no-referrer",
-  // 跨源的 no-cors 子資源讀取（例如別的站用腳本標籤把 /app.js 指過來）一律被瀏覽器擋下，
-  // 登入與否對跨站頁面都只會是 onerror，/app.js 不會變成探測「這個人登入了沒」的訊號。
-  // 同源載入、使用者自己的導覽、以及頁面對 /api/* 的同源 fetch 都不受影響。
-  "Cross-Origin-Resource-Policy": "same-origin",
-  // 頁面自帶樣式（style-src 'unsafe-inline'），腳本則是同源外部檔 /app.js，不連任何跨源資源。
-  // script-src 從 'unsafe-inline' 收緊成 'self'：自訂網域的 Cloudflare 邊緣會在 script-src
-  // 加上 nonce，行內腳本沒有 nonce 就不執行，而外部檔走網址比對，兩種入口都能跑。
-  // 其餘指令逐字不變。
-  "Content-Security-Policy":
-    "default-src 'none'; style-src 'unsafe-inline'; script-src 'self'; connect-src 'self'; img-src data:; form-action 'self'; base-uri 'none'",
-};
+// script-src 的來源只可能是 'self' 或通過這個 regex 的「<origin>/app.js」。
+// 驗的是**組好的整串**（單一收斂點）：一次涵蓋 scheme、主機名、埠、origin 為 "null"、IPv6 方括號。
+// 一定要是 allowlist：主機名未必可信（Service Binding 的呼叫端可以自訂請求 URL 的主機名，見上面「認證」），
+// 而 URL 解析會原樣保留 ; , * 等字元 —— ; 會切出新指令、, 會把標頭切成兩份政策、* 會允許任何主機。
+const APP_JS_SOURCE_RE = /^https?:\/\/[a-z0-9.-]{1,253}(:\d{1,5})?\/app\.js$/;
 
-function json(obj, status = 200) {
-  return new Response(JSON.stringify(obj), {
-    status,
-    headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", ...SECURITY_HEADERS },
-  });
+/**
+ * 這個請求的 Content-Security-Policy。恰好 8 個指令，前 7 個與 PR #28 逐字相同，另加 worker-src 'none'。
+ *
+ * - script-src 收窄成精確路徑 <origin>/app.js（CSP3：來源路徑不以 / 結尾即精確比對）。
+ *   同源上其他網址不再能以網址比對的方式當成腳本載入。
+ * - 組好的來源沒通過 APP_JS_SOURCE_RE、或 url 不是 URL 時退回 'self'（等於 PR #28 的行為，零退化），
+ *   絕不把未驗證的字串放進標頭，也絕不拋例外。
+ * - 只用 url.origin：path 與 query 永遠不進標頭。
+ * - 刻意不快取：每次重新組字串，不依 origin 存物件（否則 Host fuzz 會變成記憶體成長面）。
+ *   per-Host 的標頭能安全存在，前提是所有回應都是 Cache-Control: no-store。
+ */
+export function cspFor(url) {
+  let source = "'self'";
+  try {
+    if (url instanceof URL) {
+      const candidate = url.origin + "/app.js";
+      if (APP_JS_SOURCE_RE.test(candidate)) source = candidate;
+    }
+  } catch {}
+  return (
+    "default-src 'none'; style-src 'unsafe-inline'; script-src " + source +
+    "; connect-src 'self'; img-src data:; form-action 'self'; base-uri 'none'; worker-src 'none'"
+  );
 }
 
-function html(body, status = 200) {
-  return new Response(body, {
-    status,
-    headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", ...SECURITY_HEADERS },
-  });
+/** 每次回傳新物件，不共用、不快取。 */
+function securityHeaders(url) {
+  return {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    // 跨源的 no-cors 子資源讀取（例如別的站用腳本標籤把 /app.js 指過來）一律被瀏覽器擋下，
+    // 登入與否對跨站頁面都只會是 onerror，/app.js 不會變成探測「這個人登入了沒」的訊號。
+    // 同源載入、使用者自己的導覽、以及頁面對 /api/* 的同源 fetch 都不受影響。
+    "Cross-Origin-Resource-Policy": "same-origin",
+    // 頁面自帶樣式（style-src 'unsafe-inline'），腳本則是同源外部檔 /app.js，不連任何跨源資源。
+    // 自訂網域的 Cloudflare 邊緣會在 script-src 加上 nonce，行內腳本沒有 nonce 就不執行，
+    // 而外部檔走網址比對，兩種入口都能跑。見 cspFor。
+    "Content-Security-Policy": cspFor(url),
+  };
 }
 
-// 頁面腳本。MIME 必須是 JavaScript —— 回應同時帶 nosniff，型別不對瀏覽器就不會執行它。
-function js(body) {
-  return new Response(body, {
-    status: 200,
-    headers: { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "no-store", ...SECURITY_HEADERS },
-  });
+/**
+ * 回應小工具的工廠。在 fetch() 開頭以請求的 url 建立一次，之後所有回應（含 try 之外的 503 與兩段 403）
+ * 都帶這個請求的 CSP。用閉包而不是多一個位置參數：漏傳時不會把 url 當成 status 而在 try 之外拋例外。
+ */
+function responders(url) {
+  const json = (obj, status = 200) =>
+    new Response(JSON.stringify(obj), {
+      status,
+      headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", ...securityHeaders(url) },
+    });
+
+  const html = (body, status = 200) =>
+    new Response(body, {
+      status,
+      headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", ...securityHeaders(url) },
+    });
+
+  // 頁面腳本。MIME 必須是 JavaScript —— 回應同時帶 nosniff，型別不對瀏覽器就不會執行它。
+  const js = (body) =>
+    new Response(body, {
+      status: 200,
+      headers: { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "no-store", ...securityHeaders(url) },
+    });
+
+  return { json, html, js };
 }
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    const { json, html, js } = responders(url);
 
     // 沒有設定 ACCESS_AUD 就什麼都不給。維持原本的 fail-closed 哲學：
     // 這個頁面攤開完整 DNS 查詢記錄，設定漏掉的預設結果不可以是「公開」。

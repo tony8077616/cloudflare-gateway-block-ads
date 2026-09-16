@@ -3,6 +3,7 @@
 //   2. 腳本抓的每個 id 在 HTML 裡真的存在（打錯字會在執行期變成 null 爆炸）
 //   3. 腳本讀的 data-* 屬性真的有被產生出來（產生端同時看 PAGE 與 APP_JS）
 //   4. CSP 允許的範圍與頁面實際用到的資源一致，而且 PAGE 裡沒有任何行內腳本／行內事件屬性
+//   5. fmt() 的輸出只可能來自數字（情境 F）
 
 import { PAGE, APP_JS } from "../src/page.js";
 import { writeFileSync, mkdtempSync } from "node:fs";
@@ -132,6 +133,34 @@ console.log("\n情境 E：需求對照 —— 這四項在頁面上都要找得�
     ["輸入中即時反映（尚未套用的狀態）", /pending/.test(script)],
   ];
   for (const [d, c] of checks) c ? ok(d) : no(d);
+}
+
+console.log("\n情境 F：fmt() 只輸出由數字產生的字串（它的結果有幾處未經 esc() 就進 innerHTML）");
+{
+  // 從 APP_JS 擷取 fmt 的定義本身來測，而不是在這裡另寫一份 —— 改了頁面卻沒改測試時才抓得到。
+  const m = APP_JS.match(/\bvar fmt = (function\s*\(n\)\s*\{[^\n]*\});/);
+  if (!m) {
+    no("在 APP_JS 找不到 fmt 的定義");
+  } else {
+    let fmt = null;
+    try { fmt = new Function("return (" + m[1] + ");")(); }
+    catch (e) { no("fmt 的定義無法取出：" + String(e && e.message)); }
+    if (typeof fmt === "function") {
+      // 取出的函式看不到 APP_JS 裡的其他區域變數（例如 esc）：呼叫時拋例外也要算成一項失敗，不讓整支檢查中斷
+      const raw = fmt;
+      fmt = (v) => { try { return raw(v); } catch (e) { return "（拋出例外：" + String(e && e.message) + "）"; } };
+      const same = (d, got, want) => (got === want ? ok(d + "：" + JSON.stringify(got)) : no(d + "：得到 " + JSON.stringify(got) + " 預期 " + JSON.stringify(want)));
+      same("fmt(1234)", fmt(1234), "1,234");
+      for (const [label, v] of [["0", 0], ["null", null], ["undefined", undefined], ['""', ""], ["NaN", NaN], ["Infinity", Infinity], ["-0", -0]]) {
+        same("fmt(" + label + ")", fmt(v), "0");
+      }
+      const xss = fmt("<img src=x onerror=alert(1)>");
+      same("fmt(\"<img src=x onerror=alert(1)>\")", xss, "0");
+      if (String(xss).includes("<")) no("fmt 的輸出含 <"); else ok("fmt 的輸出不含 <");
+      same("fmt(\"123\")", fmt("123"), "123");
+      same("fmt(1234.5) 與 Number(1234.5).toLocaleString(\"zh-Hant\") 相同", fmt(1234.5), Number(1234.5).toLocaleString("zh-Hant"));
+    }
+  }
 }
 
 console.log("\n通過 " + pass + " 項，失敗 " + fail + " 項");
