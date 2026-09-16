@@ -14,7 +14,7 @@
  *（fail closed），而不是預設公開。詳見 README。
  */
 
-import { PAGE } from "./page.js";
+import { PAGE, APP_JS } from "./page.js";
 
 // ── resolverDecision 對照 ────────────────────────────────
 //
@@ -501,9 +501,16 @@ const SECURITY_HEADERS = {
   "X-Content-Type-Options": "nosniff",
   "X-Frame-Options": "DENY",
   "Referrer-Policy": "no-referrer",
-  // 頁面完全自帶樣式與腳本，不載入任何外部資源
+  // 跨源的 no-cors 子資源讀取（例如別的站用腳本標籤把 /app.js 指過來）一律被瀏覽器擋下，
+  // 登入與否對跨站頁面都只會是 onerror，/app.js 不會變成探測「這個人登入了沒」的訊號。
+  // 同源載入、使用者自己的導覽、以及頁面對 /api/* 的同源 fetch 都不受影響。
+  "Cross-Origin-Resource-Policy": "same-origin",
+  // 頁面自帶樣式（style-src 'unsafe-inline'），腳本則是同源外部檔 /app.js，不連任何跨源資源。
+  // script-src 從 'unsafe-inline' 收緊成 'self'：自訂網域的 Cloudflare 邊緣會在 script-src
+  // 加上 nonce，行內腳本沒有 nonce 就不執行，而外部檔走網址比對，兩種入口都能跑。
+  // 其餘指令逐字不變。
   "Content-Security-Policy":
-    "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src data:; form-action 'self'; base-uri 'none'",
+    "default-src 'none'; style-src 'unsafe-inline'; script-src 'self'; connect-src 'self'; img-src data:; form-action 'self'; base-uri 'none'",
 };
 
 function json(obj, status = 200) {
@@ -517,6 +524,14 @@ function html(body, status = 200) {
   return new Response(body, {
     status,
     headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", ...SECURITY_HEADERS },
+  });
+}
+
+// 頁面腳本。MIME 必須是 JavaScript —— 回應同時帶 nosniff，型別不對瀏覽器就不會執行它。
+function js(body) {
+  return new Response(body, {
+    status: 200,
+    headers: { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "no-store", ...SECURITY_HEADERS },
   });
 }
 
@@ -556,6 +571,9 @@ export default {
       if (url.pathname === "/api/data") return json(await apiData(request, env));
       if (url.pathname === "/api/status") return json(await apiStatus(env));
       if (url.pathname === "/") return html(PAGE);
+      // 頁面腳本。和 `/` 一樣不看 method，而且同樣在上面那道 Access 關卡之後 ——
+      // 未驗證的請求根本走不到這裡。
+      if (url.pathname === "/app.js") return js(APP_JS);
       return json({ error: "找不到這個路徑" }, 404);
     } catch (e) {
       return json({ error: String(e.message || e) }, 500);
