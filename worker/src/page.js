@@ -207,7 +207,9 @@ export const APP_JS = `
   var timer = null, debounce = null;
 
   var $ = function(id){ return document.getElementById(id); };
-  var fmt = function(n){ return (n||0).toLocaleString("zh-Hant"); };
+  // 輸出只可能來自數字的 toLocaleString：fmt() 的結果有幾處未經 esc() 就進 innerHTML，
+  // 而字串的 toLocaleString 會原樣回傳。非有限數字與 -0 一律顯示 0。
+  var fmt = function(n){ var v = Number(n); if (!Number.isFinite(v) || v === 0) v = 0; return v.toLocaleString("zh-Hant"); };
 
   function esc(s){
     return String(s == null ? "" : s).replace(/[&<>"']/g, function(c){

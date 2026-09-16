@@ -3,8 +3,9 @@
 
 import { readFileSync } from "node:fs";
 import { inspect } from "node:util";
-import worker from "../src/index.js";
-import { APP_JS } from "../src/page.js";
+import worker, { cspFor } from "../src/index.js";
+import * as indexModule from "../src/index.js";
+import { PAGE, APP_JS } from "../src/page.js";
 
 let pass = 0, fail = 0;
 function t(desc, got, want) {
@@ -282,8 +283,9 @@ console.log("\n情境 I：安全標頭、/app.js 與未知路徑");
 {
   // CSP 整串逐字比對。收緊 script-src 的重點就是「不可以有第二個來源溜進去」，
   // 所以除了整串比對，還把 script-src 指令單獨拆出來精確比對一次。
-  const CSP = "default-src 'none'; style-src 'unsafe-inline'; script-src 'self'; "
-    + "connect-src 'self'; img-src data:; form-action 'self'; base-uri 'none'";
+  // req() 固定用 https://dash.example.com，所以 script-src 收窄成這個 origin 的 /app.js。
+  const CSP = "default-src 'none'; style-src 'unsafe-inline'; script-src https://dash.example.com/app.js; "
+    + "connect-src 'self'; img-src data:; form-action 'self'; base-uri 'none'; worker-src 'none'";
   const scriptSrcOf = (csp) => (csp || "").split(";").map((d) => d.trim()).filter((d) => /^script-src\b/.test(d));
 
   stubGraphQL([], []);
@@ -292,7 +294,7 @@ console.log("\n情境 I：安全標頭、/app.js 與未知路徑");
   tt("有 X-Frame-Options: DENY", r.headers.get("X-Frame-Options") === "DENY");
   tt("CSP 預設封死", (r.headers.get("Content-Security-Policy") || "").includes("default-src 'none'"));
   t("/ 的 CSP 整串逐字相符", r.headers.get("Content-Security-Policy"), CSP);
-  t("/ 的 script-src 指令恰好是 script-src 'self'", scriptSrcOf(r.headers.get("Content-Security-Policy")), ["script-src 'self'"]);
+  t("/ 的 script-src 指令恰好是 script-src https://dash.example.com/app.js", scriptSrcOf(r.headers.get("Content-Security-Policy")), ["script-src https://dash.example.com/app.js"]);
   t("/ 帶 Cross-Origin-Resource-Policy: same-origin", r.headers.get("Cross-Origin-Resource-Policy"), "same-origin");
   tt("不快取", (r.headers.get("Cache-Control") || "").includes("no-store"));
 
@@ -305,7 +307,7 @@ console.log("\n情境 I：安全標頭、/app.js 與未知路徑");
   tt("/app.js 的本文與 APP_JS 完全相等", appBody === APP_JS);
   tt("/app.js 有 X-Content-Type-Options: nosniff", ra.headers.get("X-Content-Type-Options") === "nosniff");
   tt("/app.js 不快取", (ra.headers.get("Cache-Control") || "").includes("no-store"));
-  t("/app.js 的 CSP 與 / 同一份", ra.headers.get("Content-Security-Policy"), CSP);
+  t("/app.js 的 CSP 與 / 同一份（同一個主機名）", ra.headers.get("Content-Security-Policy"), CSP);
   t("/app.js 帶 Cross-Origin-Resource-Policy: same-origin", ra.headers.get("Cross-Origin-Resource-Policy"), "same-origin");
 
   // 非 JS 回應必須維持非 JS MIME + nosniff：script-src 收成 'self' 之後，
@@ -325,6 +327,142 @@ console.log("\n情境 I：安全標頭、/app.js 與未知路徑");
   tt("500 JSON 有 nosniff", r3.headers.get("X-Content-Type-Options") === "nosniff");
   tt("500 的 Content-Type 以 application/json 開頭", (r3.headers.get("Content-Type") || "").startsWith("application/json"));
   t("500 帶 Cross-Origin-Resource-Policy", r3.headers.get("Cross-Origin-Resource-Policy"), "same-origin");
+}
+
+console.log("\n情境 J：每個請求各自的 CSP —— worker-src 'none'、script-src 收窄成 <origin>/app.js、驗不過就退回 'self'");
+{
+  // 指令名逐字比對陣列（不是比對數量）：任何向量只要被切出新指令、少了一個指令，這裡就不相等。
+  const DIRECTIVES = ["default-src", "style-src", "script-src", "connect-src", "img-src", "form-action", "base-uri", "worker-src"];
+  const namesOf = (csp) => String(csp).split(";").map((d) => d.trim().split(/\s+/)[0]);
+  const scriptSrcOf = (csp) => String(csp).split(";").map((d) => d.trim()).filter((d) => /^script-src\b/.test(d));
+  const SELF = ["script-src 'self'"];
+  const cspHeaders = (r) => [...r.headers].filter(([k]) => k.toLowerCase() === "content-security-policy");
+  // 403／503 本文（逐字取自修改前的 index.js）
+  const DENY_HTML = `<h1>需要透過 Cloudflare Access 進入</h1><p>這個請求沒有經過 Cloudflare Access 驗證，或者驗證的是另一支 Access 應用。</p>
+         <p>請從 Access 應用涵蓋的網址進入，並用政策允許的帳號登入。</p>`;
+  const DENY_JSON = '{"error":"未通過驗證"}';
+  const NO_AUD_HTML = `<h1>尚未設定 ACCESS_AUD</h1><p>這個儀表板會顯示完整的 DNS 查詢記錄，在指定它所屬的 Cloudflare Access 應用之前不會提供任何內容。</p>
+         <p>請把 Access 應用的 Application Audience (AUD) Tag 填進 <code>wrangler.toml</code> 的 <code>[vars] ACCESS_AUD</code>，重新部署之後再試。</p>`;
+
+  console.log("  J1：cspFor 單元測試");
+  {
+    // 元組來源但不是 http(s)：scheme 錨點唯一的驗收證據。先釘住 origin 真的是元組形式，
+    // 否則（像 foo:// 與 data: 的 "null"）regex 的 scheme 放寬了也測不出來。
+    for (const [s, origin] of [["ws://host/", "ws://host"], ["wss://host:8443/", "wss://host:8443"], ["ftp://host/", "ftp://host"]]) {
+      const u = new URL(s);
+      const csp = cspFor(u);
+      t(`J1 ${s} → [origin, script-src, 指令名]`, [u.origin, scriptSrcOf(csp), namesOf(csp)], [origin, SELF, DIRECTIVES]);
+    }
+    for (const s of ["foo://host/", "data:text/html,x"]) {
+      const u = new URL(s);
+      const csp = cspFor(u);
+      t(`J1 不透明來源 ${s} → [origin, script-src, 指令名]`, [u.origin, scriptSrcOf(csp), namesOf(csp)], ["null", SELF, DIRECTIVES]);
+    }
+    for (const [label, v] of [["undefined", undefined], ["null", null], ["空字串", ""],
+      ["網址字串（不是 URL 物件）", "https://dash.example.com/"], ["帶 origin 的一般物件", { origin: "https://dash.example.com" }]]) {
+      let threw = null, csp = null;
+      try { csp = cspFor(v); } catch (e) { threw = e; }
+      t(`J1 cspFor(${label}) → [不拋例外, script-src, 指令名]`, [threw === null, scriptSrcOf(csp), namesOf(csp)], [true, SELF, DIRECTIVES]);
+    }
+    t("J1 對照組：cspFor(https://dash.example.com/x?y=1) 整串逐字相符",
+      cspFor(new URL("https://dash.example.com/x?y=1")),
+      "default-src 'none'; style-src 'unsafe-inline'; script-src https://dash.example.com/app.js; connect-src 'self'; "
+        + "img-src data:; form-action 'self'; base-uri 'none'; worker-src 'none'");
+    t("J1 index.js 的具名匯出只有 cspFor（外加 default）", Object.keys(indexModule).sort(), ["cspFor", "default"]);
+  }
+
+  console.log("  J2：由請求的主機名觀察 CSP");
+  {
+    stubGraphQL([], []);
+    const HOST253 = "a".repeat(253), HOST254 = "a".repeat(254);
+    const narrowed = [
+      ["https://dash.example.com", "https://dash.example.com/app.js"],
+      ["https://adblock.salausau.trade", "https://adblock.salausau.trade/app.js"],
+      ["https://host:8443", "https://host:8443/app.js"],
+      ["http://localhost:8787", "http://localhost:8787/app.js"],
+      ["https://DASH.EXAMPLE.COM", "https://dash.example.com/app.js"],
+      ["https://host.", "https://host./app.js"],
+      ["https://" + HOST253, "https://" + HOST253 + "/app.js"],
+    ];
+    for (const [origin, want] of narrowed) {
+      const r = await worker.fetch(new Request(origin + "/"), baseEnv, ctxAud(AUD));
+      const csp = r.headers.get("Content-Security-Policy");
+      const label = origin.length > 60 ? "https://（253 字元主機名）" : origin;
+      t(`J2 ${label}/ → [200, script-src, 指令名, CSP 標頭數, 含逗號]`,
+        [r.status, scriptSrcOf(csp), namesOf(csp), cspHeaders(r).length, csp.includes(",")],
+        [200, ["script-src " + want], DIRECTIVES, 1, false]);
+    }
+
+    const fallback = [
+      ["a;b.example.com", "https://a;b.example.com"],
+      ["a,b.example.com", "https://a,b.example.com"],
+      ["*", "https://*"],
+      ["a*b.example.com", "https://a*b.example.com"],
+      ["a\"b.example.com", "https://a\"b.example.com"],
+      ["[::1]:8443", "https://[::1]:8443"],
+      ["254 字元主機名", "https://" + HOST254],
+    ];
+    for (const [label, origin] of fallback) {
+      const r = await worker.fetch(new Request(origin + "/"), baseEnv, ctxAud(AUD));
+      const csp = r.headers.get("Content-Security-Policy");
+      t(`J2 退回 ${label} → [200, script-src, 指令名, CSP 標頭數, 含逗號]`,
+        [r.status, scriptSrcOf(csp), namesOf(csp), cspHeaders(r).length, csp.includes(",")],
+        [200, SELF, DIRECTIVES, 1, false]);
+    }
+  }
+
+  console.log("  J3：七種回應都帶這個請求的 CSP 與其餘安全標頭");
+  {
+    const ORIGIN = "https://adblock.salausau.trade";
+    const WANT = ["script-src " + ORIGIN + "/app.js"];
+    const at = (path, opts) => new Request(ORIGIN + path, opts);
+    const errorFetch = async () => new Response(JSON.stringify({ data: null, errors: [{ message: "Authentication error" }] }),
+      { status: 200, headers: { "Content-Type": "application/json" } });
+    const JSON_CT = "application/json; charset=utf-8", HTML_CT = "text/html; charset=utf-8", JS_CT = "text/javascript; charset=utf-8";
+    const kinds = [
+      ["/", () => worker.fetch(at("/"), baseEnv, ctxAud(AUD)), 200, HTML_CT, PAGE],
+      ["/app.js", () => worker.fetch(at("/app.js"), baseEnv, ctxAud(AUD)), 200, JS_CT, APP_JS],
+      ["/api/status", () => worker.fetch(at("/api/status"), baseEnv, ctxAud(AUD)), 200, JSON_CT, null],
+      ["404", () => worker.fetch(at("/nope"), baseEnv, ctxAud(AUD)), 404, JSON_CT, null],
+      ["500", async () => { globalThis.fetch = errorFetch; return worker.fetch(at("/api/data?range=24h"), baseEnv, ctxAud(AUD)); }, 500, JSON_CT, null],
+      ["/api/* 的 JSON 403", () => worker.fetch(at("/api/data?range=24h"), baseEnv, ctxNone()), 403, JSON_CT, DENY_JSON],
+      ["/ 的 HTML 403", () => worker.fetch(at("/"), baseEnv, ctxNone()), 403, HTML_CT, DENY_HTML],
+      ["503", () => worker.fetch(at("/"), { CF_API_TOKEN: "x", CF_ACCOUNT_ID: "y" }, ctxAud(AUD)), 503, HTML_CT, NO_AUD_HTML],
+    ];
+    for (const [label, make, status, ct, body] of kinds) {
+      stubGraphQL([], []);
+      const r = await make();
+      const csp = r.headers.get("Content-Security-Policy");
+      t(`J3 ${label} → [狀態碼, script-src, 指令名, CSP 標頭數, CORP, nosniff, X-Frame-Options, Referrer-Policy, Cache-Control, Content-Type]`,
+        [r.status, scriptSrcOf(csp), namesOf(csp), cspHeaders(r).length,
+          r.headers.get("Cross-Origin-Resource-Policy"), r.headers.get("X-Content-Type-Options"),
+          r.headers.get("X-Frame-Options"), r.headers.get("Referrer-Policy"), r.headers.get("Cache-Control"), r.headers.get("Content-Type")],
+        [status, WANT, DIRECTIVES, 1, "same-origin", "nosniff", "DENY", "no-referrer", "no-store", ct]);
+      if (body !== null) tt(`J3 ${label} 本文逐位元組不變`, (await r.text()) === body);
+    }
+  }
+
+  console.log("  J4：CSP 的路徑與 PAGE 的腳本 src 對得上；path 與 query 不進任何標頭");
+  {
+    const srcs = [...PAGE.matchAll(/<script[^>]*src="([^"]+)"/g)].map((m) => m[1]);
+    t("J4 PAGE 恰好一個帶 src 的腳本標籤", srcs.length, 1);
+    stubGraphQL([], []);
+    const r = await ok("/");
+    const [directive] = scriptSrcOf(r.headers.get("Content-Security-Policy"));
+    tt(`J4 script-src（${directive}）以 PAGE 的 src（${srcs[0]}）結尾`, srcs.length === 1 && directive.endsWith(srcs[0]));
+    t("J4 script-src 恰好是 origin + PAGE 的 src", directive, "script-src https://dash.example.com" + srcs[0]);
+
+    const PATH_CANARY = "path-canary-7c1e", QUERY_CANARY = "query-canary-3b9d";
+    const probe = "/" + PATH_CANARY + "?q=" + QUERY_CANARY;
+    for (const [label, resp] of [
+      ["已驗證 404", await ok(probe)],
+      ["未驗證 403", await worker.fetch(req(probe), baseEnv, ctxNone())],
+      ["未驗證 /api/ 403", await worker.fetch(req("/api/" + PATH_CANARY + "?q=" + QUERY_CANARY), baseEnv, ctxNone())],
+    ]) {
+      const leaked = [...resp.headers].filter(([, v]) => v.includes(PATH_CANARY) || v.includes(QUERY_CANARY) || v.includes("canary"));
+      t(`J4 ${label}：標頭不含 path 或 query（列出外洩的標頭）`, leaked, []);
+    }
+  }
 }
 
 console.log("\n情境 K：沒有 ctx.access 時，自行驗證 Access JWT（只在主機名清單內的入口）");
