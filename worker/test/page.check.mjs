@@ -1,10 +1,10 @@
 // 頁面的靜態檢查。瀏覽器擴充功能沒連上時，這是能做到的最強驗證：
-//   1. 內嵌腳本的語法（寫這種長腳本最常見的錯就是語法錯）
+//   1. 頁面腳本（APP_JS）的語法（寫這種長腳本最常見的錯就是語法錯）
 //   2. 腳本抓的每個 id 在 HTML 裡真的存在（打錯字會在執行期變成 null 爆炸）
-//   3. 腳本讀的 data-* 屬性真的有被產生出來
-//   4. CSP 允許的範圍與頁面實際用到的資源一致
+//   3. 腳本讀的 data-* 屬性真的有被產生出來（產生端同時看 PAGE 與 APP_JS）
+//   4. CSP 允許的範圍與頁面實際用到的資源一致，而且 PAGE 裡沒有任何行內腳本／行內事件屬性
 
-import { PAGE } from "../src/page.js";
+import { PAGE, APP_JS } from "../src/page.js";
 import { writeFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,11 +14,12 @@ let pass = 0, fail = 0;
 const ok = (d) => { console.log("    ✓ " + d); pass++; };
 const no = (d) => { console.log("    ✗ " + d); fail++; };
 
-const script = (PAGE.match(/<script\b[^>]*>([\s\S]*?)<\/script>/) || [])[1];
+// 腳本已經不在 PAGE 裡了：它是獨立的 APP_JS，由 Worker 的 /app.js 提供。
+const script = APP_JS;
 
-console.log("情境 A：內嵌腳本的語法");
+console.log("情境 A：頁面腳本（APP_JS）的語法");
 if (!script) {
-  no("找不到 <script> 區塊");
+  no("APP_JS 是空的");
 } else {
   const dir = mkdtempSync(join(tmpdir(), "pagecheck-"));
   const f = join(dir, "inline.cjs");
@@ -52,8 +53,11 @@ console.log("\n情境 C：data-* 屬性的產生端與讀取端要對得上");
   const readSelectors = new Set([
     ...(script || "").matchAll(/\[data-([a-z-]+)\]/g),
   ].map((m) => m[1]));
+  // 產生端一定要同時掃 PAGE 與 APP_JS：data-clear／data-dom 是腳本用 innerHTML 產生的，
+  // 只掃 PAGE 的話這兩個讀取端就沒有任何產生端為它們背書，檢查形同虛設。
   const produced = new Set([
     ...PAGE.matchAll(/data-([a-z-]+)=/g),
+    ...APP_JS.matchAll(/data-([a-z-]+)=/g),
   ].map((m) => m[1]));
 
   const camel = (s) => s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
@@ -69,24 +73,52 @@ console.log("\n情境 C：data-* 屬性的產生端與讀取端要對得上");
   else ok("[data-*] 選擇器全部有對應的產生端（" + [...readSelectors].join(", ") + "）");
 }
 
-console.log("\n情境 D：頁面不可以依賴任何外部資源");
+console.log("\n情境 D：頁面不可以依賴跨源資源，也不可以有任何行內腳本或行內事件屬性");
 {
   const ext = [...PAGE.matchAll(/(?:src|href)="(https?:\/\/[^"]+)"/g)].map((m) => m[1]);
-  if (ext.length) no("頁面引用了外部資源，CSP 會擋掉：" + ext.join(", "));
-  else ok("沒有引用任何外部資源，符合 default-src 'none'");
+  if (ext.length) no("頁面引用了跨源資源，CSP 會擋掉：" + ext.join(", "));
+  else ok("沒有引用任何跨源資源，符合 default-src 'none'");
 
   const hasInlineStyle = /<style>/.test(PAGE);
-  const hasInlineScript = /<script\b[^>]*>/.test(PAGE);
-  ok("樣式與腳本都內嵌（style:" + hasInlineStyle + " script:" + hasInlineScript + "）");
+  ok("樣式內嵌、腳本改由同源外部檔提供（style:" + hasInlineStyle + "）");
 
-  // 自訂網域的 zone 開著 Rocket Loader：它會把腳本改由外部 loader 載入，被上面的 CSP 擋掉，
-  // 頁面 JS 完全不執行、API 一次都不會呼叫（2026-09-15 上線後實際發生）。
-  // 每個 <script> 開頭標籤都必須帶 data-cfasync="false"，Rocket Loader 才會跳過。
-  const tags = [...PAGE.matchAll(/<script\b[^>]*>/g)].map((m) => m[0]);
-  const bare = tags.filter((t) => !/\sdata-cfasync="false"/.test(t));
-  if (!tags.length) no("找不到任何 <script> 開頭標籤");
-  else if (bare.length) no("有 <script> 沒帶 data-cfasync=\"false\"，會被 Rocket Loader 改寫後被 CSP 擋掉：" + bare.join(" "));
-  else ok("全部 " + tags.length + " 個 <script> 都帶 data-cfasync=\"false\"（Rocket Loader 不會改寫）");
+  // script-src 是 'self'，而自訂網域的邊緣還會再加 nonce：行內腳本沒有 nonce 就不會執行，
+  // 頁面 JS 完全不動、API 一次都不會呼叫（2026-09-15 上線後實際發生）。所以 PAGE 裡
+  // 只能有一個腳本標籤，而且必須是指向 /app.js 的空標籤。
+  // data-cfasync="false" 保留（PR #27）：zone 開著 Rocket Loader 時它會改寫腳本的載入方式。
+  // 大小寫不敏感（加 i）：HTML 的標籤名與屬性名本來就不分大小寫，只比對小寫會漏掉 <SCRIPT>。
+  const EXPECTED_TAG = '<script data-cfasync="false" src="/app.js"><' + "/script>";
+  const tags = [...PAGE.matchAll(/<script\b[^>]*>/gi)].map((m) => m[0]);
+  if (tags.length === 1) ok("PAGE 恰好一個腳本開頭標籤");
+  else no("PAGE 必須恰好一個腳本開頭標籤，實際 " + tags.length + " 個：" + tags.join(" "));
+
+  const elements = [...PAGE.matchAll(/<script\b[\s\S]*?<\/script\s*>/gi)].map((m) => m[0]);
+  if (elements.length === 1 && elements[0] === EXPECTED_TAG) {
+    ok("腳本標籤逐字等於 " + EXPECTED_TAG + "（標籤之間沒有任何內容）");
+  } else {
+    no("腳本標籤不是預期的形式，PAGE 裡可能留了行內腳本：" + JSON.stringify(elements));
+  }
+
+  const bare = tags.filter((t) => !/\sdata-cfasync="false"/i.test(t));
+  if (bare.length) no("有腳本標籤沒帶 data-cfasync=\"false\"，會被 Rocket Loader 改寫：" + bare.join(" "));
+  else ok("全部 " + tags.length + " 個腳本標籤都帶 data-cfasync=\"false\"（Rocket Loader 不會改寫）");
+
+  // 行內事件屬性（onclick=、onError= …）在 script-src 'self' 之下一律不會執行，
+  // 而且就算執行也是我們不想要的寫法。PAGE 與 APP_JS 產生的片段都不可以有。
+  for (const [name, src] of [["PAGE", PAGE], ["APP_JS", APP_JS]]) {
+    const m = src.match(/\son[a-z]+\s*=/i);
+    if (m) no(name + " 含行內事件屬性：" + m[0].trim());
+    else ok(name + " 不含行內事件屬性（on*=）");
+
+    const j = src.match(/javascript:/i);
+    if (j) no(name + " 含 javascript: 網址");
+    else ok(name + " 不含 javascript: 網址");
+  }
+
+  // APP_JS 是原樣送出的 JS 檔，不經過 HTML 解析，但它若含 </script 就代表有人
+  // 又把它塞回頁面裡了 —— 那會在瀏覽器端提早結束標籤。
+  if (/<\/script/i.test(APP_JS)) no("APP_JS 含 </script");
+  else ok("APP_JS 不含 </script");
 }
 
 console.log("\n情境 E：需求對照 —— 這四項在頁面上都要找得到");

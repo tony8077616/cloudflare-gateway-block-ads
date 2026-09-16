@@ -1,5 +1,14 @@
-// 儀表板頁面。刻意做成單一字串常數：不需要打包工具，也不載入任何外部資源
+// 儀表板頁面。刻意做成字串常數：不需要打包工具，也不連任何跨源資源
 // （Worker 的 CSP 是 default-src 'none'，連 CDN 都連不出去，這是故意的）。
+//
+// 這個檔案匯出兩個常數：
+//   PAGE   —— HTML，由 Worker 的 `/` 提供
+//   APP_JS —— 頁面腳本，由 Worker 的 `/app.js` 提供（同一道 Access 關卡）
+//
+// ⚠️ PAGE 裡**不可以**再出現任何行內腳本（有內容的腳本標籤）或行內事件屬性（on*=）。
+//    CSP 的 script-src 是 'self'，而自訂網域的 Cloudflare 邊緣還會再加上 nonce ——
+//    沒有 nonce 的行內腳本一律不會執行，頁面會整個死掉（2026-09-15 上線後實際發生）。
+//    腳本一律放進 APP_JS。page.check.mjs 的情境 D 會釘住這一點。
 //
 // 注意：底下的頁面腳本一律用字串串接，不使用樣板字面值 —— 這整份是包在
 // JS 樣板字面值裡的，頁面自己再用 ${...} 會被外層搶先解析。
@@ -179,10 +188,18 @@ code{background:var(--panel2);padding:1px 5px;border-radius:4px;font-size:12px}
 </div>
 
 </div>
-<!-- data-cfasync="false"：zone 開著 Rocket Loader 時，它會把腳本改成由外部 loader 載入，
-     而 CSP（script-src 'unsafe-inline'）會擋掉那支 loader，整個頁面的 JS 就不會執行。
-     workers.dev 不經過 zone 所以沒事，自訂網域才會發生。這個屬性讓 Rocket Loader 跳過這段腳本。 -->
-<script data-cfasync="false">
+<!-- 腳本改成同源外部檔 /app.js：自訂網域的 Cloudflare 邊緣會在 CSP 的 script-src 加上 nonce，
+     沒有 nonce 的行內腳本一律不會執行，頁面的 JS 就完全不動（2026-09-15 上線後實際發生）。
+     外部檔走的是網址比對（script-src 'self'），不需要 nonce，所以在兩種入口都會執行。
+     data-cfasync="false" 保留：zone 開著 Rocket Loader 時它會改寫腳本的載入方式，這個屬性讓它跳過。
+     腳本內容在本檔案下方的 APP_JS。 -->
+<script data-cfasync="false" src="/app.js"></script>
+</body>
+</html>`;
+
+// 頁面腳本。由 Worker 的 /app.js 以 text/javascript 提供，和 `/` 走同一道 Access 關卡。
+// 內容與先前的行內腳本逐位元組相同；一樣一律用字串串接，不使用 ${...}（理由同檔首）。
+export const APP_JS = `
 (function(){
   "use strict";
 
@@ -513,6 +530,4 @@ code{background:var(--panel2);padding:1px 5px;border-radius:4px;font-size:12px}
   load();
   loadStatus();
 })();
-</script>
-</body>
-</html>`;
+`;

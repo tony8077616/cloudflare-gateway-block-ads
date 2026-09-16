@@ -4,6 +4,7 @@
 import { readFileSync } from "node:fs";
 import { inspect } from "node:util";
 import worker from "../src/index.js";
+import { APP_JS } from "../src/page.js";
 
 let pass = 0, fail = 0;
 function t(desc, got, want) {
@@ -93,6 +94,12 @@ console.log("情境 A：沒有設定 ACCESS_AUD 時必須 fail closed");
 
   const r3 = await worker.fetch(req("/"), { ...env, ACCESS_AUD: "" }, ctxAud(AUD));
   t("ACCESS_AUD 是空字串也算沒設定", r3.status, 503);
+
+  // /app.js 和 / 走同一道關卡，ACCESS_AUD 沒設定時一樣什麼都不給
+  const r4 = await worker.fetch(req("/app.js"), env, ctxAud(AUD));
+  t("/app.js 也一樣 fail closed", r4.status, 503);
+  const r5 = await worker.fetch(req("/app.js"), { ...env, ACCESS_AUD: "" }, ctxAud(AUD));
+  t("ACCESS_AUD 是空字串時 /app.js 也是 503", r5.status, 503);
 }
 
 console.log("\n情境 B：Cloudflare Access 沒驗過的請求一律擋下");
@@ -134,6 +141,21 @@ console.log("\n情境 B：Cloudflare Access 沒驗過的請求一律擋下");
   t("未驗證的未知路徑回 403 而不是 404", r7.status, 403);
   const r8 = await worker.fetch(req("/", { method: "HEAD" }), baseEnv, ctxNone());
   tt("未驗證的 HEAD 不是 200", r8.status !== 200);
+
+  // /app.js 必須被同一道關卡涵蓋 —— 路由若被搬到關卡之前，下面四條會全部變紅
+  const gqlBefore = captured.length;
+  const r9 = await worker.fetch(req("/app.js"), baseEnv, ctxNone());
+  t("ctx 沒有 access → /app.js 回 403", r9.status, 403);
+  const body9 = await r9.text();
+  tt("/app.js 的 403 本文與 / 的 403 本文逐位元組相同", body9 === body);
+  tt("/app.js 未驗證時沒有吐出腳本", !body9.includes("loadStatus"));
+  t("/app.js 未驗證時 GraphQL 沒有被呼叫", captured.length - gqlBefore, 0);
+
+  const r10 = await worker.fetch(req("/app.js", { method: "HEAD" }), baseEnv, ctxNone());
+  t("未驗證的 HEAD /app.js 回 403", r10.status, 403);
+
+  const r11 = await worker.fetch(req("/app.js"), baseEnv, ctxAud("aud-of-another-app"));
+  t("aud 不符的 /app.js → 403", r11.status, 403);
 }
 
 console.log("\n情境 C：通過 Cloudflare Access 之後才提供內容");
@@ -256,16 +278,53 @@ console.log("\n情境 H：GraphQL 錯誤要如實回報，不要假裝成空資�
   tt("帶出原始錯誤訊息", j.error.includes("Authentication error"));
 }
 
-console.log("\n情境 I：安全標頭與未知路徑");
+console.log("\n情境 I：安全標頭、/app.js 與未知路徑");
 {
+  // CSP 整串逐字比對。收緊 script-src 的重點就是「不可以有第二個來源溜進去」，
+  // 所以除了整串比對，還把 script-src 指令單獨拆出來精確比對一次。
+  const CSP = "default-src 'none'; style-src 'unsafe-inline'; script-src 'self'; "
+    + "connect-src 'self'; img-src data:; form-action 'self'; base-uri 'none'";
+  const scriptSrcOf = (csp) => (csp || "").split(";").map((d) => d.trim()).filter((d) => /^script-src\b/.test(d));
+
   stubGraphQL([], []);
   const r = await ok("/");
   tt("有 X-Content-Type-Options", r.headers.get("X-Content-Type-Options") === "nosniff");
   tt("有 X-Frame-Options: DENY", r.headers.get("X-Frame-Options") === "DENY");
   tt("CSP 預設封死", (r.headers.get("Content-Security-Policy") || "").includes("default-src 'none'"));
+  t("/ 的 CSP 整串逐字相符", r.headers.get("Content-Security-Policy"), CSP);
+  t("/ 的 script-src 指令恰好是 script-src 'self'", scriptSrcOf(r.headers.get("Content-Security-Policy")), ["script-src 'self'"]);
+  t("/ 帶 Cross-Origin-Resource-Policy: same-origin", r.headers.get("Cross-Origin-Resource-Policy"), "same-origin");
   tt("不快取", (r.headers.get("Cache-Control") || "").includes("no-store"));
+
+  // /app.js：通過 Access 之後才拿得到，而且必須是完整的安全標頭 + JavaScript MIME
+  stubGraphQL([], []);
+  const ra = await ok("/app.js");
+  t("有效 ctx.access → /app.js 200", ra.status, 200);
+  t("/app.js 的 Content-Type 是 JavaScript MIME", ra.headers.get("Content-Type"), "text/javascript; charset=utf-8");
+  const appBody = await ra.text();
+  tt("/app.js 的本文與 APP_JS 完全相等", appBody === APP_JS);
+  tt("/app.js 有 X-Content-Type-Options: nosniff", ra.headers.get("X-Content-Type-Options") === "nosniff");
+  tt("/app.js 不快取", (ra.headers.get("Cache-Control") || "").includes("no-store"));
+  t("/app.js 的 CSP 與 / 同一份", ra.headers.get("Content-Security-Policy"), CSP);
+  t("/app.js 帶 Cross-Origin-Resource-Policy: same-origin", ra.headers.get("Cross-Origin-Resource-Policy"), "same-origin");
+
+  // 非 JS 回應必須維持非 JS MIME + nosniff：script-src 收成 'self' 之後，
+  // 同源的 /api/* 與錯誤回應理論上都能被當腳本指過來，nosniff 成為主要控制。
   const r2 = await ok("/nope");
   t("未知路徑 → 404", r2.status, 404);
+  tt("404 JSON 有 nosniff", r2.headers.get("X-Content-Type-Options") === "nosniff");
+  tt("404 的 Content-Type 以 application/json 開頭", (r2.headers.get("Content-Type") || "").startsWith("application/json"));
+  t("404 帶 Cross-Origin-Resource-Policy", r2.headers.get("Cross-Origin-Resource-Policy"), "same-origin");
+
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    data: null,
+    errors: [{ message: "Authentication error" }],
+  }), { status: 200, headers: { "Content-Type": "application/json" } });
+  const r3 = await ok("/api/data?range=24h");
+  t("GraphQL 失敗 → 500", r3.status, 500);
+  tt("500 JSON 有 nosniff", r3.headers.get("X-Content-Type-Options") === "nosniff");
+  tt("500 的 Content-Type 以 application/json 開頭", (r3.headers.get("Content-Type") || "").startsWith("application/json"));
+  t("500 帶 Cross-Origin-Resource-Policy", r3.headers.get("Cross-Origin-Resource-Policy"), "same-origin");
 }
 
 console.log("\n情境 K：沒有 ctx.access 時，自行驗證 Access JWT（只在主機名清單內的入口）");
@@ -698,6 +757,27 @@ console.log("\n情境 K：沒有 ctx.access 時，自行驗證 Access JWT（只�
     for (const [label, path, method, token, api] of cases) {
       denied(`K13 ${label}`, await call(path, { env: tm.env(), method, token }), api);
     }
+
+    // /app.js 在回退路徑上也必須被同一道關卡涵蓋
+    const cNoToken = await call("/app.js", { env: tm.env() });
+    denied("K13 /app.js、沒有 token", cNoToken);
+    t("K13 /app.js、沒有 token 紀錄", cNoToken.reason, "missing");
+
+    const cHead = await call("/app.js", { env: tm.env(), method: "HEAD" });
+    denied("K13 HEAD /app.js、沒有 token", cHead);
+
+    // 簽章有效、但 aud 是別支應用的 token：同一個 team domain 底下共用簽章金鑰，
+    // 少了 aud 相等比對的話這條會變成 200。
+    const cBadAud = await call("/app.js", { env: tm.env(), token: await mint(k1, KID1, tm.domain, { aud: ["aud-of-another-app"] }) });
+    denied("K13 /app.js、有效簽章但 aud 不符", cBadAud);
+    t("K13 /app.js、aud 不符 紀錄", cBadAud.reason, "bad_aud");
+
+    const cOk = await call("/app.js", { env: tm.env(), token: await mint(k1, KID1, tm.domain) });
+    t("K13 /app.js、有效 token → [不拋例外, 200]", [cOk.threw === null, cOk.status], [true, 200]);
+    tt("K13 /app.js 本文與 APP_JS 完全相等", cOk.body === APP_JS);
+
+    const cAudEmpty = await call("/app.js", { env: tm.env({ ACCESS_AUD: "" }), token: await mint(k1, KID1, tm.domain) });
+    t("K13 /app.js、ACCESS_AUD 空 → 503", cAudEmpty.status, 503);
   }
 
   console.log("  K14：ACCESS_AUD 的 503 在回退之前");
@@ -732,7 +812,8 @@ console.log("\n情境 K：沒有 ctx.access 時，自行驗證 Access JWT（只�
       ["AbortSignal.timeout", /AbortSignal\s*\.\s*timeout/],
       ['redirect: "error"', /redirect\s*:\s*["'`]error/], ['redirect: "follow"', /redirect\s*:\s*["'`]follow/],
     ]) tt(`K16 index.js 不含 ${label}`, !re.test(src));
-    t("K16 index.js 的 import 只有既有的 ./page.js", src.match(/\bimport\b[^\r\n]*/g), ['import { PAGE } from "./page.js";']);
+    // 這個 regex 也會比對到註解裡的 "import" 字樣，所以 index.js 的註解刻意不使用那個字
+    t("K16 index.js 的 import 只有既有的 ./page.js", src.match(/\bimport\b[^\r\n]*/g), ['import { PAGE, APP_JS } from "./page.js";']);
   }
 
   Date.now = realDateNow;
