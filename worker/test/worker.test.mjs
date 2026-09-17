@@ -247,6 +247,18 @@ console.log("\n情境 F：點選柱狀圖只縮小明細的時間範圍，趨勢
   stubGraphQL([], []);
   await ok("/api/data?range=24h&bucket=not-a-time");
   tt("無效的 bucket 被忽略而不是炸掉", captured[1].variables.filter.datetime_leq.length > 0);
+
+  // 明細排除自己連線用的 Gateway DoH 端點；趨勢圖與統計不排除
+  stubGraphQL([], []);
+  await ok("/api/data?range=24h");
+  t("明細排除 *.cloudflare-gateway.com", captured[1].variables.filter.queryName_notlike, "%.cloudflare-gateway.com");
+  tt("趨勢圖不排除", captured[0].variables.filter.queryName_notlike === undefined);
+
+  stubGraphQL([], []);
+  await ok("/api/data?range=24h&q=doubleclick&decision=blocked&bucket=2026-08-30T10:00:00Z");
+  const f2 = captured[1].variables.filter;
+  t("搜尋、篩選、時間桶同時存在時仍排除", f2.queryName_notlike, "%.cloudflare-gateway.com");
+  t("排除不會蓋掉搜尋", f2.queryName_like, "%doubleclick%");
 }
 
 console.log("\n情境 G：網域明細的合併");

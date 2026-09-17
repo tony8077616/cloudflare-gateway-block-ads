@@ -361,6 +361,9 @@ function buildFilter({ since, until, decision, search, bucketStart, bucketEnd })
   return f;
 }
 
+// 網域明細不列出的網域（LIKE 樣式；2026-09-17 實測 queryName_notlike 可與搜尋的 queryName_like 並用）
+const EXCLUDED_DETAIL_DOMAINS = "%.cloudflare-gateway.com";
+
 const SERIES_QUERY = (bucketField) => `
   query($acct:String!, $filter:AccountGatewayResolverQueriesAdaptiveGroupsFilter_InputObject!) {
     viewer { accounts(filter:{accountTag:$acct}) {
@@ -415,6 +418,10 @@ async function apiData(request, env) {
 
   const seriesFilter = buildFilter({ since, until, decision, search });
   const topFilter = buildFilter({ since, until, decision, search, bucketStart, bucketEnd });
+  // 明細排除裝置自己連 Gateway 用的 DoH 端點（<id>.cloudflare-gateway.com）：它每次查詢都會出現、
+  // 量永遠排第一，卻不是「去了哪裡」。在查詢端排除，前 100 名才不會被它佔掉一格。
+  // 趨勢圖與統計刻意不排除，維持 Gateway 實際處理的總量。
+  topFilter.queryName_notlike = EXCLUDED_DETAIL_DOMAINS;
 
   const [seriesData, topData] = await Promise.all([
     graphql(env, SERIES_QUERY(range.bucket), { acct: env.CF_ACCOUNT_ID, filter: seriesFilter }),
