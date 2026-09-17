@@ -135,6 +135,20 @@ console.log("\n情境 E：需求對照 —— 這四項在頁面上都要找得�
   for (const [d, c] of checks) c ? ok(d) : no(d);
 }
 
+console.log("\n情境 G：柱狀圖整欄都點得到（柱子畫在點擊區上面，不可以攔截滑鼠事件）");
+{
+  // 2026-09-17 實測：少了這條規則時，游標在柱子上的 elementFromPoint 是彩色柱子（0/24 是點擊區），
+  // 只有柱子上方的空白點得到；加上之後 25/25 是點擊區。
+  const rule = PAGE.match(/\.chart \.bar-grp,\s*\.chart text\s*\{\s*pointer-events:\s*none\s*;?\s*\}/);
+  rule ? ok("CSS 讓 .bar-grp 與圖上文字 pointer-events:none") : no("缺少 .chart .bar-grp,.chart text{pointer-events:none}");
+
+  // 點擊區必須是柱子群組之前的兄弟節點（hover 的 + 選擇器靠這個順序），而且點擊事件掛在點擊區上
+  const iHit = APP_JS.indexOf("g.appendChild(hit);");
+  const iGrp = APP_JS.indexOf("g.appendChild(grp);");
+  iHit >= 0 && iGrp > iHit ? ok("點擊區先加入、柱子群組後加入") : no("點擊區與柱子群組的加入順序不符預期");
+  /hit\.addEventListener\("click"/.test(APP_JS) ? ok("點擊事件掛在點擊區上") : no("點擊事件沒有掛在點擊區上");
+}
+
 console.log("\n情境 F：fmt() 只輸出由數字產生的字串（它的結果有幾處未經 esc() 就進 innerHTML）");
 {
   // 從 APP_JS 擷取 fmt 的定義本身來測，而不是在這裡另寫一份 —— 改了頁面卻沒改測試時才抓得到。

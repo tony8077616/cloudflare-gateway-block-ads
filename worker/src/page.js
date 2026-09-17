@@ -80,6 +80,8 @@ input[type=search]{min-width:230px}
 .chart-hint{font-size:11px;color:var(--faint);margin-bottom:8px}
 .chart{width:100%;height:230px;display:block;touch-action:manipulation}
 .chart .bar-hit{cursor:pointer;fill:transparent}
+/* 柱子與文字畫在點擊區上面，不讓它們吃掉滑鼠事件 —— 否則游標一碰到柱子就點不到（只剩柱子上方的空白點得到） */
+.chart .bar-grp,.chart text{pointer-events:none}
 .chart .bar-hit:hover + .bar-grp rect,.chart g.sel .bar-grp rect{filter:brightness(1.35)}
 .chart g.sel .bg{fill:#ffffff12}
 .axis{fill:var(--faint);font-size:10px}
@@ -366,7 +368,8 @@ export const APP_JS = `
   function renderRows(){
     var d = state.data;
     var tb = $("rows");
-    $("detail-scope").textContent = state.bucket ? "（限於 " + tfull(state.bucket) + "）" : "（整個時間範圍）";
+    $("detail-scope").textContent = (state.bucket ? "（限於 " + tfull(state.bucket) + "）" : "（整個時間範圍）")
+      + "　不含自己連線用的 Gateway 網域 *.cloudflare-gateway.com";
     if (!d || !d.topDomains.length){
       tb.innerHTML = '<tr><td colspan="5" class="msg">沒有符合條件的網域</td></tr>';
       return;
