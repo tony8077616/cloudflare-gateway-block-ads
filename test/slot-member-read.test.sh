@@ -229,6 +229,19 @@ fail_case "success 是 false"   '{"success":false,"errors":[{"code":10000}],"res
 fail_case "HTML 錯誤頁"        '<html><head><title>500</title></head></html>'
 fail_case "result 是空物件"    '{"success":true,"result":{}}'
 fail_case "result 是 null"     '{"success":true,"result":null}'
+fail_case "result 是 null 但 total_count 為 5" '{"success":true,"result":null,"result_info":{"total_count":5}}'
+
+# ── 案例 4b：空清單的正常回應（result: null 且 total_count 為 0）→ 合法零筆 ──
+# Cloudflare 對本來就空的清單就是這樣回（實測 2026-11-10）。把它當成讀取失敗會讓整次同步中止。
+SC="$(scenario null_empty)"
+printf '{"success":true,"result":null,"result_info":{"total_count":0}}' > "$SC/items_id7.json"
+st=$(run "$SC" "" _fetch_one_slot 7 id7 "$SC/r7")
+check_status "result 是 null 且 total_count 為 0 → 成功" 0 "$st"
+if [[ "$(slot_lines "$SC" 7)" == "0" ]]; then
+  ok "result 是 null 且 total_count 為 0 → 留下零行的槽位檔"
+else
+  bad "result 是 null 且 total_count 為 0 的槽位檔不對（實得 $(slot_lines "$SC" 7)）"
+fi
 
 # `result` 是 {} 這一項特別重要：jq 迭代空物件會回傳 0 且不輸出任何東西，
 # 安安靜靜地變成「這份清單是空的」。null 至少還會讓 jq 以 5 結束。
