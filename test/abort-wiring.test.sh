@@ -202,6 +202,24 @@ counterfactual "拆掉 Policy 呼叫端的 if !（獨立驗證找到的第四個
   's|^  if ! ensure_policy "\$list_ids_file"; then$|  ensure_policy "$list_ids_file"; if false; then|' \
   "$STUB_POL_FAIL" "1	no"
 
+# ── 空槽位的刪除順序（靜態斷言）──────────────────────────
+# 規則還引用的清單刪不掉。空槽位的刪除必須排在 ensure_policy 成功之後，
+# 而且 sync_slots 本身不能送出 DELETE。這裡只驗順序，不驗網路行為。
+echo "── 空槽位刪除順序 ──"
+pol_line=$(grep -n '^  if ! ensure_policy "\$list_ids_file"; then$' "$WORK/sync_lf.sh" | head -1 | cut -d: -f1)
+del_line=$(grep -n '^  delete_empty_slots$' "$WORK/sync_lf.sh" | head -1 | cut -d: -f1)
+if [[ -n "$pol_line" && -n "$del_line" && "$del_line" -gt "$pol_line" ]]; then
+  echo "  ✅ delete_empty_slots 在 ensure_policy 成功之後呼叫（policy 第 $pol_line 行，刪除第 $del_line 行）"; PASS=$((PASS + 1))
+else
+  echo "  ❌ delete_empty_slots 沒有排在 ensure_policy 之後（policy=$pol_line 刪除=$del_line）"; FAIL=$((FAIL + 1))
+fi
+sync_body=$(awk '$0 == "sync_slots() {" {inside=1} inside {print} inside && $0 == "}" {exit}' "$WORK/sync_lf.sh")
+if [[ -n "$sync_body" ]] && ! grep -q 'cf_curl DELETE' <<< "$sync_body"; then
+  echo "  ✅ sync_slots 內沒有 cf_curl DELETE（刪除只在 delete_empty_slots 裡）"; PASS=$((PASS + 1))
+else
+  echo "  ❌ sync_slots 內仍有 cf_curl DELETE，或抽不到 sync_slots"; FAIL=$((FAIL + 1))
+fi
+
 echo
 echo "通過 $PASS / 失敗 $FAIL"
 [[ $FAIL -eq 0 ]]

@@ -1729,8 +1729,9 @@ _fetch_one_slot() {
   # 失敗就變成一份**內容為零筆的槽位檔**，跟「這份清單真的空了」完全無法分辨。
   # 下游會把那 1000 筆當成不存在而重新分配到別的槽位，並把讀錯的那一份刪掉。
   #
-  # 合法的零筆仍然回傳 0：剛好刪除失敗的空清單就是這個形狀，把它當成失敗會讓整次
-  # 同步卡在一份無關緊要的空清單上。分辨兩者的依據是回應的結構，不是輸出的行數。
+  # 合法的零筆仍然回傳 0：清單本來就是空的時，Cloudflare 回的是 result: null 加上
+  # result_info.total_count: 0（不是 []）。把它當成失敗會讓整次同步卡在一份空清單上。
+  # 只有這個組合才放行；其他 null 仍然是讀取失敗。分辨的依據是回應的結構，不是輸出的行數。
   local idx="$1" id="$2" reason_file="$3"
   local out="$TMP_DIR/slot/$idx.txt" raw="$TMP_DIR/slot/$idx.raw"
   local resp attempt expected actual total_count reason=""
@@ -1741,9 +1742,18 @@ _fetch_one_slot() {
       reason="回應不是合法的 JSON"
     elif [[ "$(jq -r '.success' <<< "$resp")" != "true" ]]; then
       reason="Cloudflare 回報 success 不是 true"
+    elif [[ "$(jq -r '.result | type' <<< "$resp")" == "null" ]]; then
+      # 空清單的正常回應：result 是 null，且 total_count 為 0。只有這個組合當成零筆，
+      # 其他 null（例如沒有 result_info、或 total_count 不是 0）仍然算讀取失敗。
+      if [[ "$(jq -r '.result_info.total_count // empty' <<< "$resp")" == "0" ]]; then
+        : > "$out"
+        rm -f "$raw"
+        return 0
+      fi
+      reason="回應的 result 是 null，但 total_count 不是 0"
     elif ! jq -e '.result | type == "array"' <<< "$resp" >/dev/null 2>&1; then
       # 這一道不是多餘的：.result 是 {} 的時候，jq 迭代空物件會回傳 0 且不輸出任何
-      # 東西，安安靜靜地變成「這份清單是空的」。null 至少還會讓 jq 以 5 結束。
+      # 東西，安安靜靜地變成「這份清單是空的」。所以 {} 在這裡拒絕，只有 null 能在上一個分支放行。
       reason="回應裡沒有結構完整的成員陣列"
     else
       expected=$(jq -r '.result | length' <<< "$resp")
@@ -1977,7 +1987,10 @@ sync_slots() {
 
     # 這一份沒有變動就不重傳，直接沿用既有 id
     if ! grep -qx "$idx" "$TMP_DIR/changed_slots.txt" 2>/dev/null; then
-      if [[ -n "$existing_id" ]]; then echo "$existing_id" >> "$list_ids_file"; fi
+      # 空槽位不放進 list_ids_file：規則之後不再引用它，刪除留到 ensure_policy 成功之後（見 delete_empty_slots）。
+      if [[ -n "$existing_id" ]] && ! grep -qx "$idx" "$TMP_DIR/empty_slots.txt" 2>/dev/null; then
+        echo "$existing_id" >> "$list_ids_file"
+      fi
       n_skip=$((n_skip + 1))
       continue
     fi
@@ -2031,12 +2044,33 @@ sync_slots() {
     esac
   done < "$idx_list"
 
-  # 變成空的槽位就刪掉，編號留著日後重用
+  # 變成空的槽位先記下來，不在這裡刪：Gateway 規則還引用它們，刪除一定失敗。
+  # 等 ensure_policy 成功、規則已改掉之後才由 delete_empty_slots 刪除。
   local eidx eid
+  : > "$TMP_DIR/pending_deletes.txt"
   while read -r eidx; do
     [[ -n "$eidx" ]] || continue
     eid="${slot_id[$eidx]:-}"
     [[ -n "$eid" ]] || continue
+    printf '%s\t%s\n' "$eidx" "$eid" >> "$TMP_DIR/pending_deletes.txt"
+  done < "$TMP_DIR/empty_slots.txt"
+
+  UPLOAD_STAT_UPLOADED=$n_up
+  UPLOAD_STAT_SKIPPED=$n_skip
+  UPLOAD_STAT_FAILED=$n_fail
+  log "上傳統計：新上傳 $n_up 份／內容未變略過 $n_skip 份／失敗 $n_fail 份（共 $total 份）"
+
+  cat "$list_ids_file"
+}
+
+
+delete_empty_slots() {
+  # 只在 ensure_policy 成功之後呼叫：規則已不再引用這些清單，刪除才會成功。
+  # 刪除失敗不影響結果，下一次同步會再試（那時它仍是空的，會再次被記下來）。
+  [[ -s "$TMP_DIR/pending_deletes.txt" ]] || return 0
+  local eidx eid
+  while IFS=$'\t' read -r eidx eid; do
+    [[ -n "$eidx" && -n "$eid" ]] || continue
     # 不能用 `if cf_curl DELETE ...` 判斷成敗：curl 沒有 -f/--fail，HTTP 403/404/500
     # 一律回 0，所以那種寫法幾乎永遠走成功分支，Cloudflare 拒絕刪除時照樣印「已刪除」。
     # 改用本檔既有的判定慣用法：看回應的 .success。
@@ -2048,16 +2082,8 @@ sync_slots() {
     else
       warn "刪除空清單（編號 $eidx）失敗（不影響本次結果）"
     fi
-  done < "$TMP_DIR/empty_slots.txt"
-
-  UPLOAD_STAT_UPLOADED=$n_up
-  UPLOAD_STAT_SKIPPED=$n_skip
-  UPLOAD_STAT_FAILED=$n_fail
-  log "上傳統計：新上傳 $n_up 份／內容未變略過 $n_skip 份／失敗 $n_fail 份（共 $total 份）"
-
-  cat "$list_ids_file"
+  done < "$TMP_DIR/pending_deletes.txt"
 }
-
 
 ensure_policy() {
   # $1 = list_ids 檔案
@@ -2467,6 +2493,7 @@ main() {
     record_sync_history "failed" "ensure_policy failed" "$total_merged" "$total_uploaded" "$excluded_by_native" "$whitelisted_count"
     exit 1
   fi
+  delete_empty_slots
 
   # 同步成功才把本次的 checksum 寫回。若中途失敗就不寫，下次執行自然會重跑，
   # 不會出現「狀態說已同步、實際上沒完成」的落差。
